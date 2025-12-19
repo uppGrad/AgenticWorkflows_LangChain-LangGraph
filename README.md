@@ -1,1 +1,38 @@
-"# AgenticWorkflows_LangChain-LangGraph" 
+# AgenticWorkflows_LangChain-LangGraph
+
+Agentic workflows for **UppGrad**: auto-apply assistance, opportunity recommendation support, document assistance, and a personalised chatbot, built with **LangChain** and **LangGraph** frameworks (python).
+
+## Why this repo exists
+
+UppGrad includes an AI/agentic subsystem that can plan and execute multi-step workflows such as:
+- finding suitable opportunities,
+- adapting CV / cover letter drafts,
+- preparing an application bundle,
+- guiding the user through steps with **human-in-the-loop** approval checkpoints.
+
+This repo contains the **agent graphs**, orchestration logic, and prototypes for those workflows.
+
+Important: Any “auto-apply” capability must remain **human-in-the-loop** (user review + explicit consent before submission).
+
+## Scope
+
+**In scope**
+- LangGraph graphs (state machines) for:
+  - opportunity triage + shortlist creation
+  - document feedback + rewrite planning
+  - application bundle preparation (CV + letter + metadata)
+  - conversational assistant workflows (tool-augmented)
+- Adapters for calling UppGrad backend APIs (optional/mocked early)
+- Local evaluation scripts / smoke tests for graph runs
+
+**Out of scope**
+- Frontend UI implementation
+- Django backend implementation (lives in the backend repo)
+- Large-scale scraping / ingestion pipelines (lives in scrapers repo)
+
+## Tech stack
+
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv) for fast environment + dependency management
+- LangChain + LangGraph
+- (Optional) OpenAI / Gemini clients via environment variables
