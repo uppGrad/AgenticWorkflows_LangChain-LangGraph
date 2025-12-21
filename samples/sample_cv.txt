@@ -1,0 +1,17 @@
+ALI OZHAVALA
+Bilkent University — Computer Science
+Email: ali@example.com | Phone: +90 5xx xxx xx xx
+
+EDUCATION
+Bilkent University, BSc Computer Science (2022–2026)
+
+PROJECTS
+UppGrad — Agentic workflows for job applications (LangGraph, LangChain)
+Remote Sensing ML — CNN training on RESISC45
+
+SKILLS
+Python, Java, SQL, Docker, LangChain, LangGraph, Git
+
+EXPERIENCE
+HAVELSAN — Big Data & AI Intern
+Huawei — Wireless DC Intern
