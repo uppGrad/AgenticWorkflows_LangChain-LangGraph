@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
 
 DocType = Literal["CV", "SOP", "COVER_LETTER", "UNKNOWN"]
+
+
+def _merge_analysis(
+    left: Dict[str, Any] | None,
+    right: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Reducer for analysis_results: merges parallel analysis outputs by key."""
+    return {**(left or {}), **(right or {})}
 
 
 class FileInput(TypedDict, total=False):
@@ -52,6 +60,9 @@ class DocFeedbackState(TypedDict, total=False):
     parsed_instructions: Dict[str, Any]
     opportunity_context: Dict[str, Any]
     context_pack: Dict[str, Any]
+
+    # phase 2: parallel analysis (merged via _merge_analysis reducer)
+    analysis_results: Annotated[Dict[str, Any], _merge_analysis]
 
     # phase 3: synthesis output
     proposals: List[Dict[str, Any]]  # list of ChangeProposal dicts

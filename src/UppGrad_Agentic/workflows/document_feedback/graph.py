@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
 
 from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 from uppgrad_agentic.workflows.document_feedback.nodes.load_document import load_document
@@ -11,10 +12,27 @@ from uppgrad_agentic.workflows.document_feedback.nodes.extract_doc_sections impo
 from uppgrad_agentic.workflows.document_feedback.nodes.parse_user_instructions import parse_user_instructions
 from uppgrad_agentic.workflows.document_feedback.nodes.get_opportunity_context import get_opportunity_context
 from uppgrad_agentic.workflows.document_feedback.nodes.build_context_pack import build_context_pack
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_structure import analyze_structure
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_style import analyze_style
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_content_gaps import analyze_content_gaps
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_ats import analyze_ats
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_opportunity_alignment import analyze_opportunity_alignment
 
 
 REJECT_CONFIDENCE = 0.70
 
+_ANALYSIS_NODES = [
+    "analyze_structure",
+    "analyze_style",
+    "analyze_content_gaps",
+    "analyze_ats",
+    "analyze_opportunity_alignment",
+]
+
+
+# ---------------------------------------------------------------------------
+# Routing helpers
+# ---------------------------------------------------------------------------
 
 def _route_after_detect(state: DocFeedbackState) -> str:
     # If any earlier node produced an error, end.
@@ -41,6 +59,19 @@ def _route_after_detect(state: DocFeedbackState) -> str:
     return "end_with_error"
 
 
+def _dispatch_analysis(state: DocFeedbackState) -> list[Send]:
+    """Fan out to all parallel analysis nodes, passing context_pack as payload."""
+    if state.get("result", {}).get("status") == "error":
+        return []
+
+    context_pack = state.get("context_pack") or {}
+    return [Send(node, context_pack) for node in _ANALYSIS_NODES]
+
+
+# ---------------------------------------------------------------------------
+# Graph
+# ---------------------------------------------------------------------------
+
 def build_graph():
     g = StateGraph(DocFeedbackState)
 
@@ -56,11 +87,20 @@ def build_graph():
     g.add_node("get_opportunity_context", get_opportunity_context)
     g.add_node("build_context_pack", build_context_pack)
 
-    # Routing entry-points (no-op pass-throughs; kept so _route_after_detect
-    # can name them separately if per-type branching is needed in a later phase)
+    # Doc-type routing entry-points (no-op pass-throughs)
     g.add_node("cv_route", lambda state: {})
     g.add_node("sop_route", lambda state: {})
     g.add_node("cover_route", lambda state: {})
+
+    # Phase 2 — parallel analysis
+    g.add_node("analyze_structure", analyze_structure)
+    g.add_node("analyze_style", analyze_style)
+    g.add_node("analyze_content_gaps", analyze_content_gaps)
+    g.add_node("analyze_ats", analyze_ats)
+    g.add_node("analyze_opportunity_alignment", analyze_opportunity_alignment)
+
+    # Phase 3 stub — convergence point for all parallel branches
+    g.add_node("synthesize_feedback", lambda state: {})
 
     # -----------------------------------------------------------------------
     # Edges — Phase 0
@@ -90,8 +130,20 @@ def build_graph():
     g.add_edge("extract_doc_sections", "parse_user_instructions")
     g.add_edge("parse_user_instructions", "get_opportunity_context")
     g.add_edge("get_opportunity_context", "build_context_pack")
-    g.add_edge("build_context_pack", END)
 
+    # -----------------------------------------------------------------------
+    # Edges — Phase 2 (fan-out via Send, fan-in at synthesize_feedback)
+    # -----------------------------------------------------------------------
+    g.add_conditional_edges("build_context_pack", _dispatch_analysis, _ANALYSIS_NODES)
+
+    # All parallel branches converge at synthesize_feedback.
+    for node in _ANALYSIS_NODES:
+        g.add_edge(node, "synthesize_feedback")
+
+    # -----------------------------------------------------------------------
+    # Edges — Phase 3+ (stubs; will be replaced as phases are implemented)
+    # -----------------------------------------------------------------------
+    g.add_edge("synthesize_feedback", END)
     g.add_edge("end_with_error", END)
 
     return g.compile()
