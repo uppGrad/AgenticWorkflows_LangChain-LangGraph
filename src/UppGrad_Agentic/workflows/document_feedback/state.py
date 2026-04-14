@@ -46,5 +46,21 @@ class DocFeedbackState(TypedDict, total=False):
     doc_meta: DocMeta
     doc_classification: DocClassification
 
+    # phase 1: context assembly
+    profile_snapshot: Dict[str, Any]
+    doc_sections: Dict[str, str]
+    parsed_instructions: Dict[str, Any]
+    opportunity_context: Dict[str, Any]
+    context_pack: Dict[str, Any]
+
+    # phase 3: synthesis output
+    proposals: List[Dict[str, Any]]  # list of ChangeProposal dicts
+
+    # phase 4: evaluation loop
+    iteration_count: int
+
+    # phase 6: rewrite output
+    final_document: str
+
     # final response for frontend
     result: WorkflowResult
