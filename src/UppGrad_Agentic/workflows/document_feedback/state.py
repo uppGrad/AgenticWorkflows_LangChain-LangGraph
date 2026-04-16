@@ -68,10 +68,15 @@ class DocFeedbackState(TypedDict, total=False):
     proposals: List[Dict[str, Any]]  # list of ChangeProposal dicts
 
     # phase 4: evaluation loop
+    evaluation_result: Dict[str, Any]  # EvaluationResult dict
     iteration_count: int
+
+    # phase 5: human review decisions
+    human_review: Dict[str, Any]  # {"approved_proposals": [...], "decisions": {...}}
 
     # phase 6: rewrite output
     final_document: str
+    diff: Dict[str, Any]  # {"applied": [...], "rejected": [...], "conflicts": [...], ...}
 
     # final response for frontend
     result: WorkflowResult

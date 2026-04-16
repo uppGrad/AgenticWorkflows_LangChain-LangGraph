@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Send
 
 from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
@@ -17,6 +18,10 @@ from uppgrad_agentic.workflows.document_feedback.nodes.analyze_style import anal
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_content_gaps import analyze_content_gaps
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_ats import analyze_ats
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_opportunity_alignment import analyze_opportunity_alignment
+from uppgrad_agentic.workflows.document_feedback.nodes.synthesize_feedback import synthesize_feedback
+from uppgrad_agentic.workflows.document_feedback.nodes.evaluate_output import evaluate_output
+from uppgrad_agentic.workflows.document_feedback.nodes.human_gate import human_gate
+from uppgrad_agentic.workflows.document_feedback.nodes.finalize import finalize
 
 
 REJECT_CONFIDENCE = 0.70
@@ -59,6 +64,23 @@ def _route_after_detect(state: DocFeedbackState) -> str:
     return "end_with_error"
 
 
+MAX_EVAL_ITERATIONS = 2
+
+
+def _route_after_evaluate(state: DocFeedbackState) -> str:
+    if state.get("result", {}).get("status") == "error":
+        return "end_with_error"
+
+    evaluation_result = state.get("evaluation_result") or {}
+    passed = evaluation_result.get("passed", True)
+    # iteration_count has already been incremented by evaluate_output.
+    iteration_count = state.get("iteration_count", 0)
+
+    if passed or iteration_count >= MAX_EVAL_ITERATIONS:
+        return "human_gate"
+    return "synthesize_feedback"
+
+
 def _dispatch_analysis(state: DocFeedbackState) -> list[Send]:
     """Fan out to all parallel analysis nodes, passing context_pack as payload."""
     if state.get("result", {}).get("status") == "error":
@@ -99,8 +121,17 @@ def build_graph():
     g.add_node("analyze_ats", analyze_ats)
     g.add_node("analyze_opportunity_alignment", analyze_opportunity_alignment)
 
-    # Phase 3 stub — convergence point for all parallel branches
-    g.add_node("synthesize_feedback", lambda state: {})
+    # Phase 3 — synthesis and planning
+    g.add_node("synthesize_feedback", synthesize_feedback)
+
+    # Phase 4 — evaluation loop
+    g.add_node("evaluate_output", evaluate_output)
+
+    # Phase 5 — human gate (interrupt/resume)
+    g.add_node("human_gate", human_gate)
+
+    # Phase 6 — rewrite
+    g.add_node("finalize", finalize)
 
     # -----------------------------------------------------------------------
     # Edges — Phase 0
@@ -141,9 +172,37 @@ def build_graph():
         g.add_edge(node, "synthesize_feedback")
 
     # -----------------------------------------------------------------------
-    # Edges — Phase 3+ (stubs; will be replaced as phases are implemented)
+    # Edges — Phase 4 (evaluation loop)
     # -----------------------------------------------------------------------
-    g.add_edge("synthesize_feedback", END)
+    g.add_edge("synthesize_feedback", "evaluate_output")
+
+    # If evaluation fails and retries remain, loop back to synthesize_feedback.
+    # If passed or retry cap (MAX_EVAL_ITERATIONS) reached, proceed forward.
+    g.add_conditional_edges(
+        "evaluate_output",
+        _route_after_evaluate,
+        {
+            "synthesize_feedback": "synthesize_feedback",
+            "human_gate": "human_gate",
+            "end_with_error": "end_with_error",
+        },
+    )
+
+    # -----------------------------------------------------------------------
+    # Edges — Phase 5 (human gate)
+    # -----------------------------------------------------------------------
+    g.add_edge("human_gate", "finalize")
+
+    # -----------------------------------------------------------------------
+    # Edges — Phase 6 (rewrite)
+    # -----------------------------------------------------------------------
+    g.add_edge("finalize", END)
+
+    # -----------------------------------------------------------------------
+    # Edges — error path
+    # -----------------------------------------------------------------------
     g.add_edge("end_with_error", END)
 
-    return g.compile()
+    # MemorySaver provides in-process state persistence required for human_gate
+    # interrupt/resume. Swap for a PostgreSQL checkpointer during backend integration.
+    return g.compile(checkpointer=MemorySaver())

@@ -155,24 +155,103 @@ Any workflow that can trigger external actions (e.g., submitting an application)
 ## Implementation status
 
 ### Completed
-- Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing (stub endpoints only)
+- Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing
+- Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, parse_user_instructions, get_opportunity_context, build_context_pack); state.py and schemas.py extended with all Phase 1+ fields and ChangeProposal/EvaluationResult schemas
+- Phase 2: Parallel analysis nodes (analyze_structure, analyze_style, analyze_content_gaps, analyze_ats, analyze_opportunity_alignment); graph wired with LangGraph Send fan-out from build_context_pack, converging at synthesize_feedback
+- Phase 3: Synthesis & Planning (synthesize_feedback); graph wired with MemorySaver checkpointer for human_gate interrupt support
+- Phase 4: Evaluation loop (evaluate_output); conditional routing back to synthesize_feedback on failure, capped at MAX_EVAL_ITERATIONS=2; synthesize_feedback passes prior evaluation issues to LLM on retry
+- Phase 5: Human gate (human_gate); interrupt() suspends graph and surfaces proposals to frontend; resume via Command(resume=decisions) where decisions maps string proposal IDs to {"action": "accept"|"reject", "comment": "..."}
+- Phase 6: Rewrite (finalize); applies accepted proposals right-to-left to preserve positions, resolves overlapping spans by confidence, LLM coherence smoothing pass, produces diff summary; result.details contains final_document and diff for frontend
 
 ### In progress
 - Nothing currently in progress
 
 ### Not started
-- Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, parse_user_instructions, get_opportunity_context, build_context_pack)
-- Phase 2: Parallel analysis nodes (analyze_structure, analyze_style, analyze_content_gaps, analyze_ats, analyze_opportunity_alignment)
-- Phase 3: Synthesis & Planning (synthesize_feedback)
-- Phase 4: Evaluation loop (evaluate_output, iteration counter)
-- Phase 5: Human gate (human_gate with LangGraph interrupt)
-- Phase 6: Rewrite (finalize)
+
 - Auto-apply workflow (not started)
 
-### Known issues to address before Phase 1
-- state.py missing Phase 1+ fields: context_pack, parsed_instructions, proposals, iteration_count, final_document
-- schemas.py missing ChangeProposal and evaluation output schemas
+### Known issues
 - common/state.py is intentionally a shared base for future workflows, currently empty, do not delete
+
+## Integration TODO
+
+Items that are currently stubbed, hardcoded, or mocked and must be replaced during
+backend / frontend / database integration. Grouped by area.
+
+### Authentication and user identity
+
+- **`state.py`** — No `user_id` field in `DocFeedbackState`. The API layer must inject
+  the authenticated user's ID into state at invocation time so nodes can scope DB queries.
+- **`fetch_profile_snapshot.py`** — Returns a hardcoded `_STUB_PROFILE` dict (user
+  "Alex Johnson"). Replace with a real DB lookup keyed on `state["user_id"]`.
+
+### Opportunity context
+
+- **`get_opportunity_context.py`** — Returns a hardcoded `_MOCK_OPPORTUNITY` whenever
+  the user's instructions contain job-related keywords. Real implementation must:
+  - Accept a structured opportunity input from the frontend (job URL, paste of JD, or
+    saved opportunity ID) rather than inferring intent from free text.
+  - Look up or scrape/parse the opportunity and return structured data
+    (title, org, description, requirements, keywords).
+
+### File ingestion and storage
+
+- **`load_document.py`** — Reads the file from a local filesystem path via
+  `file.get("path")`. In production the file will arrive as a multipart upload or
+  be stored in object storage (S3/GCS). Options: materialise bytes to a temp path in
+  the API layer before invoking the graph, or extend `extract_text_from_file` to
+  accept `bytes` directly (the `bytes` field already exists in `FileInput` but is
+  unused).
+- **`tools/documents.py`** — Several known extraction gaps to address:
+  - DOCX: tables and images are silently ignored; `page_count` is always `None`.
+  - PDF: scanned / image-based pages return empty text with no OCR fallback. Wire in
+    an OCR library (e.g. pytesseract, AWS Textract, Google Document AI) for scanned docs.
+
+### Graph state persistence and checkpointing
+
+- **`graph.py`** — `MemorySaver` is an in-process, non-durable checkpointer. Replace
+  with `AsyncPostgresSaver` (from `langgraph-checkpoint-postgres`) pointing at the
+  production database for persistence across API requests and process restarts.
+- **`run.py`** — The CLI calls `graph.invoke(...)` without a `config` dict. Now that a
+  checkpointer is active, every invocation requires
+  `config={"configurable": {"thread_id": "<unique-run-id>"}}` or LangGraph will
+  generate a new thread on every call. The API layer must generate and store thread IDs
+  so interrupted runs (human gate) can be resumed.
+
+### LLM provider and configuration
+
+- **`common/llm.py`** — Only OpenAI (`langchain-openai`) is wired up. Add support for
+  other providers as needed (Anthropic, Azure OpenAI, etc.).
+- **`config/settings.py`** — Currently an empty stub. Wire in a real settings module
+  (e.g. pydantic-settings reading from environment / secrets manager) and route all
+  configuration through it instead of scattered `os.getenv` calls.
+
+### Analysis quality
+
+- **`analyze_ats.py`** — `_ATS_KEYWORDS` is a static, role-agnostic list. It should be
+  supplemented or replaced by keywords extracted from `opportunity_context.keywords`
+  (already in `context_pack`) and the user's `target_roles` from the profile snapshot.
+- **All analysis nodes** — `parsed_instructions` (including `focus_areas`,
+  `target_role`, and `explicit_constraints`) is assembled in `context_pack` and passed
+  to every node, but none of the analysis nodes currently read it to narrow or
+  prioritise their output. Each node should filter or weight findings based on the
+  user's stated intent and constraints.
+- **`synthesize_feedback.py` (heuristic path)** — `before_text` and `after_text` for
+  most heuristic proposals are placeholder strings (e.g. `"[Current Skills section]"`)
+  rather than actual text spans extracted from `doc_sections`. The LLM path handles
+  this correctly. If the heuristic path needs to remain accurate without an LLM, each
+  proposal generator should locate and quote the relevant span from `doc_sections`.
+
+### Not-yet-implemented nodes (empty stubs)
+
+- **`run.py`** — No `thread_id` passed to `graph.invoke()`; required now that checkpointer is active. Callers must pass `config={"configurable": {"thread_id": "<id>"}}` for interrupt/resume to work correctly.
+
+### API / frontend surface
+
+- **No HTTP API layer yet.** `run.py` is a CLI-only entry point. A FastAPI (or
+  equivalent) service layer is needed to handle: authenticated file upload, graph
+  invocation with a scoped thread ID, streaming or polling for intermediate state,
+  and returning the final `result` / `proposals` as structured JSON to the frontend.
 
 
 
