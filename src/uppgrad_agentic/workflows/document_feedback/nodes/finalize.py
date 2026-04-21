@@ -13,14 +13,128 @@ from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Load the LaTeX CV template once at module level
+# LaTeX CV template — embedded to avoid packaging/data-file issues
 # ---------------------------------------------------------------------------
-import importlib.resources as _pkg_resources
-_RESUME_TEMPLATE = (
-    _pkg_resources.files("uppgrad_agentic.templates")
-    .joinpath("resume_template.tex")
-    .read_text(encoding="utf-8")
-)
+_RESUME_TEMPLATE = r"""%-------------------------
+% Resume Template (sb2nov-based)
+% Tectonic-compatible — no glyphtounicode
+%------------------------
+
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Adjust margins
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% Sections formatting
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+%-------------------------
+% Custom commands
+\newcommand{\resumeItem}[2]{
+  \item\small{
+    \textbf{#1}{: #2 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small #3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-5pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small #1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-5pt}
+}
+
+\newcommand{\resumeItemPlain}[1]{
+  \item\small{
+    {#1 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{-4pt}}
+
+\renewcommand{\labelitemii}{$\circ$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+%-------------------------------------------
+%  DOCUMENT STARTS HERE
+%-------------------------------------------
+
+\begin{document}
+
+%----------HEADING-----------------
+% USE: \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+%        \textbf{\Large FULL NAME} & Email: \href{mailto:EMAIL}{EMAIL}\\
+%        \href{WEBSITE}{WEBSITE} & Mobile: PHONE \\
+%      \end{tabular*}
+
+%----------EDUCATION-----------------
+% \section{Education}
+%   \resumeSubHeadingListStart
+%     \resumeSubheading{UNIVERSITY}{LOCATION}{DEGREE; GPA: X.XX}{DATE RANGE}
+%   \resumeSubHeadingListEnd
+
+%----------EXPERIENCE-----------------
+% \section{Experience}
+%   \resumeSubHeadingListStart
+%     \resumeSubheading{COMPANY}{LOCATION}{TITLE}{DATE RANGE}
+%       \resumeItemListStart
+%         \resumeItemPlain{DESCRIPTION}
+%       \resumeItemListEnd
+%   \resumeSubHeadingListEnd
+
+%----------PROJECTS-----------------
+% \section{Projects}
+%   \resumeSubHeadingListStart
+%     \resumeSubItem{PROJECT NAME}{DESCRIPTION}
+%   \resumeSubHeadingListEnd
+
+%----------SKILLS-----------------
+% \section{Skills}
+%   \resumeSubHeadingListStart
+%     \item{
+%       \textbf{Languages}{: LIST} \hfill
+%       \textbf{Technologies}{: LIST}
+%     }
+%   \resumeSubHeadingListEnd
+
+\end{document}
+"""
 
 # ---------------------------------------------------------------------------
 # LaTeX generation prompt
