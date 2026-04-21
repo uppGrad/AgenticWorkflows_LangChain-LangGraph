@@ -58,11 +58,32 @@ _ATS_UNFRIENDLY = [
 ]
 
 
-def _heuristic(doc_sections: dict[str, str]) -> ATSAnalysis:
+def _heuristic(doc_sections: dict[str, str], opportunity_context: dict | None = None) -> ATSAnalysis:
     full_text = " ".join(doc_sections.values()).lower()
 
-    hits = [kw for kw in _ATS_KEYWORDS if re.search(rf"\b{re.escape(kw)}\b", full_text)]
-    missing = [kw for kw in _ATS_KEYWORDS if kw not in hits]
+    # Build keyword list: start with generic, then add opportunity-specific
+    keywords_to_check = list(_ATS_KEYWORDS)
+    if opportunity_context:
+        # Extract keywords from opportunity title and description
+        opp_text = " ".join([
+            opportunity_context.get("title", ""),
+            opportunity_context.get("description", ""),
+            " ".join(opportunity_context.get("keywords", [])),
+        ])
+        opp_tokens = set(re.findall(r"\b[a-z][a-z0-9+#/.]{2,}\b", opp_text.lower()))
+        # Filter out common stopwords
+        opp_keywords = [kw for kw in opp_tokens if kw not in {
+            "the", "and", "for", "are", "with", "that", "this", "will", "have",
+            "from", "they", "your", "our", "their", "its", "you", "not", "but",
+            "all", "can", "may", "was", "has", "been", "more", "any", "who",
+            "about", "experience", "work", "looking", "team", "join", "role",
+            "company", "ideal", "candidate", "requirements", "responsibilities",
+            "ability", "strong", "must", "including", "working", "position",
+        }]
+        keywords_to_check = list(set(keywords_to_check + opp_keywords))
+
+    hits = [kw for kw in keywords_to_check if re.search(rf"\b{re.escape(kw)}\b", full_text)]
+    missing = [kw for kw in keywords_to_check if kw not in hits]
 
     formatting_issues: List[str] = []
     original_text = " ".join(doc_sections.values())
@@ -110,9 +131,12 @@ Assess:
 - recommendations: specific fixes
 
 Focus on machine-parseability, not subjective quality.
+When an opportunity description is provided, focus keyword analysis on keywords
+relevant to THAT SPECIFIC role/opportunity, not generic tech keywords.
 """
 
 _MAX_CHARS = 6000
+_MAX_OPP_CHARS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -127,24 +151,36 @@ def analyze_ats(context_pack: dict) -> dict:
         return {"analysis_results": {"ats": {}}}
 
     doc_sections = context_pack.get("doc_sections") or {}
+    opportunity_context = context_pack.get("opportunity_context") or {}
 
     llm = get_llm()
     if llm is None:
-        result = _heuristic(doc_sections)
+        result = _heuristic(doc_sections, opportunity_context)
         return {"analysis_results": {"ats": result.model_dump()}}
 
     doc_text = " ".join(doc_sections.values())[:_MAX_CHARS]
+
+    # Include opportunity context in the prompt when available
+    opp_section = ""
+    if opportunity_context and opportunity_context.get("title"):
+        opp_text = str(opportunity_context)[:_MAX_OPP_CHARS]
+        opp_section = (
+            f"\n\nTARGET OPPORTUNITY (tailor keyword analysis to this role):\n{opp_text}\n"
+            "Focus your missing_keywords on keywords that are relevant to THIS specific "
+            "opportunity, not generic tech keywords."
+        )
+
     structured = llm.with_structured_output(ATSAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(content=f"CV text (truncated):\n{doc_text}"),
+        HumanMessage(content=f"CV text (truncated):\n{doc_text}{opp_section}"),
     ]
 
     try:
         result: ATSAnalysis = structured.invoke(msgs)
         return {"analysis_results": {"ats": result.model_dump()}}
     except Exception as e:
-        result = _heuristic(doc_sections)
+        result = _heuristic(doc_sections, opportunity_context)
         out = result.model_dump()
         out["recommendations"] = out.get("recommendations", []) + [f"[LLM failed, used heuristic: {e}]"]
         return {"analysis_results": {"ats": out}}

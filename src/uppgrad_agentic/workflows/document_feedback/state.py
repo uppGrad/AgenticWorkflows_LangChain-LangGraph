@@ -75,7 +75,8 @@ class DocFeedbackState(TypedDict, total=False):
     human_review: Dict[str, Any]  # {"approved_proposals": [...], "decisions": {...}}
 
     # phase 6: rewrite output
-    final_document: str
+    final_document: str  # LaTeX source code
+    final_pdf_bytes: Optional[bytes]  # compiled PDF binary
     diff: Dict[str, Any]  # {"applied": [...], "rejected": [...], "conflicts": [...], ...}
 
     # final response for frontend

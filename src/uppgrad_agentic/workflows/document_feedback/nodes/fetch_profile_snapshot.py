@@ -41,7 +41,11 @@ def fetch_profile_snapshot(state: DocFeedbackState) -> dict:
     if state.get("result", {}).get("status") == "error":
         return {}
 
-    # Real implementation will look up the authenticated user's profile from the
-    # database. For now, return the hardcoded stub so downstream nodes have
-    # realistic data to work with.
+    # If the caller pre-injected profile_snapshot (e.g., Django adapter),
+    # skip the stub and use the real data already in state.
+    if state.get("profile_snapshot"):
+        return {}
+
+    # Fallback: return the hardcoded stub for standalone/CLI usage so
+    # downstream nodes have realistic data to work with.
     return {"profile_snapshot": _STUB_PROFILE}

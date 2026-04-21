@@ -45,6 +45,11 @@ def get_opportunity_context(state: DocFeedbackState) -> dict:
     if state.get("result", {}).get("status") == "error":
         return {}
 
+    # If the caller pre-injected opportunity_context (e.g., Django adapter),
+    # skip the stub/mock logic and use the real data already in state.
+    if state.get("opportunity_context"):
+        return {}
+
     instructions = (state.get("user_instructions") or "").strip()
 
     if instructions and _OPPORTUNITY_SIGNALS.search(instructions):

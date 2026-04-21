@@ -94,7 +94,7 @@ def _dispatch_analysis(state: DocFeedbackState) -> list[Send]:
 # Graph
 # ---------------------------------------------------------------------------
 
-def build_graph():
+def build_graph(checkpointer=None):
     g = StateGraph(DocFeedbackState)
 
     # Phase 0
@@ -203,6 +203,7 @@ def build_graph():
     # -----------------------------------------------------------------------
     g.add_edge("end_with_error", END)
 
-    # MemorySaver provides in-process state persistence required for human_gate
-    # interrupt/resume. Swap for a PostgreSQL checkpointer during backend integration.
-    return g.compile(checkpointer=MemorySaver())
+    # Use the provided checkpointer, or fall back to MemorySaver for
+    # standalone/CLI usage. Production callers (e.g., Django) should pass
+    # a PostgresSaver for durable interrupt/resume across requests.
+    return g.compile(checkpointer=checkpointer or MemorySaver())

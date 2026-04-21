@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
+from difflib import SequenceMatcher
 from typing import List
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -10,6 +13,7 @@ from uppgrad_agentic.common.llm import get_llm
 from uppgrad_agentic.workflows.document_feedback.schemas import ChangeProposal
 from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # LLM output schema
@@ -23,11 +27,38 @@ class SynthesisOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Prompts
+# Prompts — with strong anti-hallucination guardrails
 # ---------------------------------------------------------------------------
 
-SYSTEM = """You are a document improvement advisor synthesizing multiple analysis reports \
+SYSTEM = """\
+You are a document improvement advisor synthesizing multiple analysis reports \
 into concrete, actionable change proposals.
+
+═══════════════════════ CRITICAL RULES ═══════════════════════
+
+1. **NEVER FABRICATE CONTENT.** You must NEVER invent, add, or suggest:
+   - Skills, tools, frameworks, or technologies the candidate does not mention
+   - Awards, certifications, or honors that do not appear in the document
+   - Job titles, company names, or experiences not present in the document
+   - Quantified metrics or numbers that are not in the original text
+   If the opportunity requires skills the candidate lacks, DO NOT add those \
+   skills — instead, suggest *better phrasing* of the candidate's EXISTING skills \
+   to highlight transferable relevance.
+
+2. **before_text MUST be a VERBATIM QUOTE** copied exactly from the document text \
+   provided below. It must appear character-for-character in the document. \
+   If you cannot find an exact quote, set before_text to an empty string "" \
+   and explain in the rationale that this is a new addition suggestion.
+
+3. **after_text must only rephrase, restructure, or reformat** existing content. \
+   You may suggest *where* to add new sections (with before_text=""), but the \
+   suggested text in after_text for new sections should be a template/placeholder \
+   like "[Add your relevant certifications here]", never fabricated content.
+
+4. **One proposal per change.** Do not bundle multiple unrelated changes into \
+   one proposal. Each proposal should target a single, specific edit.
+
+═══════════════════════════════════════════════════════════════
 
 Each proposal must:
 - target a specific section of the document
@@ -37,8 +68,20 @@ Each proposal must:
 - set requires_confirmation=true for structural or substantive content changes; \
   false for minor style/formatting fixes
 
-Prioritize proposals by impact: structural gaps first, then content gaps, \
+Prioritize proposals by impact: structural gaps first, then content improvements, \
 then style and ATS improvements, then opportunity alignment.
+
+Good proposal examples:
+  ✅ Rephrasing "Worked on backend" → "Developed and maintained backend services"
+  ✅ Restructuring bullet points for clarity
+  ✅ Suggesting a missing section with before_text="" and placeholder after_text
+  ✅ Fixing passive voice or vague language
+
+Bad proposal examples (NEVER do these):
+  ❌ Adding "AWS, Azure, Kubernetes" when candidate only mentions "Docker"
+  ❌ Inventing "Dean's List (2022-2023)" when no awards section exists
+  ❌ Replacing "Django, Redis" with "cloud security, AI deployments"
+  ❌ Using a before_text that doesn't exist in the document
 
 Merge overlapping findings into a single proposal. Avoid duplicates.
 Return at most 15 proposals.
@@ -46,6 +89,82 @@ Return at most 15 proposals.
 
 _MAX_ANALYSIS_CHARS = 6000
 _MAX_DOC_CHARS = 4000
+
+# Minimum fuzzy-match ratio for before_text to be considered "grounded"
+_MIN_MATCH_RATIO = 0.55
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: validate proposals against the actual document
+# ---------------------------------------------------------------------------
+
+def _normalize(text: str) -> str:
+    """Collapse whitespace and lowercase for fuzzy matching."""
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _before_text_is_grounded(before_text: str, full_doc_text: str) -> bool:
+    """Check if before_text exists (or nearly exists) in the document."""
+    if not before_text or before_text.startswith("["):
+        # Empty or placeholder before_text is fine (new section suggestions)
+        return True
+
+    norm_before = _normalize(before_text)
+    norm_doc = _normalize(full_doc_text)
+
+    # Exact substring match (fast path)
+    if norm_before in norm_doc:
+        return True
+
+    # Sliding-window fuzzy match — check if any window of similar length
+    # in the document is a close match
+    window_len = len(norm_before)
+    if window_len < 10:
+        # Very short text — require exact match
+        return norm_before in norm_doc
+
+    best_ratio = 0.0
+    step = max(1, window_len // 4)
+    for i in range(0, max(1, len(norm_doc) - window_len + 1), step):
+        window = norm_doc[i : i + window_len + 20]  # slight oversize for flexibility
+        ratio = SequenceMatcher(None, norm_before, window).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            if best_ratio >= _MIN_MATCH_RATIO:
+                return True
+
+    return best_ratio >= _MIN_MATCH_RATIO
+
+
+def _validate_proposals(
+    proposals: List[dict],
+    doc_sections: dict,
+) -> List[dict]:
+    """Filter out proposals with hallucinated before_text."""
+    full_text = " ".join(doc_sections.values())
+    validated = []
+    dropped = 0
+
+    for p in proposals:
+        before = p.get("before_text", "")
+        if _before_text_is_grounded(before, full_text):
+            validated.append(p)
+        else:
+            dropped += 1
+            logger.warning(
+                "Dropped hallucinated proposal (before_text not found in document): "
+                "section=%s, before_text=%.80s…",
+                p.get("section", "?"),
+                before,
+            )
+
+    if dropped:
+        logger.info(
+            "Validation: kept %d / %d proposals (%d dropped as ungrounded)",
+            len(validated), len(proposals), dropped,
+        )
+
+    return validated
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +329,7 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
     doc_sections = context_pack.get("doc_sections") or state.get("doc_sections") or {}
     doc_type = (state.get("doc_classification") or {}).get("doc_type", "UNKNOWN")
     parsed_instructions = state.get("parsed_instructions") or {}
+    opportunity_context = context_pack.get("opportunity_context") or state.get("opportunity_context") or {}
 
     # On retry: include evaluator feedback so the LLM can address specific issues.
     prior_eval = state.get("evaluation_result") or {}
@@ -230,6 +350,17 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
         if prior_issues else ""
     )
 
+    # Include opportunity context so proposals are tailored to the target role
+    opp_section = ""
+    if opportunity_context and opportunity_context.get("title"):
+        opp_text = json.dumps(opportunity_context, indent=2)[:2000]
+        opp_section = (
+            f"\n\nTARGET OPPORTUNITY (tailor proposals to this role):\n{opp_text}\n"
+            "Prioritize changes that align the document with THIS specific opportunity.\n"
+            "IMPORTANT: Only suggest rephrasing EXISTING content to better match the "
+            "opportunity. Do NOT add skills or experiences the candidate does not have.\n"
+        )
+
     structured = llm.with_structured_output(SynthesisOutput)
     msgs = [
         SystemMessage(content=SYSTEM),
@@ -238,6 +369,7 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
                 f"Document type: {doc_type}\n"
                 f"{focus_line}"
                 f"{retry_section}"
+                f"{opp_section}"
                 f"\nAnalysis results (JSON):\n{analysis_text}"
                 f"\n\nDocument text (first {_MAX_DOC_CHARS} chars):\n{doc_text}"
             )
@@ -246,7 +378,11 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
 
     try:
         output: SynthesisOutput = structured.invoke(msgs)
-        return {"proposals": [p.model_dump() for p in output.proposals]}
+        raw_proposals = [p.model_dump() for p in output.proposals]
+
+        # Post-process: drop proposals with hallucinated before_text
+        validated = _validate_proposals(raw_proposals, doc_sections)
+        return {"proposals": validated}
     except Exception as e:
         proposals = _heuristic_proposals(analysis_results, doc_sections)
         result = [p.model_dump() for p in proposals]
