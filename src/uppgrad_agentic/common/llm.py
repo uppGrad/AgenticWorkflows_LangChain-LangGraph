@@ -46,7 +46,7 @@ def get_llm() -> Optional[BaseChatModel]:
             logger.error("langchain-openai not installed but provider=openai: %s", e)
             return None
 
-        model = os.getenv("UPPGRAD_OPENAI_MODEL", "gpt-4o-mini")
+        model = os.getenv("UPPGRAD_OPENAI_MODEL", "gpt-5.4-mini")
         logger.info("Using OpenAI LLM: model=%s", model)
         return ChatOpenAI(model=model, temperature=0)
 

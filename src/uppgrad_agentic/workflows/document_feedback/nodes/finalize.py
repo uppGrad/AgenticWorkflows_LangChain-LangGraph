@@ -165,8 +165,8 @@ Return ONLY the complete LaTeX source code. No explanations, no markdown fences.
 Start with \documentclass and end with \end{document}.
 """
 
-_MAX_DOC_CHARS = 8000
-_MAX_PROPOSALS_CHARS = 4000
+_MAX_DOC_CHARS = 16000
+_MAX_PROPOSALS_CHARS = 8000
 
 
 # ---------------------------------------------------------------------------
