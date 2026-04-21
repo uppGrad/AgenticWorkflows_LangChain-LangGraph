@@ -12,77 +12,6 @@ assesses eligibility, generates tailored application materials, and attempts
 submission. Both workflows use human-in-the-loop approval before any 
 consequential action.
 
-The document feedback workflow is the active development focus. Phase 0 
-(load, classify, route) is complete. The remaining phases follow the node 
-files already scaffolded in nodes/.
-
-## Agent responsibilities (document feedback workflow)
-
-Each node file maps to one of these agents:
-
-**Intake & Classification Agent** (load_document.py, detect_doc_type.py)
-Loads and extracts text from uploaded file, validates minimum length, 
-classifies document as CV/SOP/COVER_LETTER, routes accordingly.
-
-**Context Assembly Agent** (parse_user_prompt.py + new nodes)
-Fetches user profile snapshot, extracts document sections, parses user 
-instructions, optionally retrieves opportunity context, builds unified 
-context pack for all downstream agents.
-
-**Document Analysis Agent** (analyze_document.py)
-Runs parallel analyses: structure, style/grammar, content gaps, ATS 
-compatibility (CV only), opportunity alignment (if context provided). 
-All analyses are parameterized by doc_type.
-
-**Synthesis & Planning Agent** (synthesize_feedback.py)
-Merges parallel analysis outputs, prioritizes issues, generates structured 
-ChangeProposal list with section, rationale, before/after text, confidence, 
-and confirmation flag per proposal.
-
-**Evaluation Agent** (evaluate_output.py)
-Checks proposals for groundedness, hallucinations, and format compliance. 
-Triggers refinement loop back to synthesis, capped at 2 iterations.
-
-**Human Review Coordinator** (human_gate.py)
-LangGraph interrupt point. Presents proposals to user as reviewable 
-checklist, collects accept/reject decisions and comments, holds workflow 
-until explicit approval.
-
-**Rewrite Agent** (finalize.py)
-Applies only approved edits, resolves conflicts between overlapping changes, 
-preserves rejected segments, produces final rewritten document and diff.
-
-## Document feedback workflow orchestration
-
-The full graph flow is:
-
-START
-→ load_document
-→ detect_doc_type
-→ [route by doc_type: cv / sop / cover_letter / error]
-→ fetch_profile_snapshot
-→ extract_doc_sections
-→ parse_user_instructions
-→ [conditional] get_opportunity_context (only if user provided opportunity)
-→ build_context_pack
-→ [parallel] analyze_structure, analyze_style, analyze_content_gaps
-           + analyze_ats (CV only)
-           + analyze_opportunity_alignment (only if opportunity context exists)
-→ synthesize_feedback
-→ evaluate_output
-→ [loop back to synthesize_feedback if quality check fails, max 2 iterations]
-→ human_gate (interrupt — wait for user approval)
-→ finalize
-→ END
-
-Key orchestration rules:
-- Every node checks for result.status == "error" at the top and returns {} to short-circuit
-- Parallel analysis nodes fan out from build_context_pack and merge into synthesize_feedback
-- The evaluation loop is capped at 2 retries via an iteration counter in state
-- human_gate uses LangGraph interrupt() and resumes only after user submits approved changes
-- All three doc types (CV/SOP/COVER_LETTER) share the same nodes after routing; 
-  doc_type in state parameterizes behavior inside each node
-
 ## Commands
 
 This project uses [uv](https://github.com/astral-sh/uv) for environment and dependency management.
@@ -129,129 +58,457 @@ src/uppgrad_agentic/
       nodes/       # One file per node function
       prompts.py   # System/human prompt strings
       tests/       # Smoke test + unit test stubs (currently empty)
+    auto_apply/          # Not yet implemented
+      state.py     # AutoApplyState TypedDict (to be created)
+      schemas.py   # Pydantic models (to be created)
+      graph.py     # build_graph() (to be created)
+      run.py       # CLI entry point (to be created)
+      nodes/       # One file per node function (to be created) 
 ```
-### Prompt pattern decision
-Prompts live inline inside each node file, not in prompts.py. 
-This keeps each prompt next to its logic and is easier to maintain 
-at this project scale. prompts.py is unused and can be ignored.
+
+### General patterns
+
+- **State pattern**: each node receives the full State TypedDict and returns a partial 
+  dict of keys to merge. Errors are signalled by setting `result.status = "error"` 
+  in state. Downstream nodes check this and short-circuit with `return {}`.
+- **LLM pattern**: `get_llm()` in `common/llm.py` returns `None` when no provider is 
+  configured. Every node that calls an LLM must handle the `None` case with a 
+  heuristic fallback. See `detect_doc_type.py` for the reference implementation.
+- **Prompt pattern**: prompts live inline inside each node file, not in prompts.py. 
+  This keeps each prompt next to its logic. prompts.py is unused and can be ignored.
+- **Human-in-the-loop**: any workflow that triggers external actions must include a 
+  human_gate node using LangGraph interrupt() before the action.
+- **Checkpointer**: MemorySaver is used for now. Will be replaced with 
+  AsyncPostgresSaver during backend integration.
 
 ### common/state.py
-This file is intentionally reserved as a shared base state for 
-future workflows (auto-apply etc.). It is currently empty. 
-Do not delete it or use it for document_feedback specific state.
+Intentionally reserved as a shared base state for future workflows. Currently empty. 
+Do not delete or use for workflow-specific state.
 
-### Human-in-the-loop requirement
-
-Any workflow that can trigger external actions (e.g., submitting an application) **must** include a `human_gate` node before the action. `nodes/human_gate.py` exists as a placeholder. See `HumanGate` in that file for the intended pattern using LangGraph's interrupt mechanism.
 
 ### Adding a new workflow
-
 1. Create `src/uppgrad_agentic/workflows/<name>/` mirroring the `document_feedback` layout.
 2. Define a `State` TypedDict in `state.py`.
 3. Put each node in `nodes/<node_name>.py` with signature `(state: YourState) -> dict`.
 4. Wire the graph in `graph.py` with `build_graph() -> CompiledGraph`.
 5. Add a `run.py` CLI entry point.
 
-## Implementation status
+---
+
+
+## Document Feedback Workflow
+
+### Agent responsibilities 
+
+**Intake & Classification Agent** (load_document.py, detect_doc_type.py)
+Loads and extracts text from uploaded file, validates minimum length, 
+classifies document as CV/SOP/COVER_LETTER, routes accordingly.
+
+**Context Assembly Agent** (fetch_profile_snapshot.py, extract_doc_sections.py, 
+parse_user_instructions.py, get_opportunity_context.py, build_context_pack.py)
+Fetches user profile snapshot, extracts document sections, parses user 
+instructions, optionally retrieves opportunity context, builds unified 
+context pack for all downstream agents.
+
+**Document Analysis Agent** (analyze_structure.py, analyze_style.py, 
+analyze_content_gaps.py, analyze_ats.py, analyze_opportunity_alignment.py)
+Runs parallel analyses: structure, style/grammar, content gaps, ATS 
+compatibility (CV only), opportunity alignment (if context provided). 
+All analyses are parameterized by doc_type.
+
+**Synthesis & Planning Agent** (synthesize_feedback.py)
+Merges parallel analysis outputs, prioritizes issues, generates structured 
+ChangeProposal list with section, rationale, before/after text, confidence, 
+and confirmation flag per proposal.
+
+**Evaluation Agent** (evaluate_output.py)
+Checks proposals for groundedness, hallucinations, and format compliance. 
+Triggers refinement loop back to synthesis, capped at 2 iterations.
+
+**Human Review Coordinator** (human_gate.py)
+LangGraph interrupt point. Presents proposals to user as reviewable 
+checklist, collects accept/reject decisions and comments, holds workflow 
+until explicit approval.
+
+**Rewrite Agent** (finalize.py)
+Applies only approved edits, resolves conflicts between overlapping changes, 
+preserves rejected segments, runs coherence smoothing pass, produces final 
+rewritten document and diff.
+
+### Orchestration
+
+The full graph flow is:
+
+START
+→ load_document
+→ detect_doc_type
+→ [route by doc_type: cv / sop / cover_letter / error]
+→ fetch_profile_snapshot
+→ extract_doc_sections
+→ parse_user_instructions
+→ [conditional] get_opportunity_context (only if user provided opportunity)
+→ build_context_pack
+→ [parallel] analyze_structure, analyze_style, analyze_content_gaps
+           + analyze_ats (CV only)
+           + analyze_opportunity_alignment (only if opportunity context exists)
+→ synthesize_feedback
+→ evaluate_output
+→ [loop back to synthesize_feedback if quality check fails, max 2 iterations]
+→ human_gate (interrupt — wait for user approval)
+→ finalize
+→ END
+
+Key orchestration rules:
+- Every node checks for result.status == "error" at the top and returns {} to short-circuit
+- Parallel analysis nodes fan out from build_context_pack and merge into synthesize_feedback
+- The evaluation loop is capped at 2 retries via an iteration counter in state
+- human_gate uses LangGraph interrupt() and resumes only after user submits approved changes
+- All three doc types (CV/SOP/COVER_LETTER) share the same nodes after routing; 
+  doc_type in state parameterizes behavior inside each node
+
+
+---
+
+## Auto-Apply Workflow
+
+### Opportunity database tables
+
+Three tables hold opportunities. The workflow determines which table to query
+based on opportunity_type passed in by the frontend.
+
+**linkedin_jobs** (jobs)
+Key columns for the workflow:
+- id, title, company, location, description, job_type, job_level, job_function
+- company_industry, is_remote, is_closed
+- url (linkedin application url), url_direct (company site url, not always present)
+- site: "linkedin" for external, "manuel" for internal UppGrad jobs
+- employer_id: NULL for external, 1 for internal (use this to determine internal vs external)
+- posted_time, salary
+
+**programs** (masters / phd)
+Key columns for the workflow:
+- id, url, title, university, location, duration, degree_type, study_mode
+- program_type, tuition_fee, venue
+- data (json): contains description, requirements (academic, english, other),
+  curriculum, funding, living_costs, start_dates — primary source of eligibility info
+
+**scholarships**
+Key columns for the workflow:
+- id, url, title, provider_name, disciplines, grant_display, location, deadline
+- scholarship_type, coverage, description, benefits
+- eligibility_text, req_disciplines, req_locations, req_nationality,
+  req_age, req_study_experience
+- application_info (contains how to apply instructions)
+- data (json): contains all of the above in structured form — use as primary source
+
+
+### Agent responsibilities
+
+**Opportunity Intelligence Agent** (load_opportunity.py, scrape_application_page.py, 
+evaluate_scrape.py, determine_requirements.py)
+Loads the opportunity record from the correct DB table based on opportunity_type.
+For jobs only: attempts to scrape the application page (url_direct if present, 
+else url), evaluates scrape quality as full, partial, or failed, and normalizes 
+scraped content into a structured requirements list.
+For programs and scholarships: skips scraping entirely and parses requirements 
+directly from the data json field in the DB record.
+If scraping fails or is partial, falls back to assumed default requirements based 
+on opportunity type. Never blocks on a failed scrape.
+Stores scrape_status and scrape_confidence in state so downstream agents and the 
+user are aware of whether requirements are real or assumed.
+
+**Applicant Eligibility and Readiness Agent** (eligibility_and_readiness.py)
+Checks hard constraints: deadline not passed, location fit, degree requirements 
+from data json, profile completeness against normalized requirements.
+Produces one of: ready | pending | ineligible | manual_review.
+If pending, triggers human_gate_0 to ask user to complete missing profile info 
+before continuing.
+
+**Asset Mapping Agent** (asset_mapping.py)
+Maps each normalized requirement to the best available user document.
+Determines tailoring depth for each: none | light | deep | generate.
+Flags requirements with no suitable source document.
+
+**Application Tailoring Agent** (application_tailoring.py)
+Reuses document feedback pipeline in apply-mode meaning changes are applied 
+directly without a proposal review step at this stage.
+Generates tailored version of each required document grounded in opportunity 
+context and the normalized requirements from the Opportunity Intelligence Agent.
+Parameterized by opportunity_type and tailoring depth from asset mapping.
+
+**Application Evaluation Agent** (application_evaluation.py)
+Verifies full package for groundedness, requirement coverage, and hallucinations.
+Triggers refinement loop back to application_tailoring, capped at 2 iterations.
+
+**Human Review Coordinator** (human_gate_0.py, human_gate_1.py, human_gate_2.py)
+Gate 0: only triggered if eligibility check finds missing profile info. Asks user 
+to complete required fields before workflow continues.
+Gate 1: after asset mapping, presents document mapping to user, collects document 
+selections and any additional uploads from local device.
+Gate 2: after evaluation, presents final tailored package for user approval before 
+submission or handoff. No materials are submitted without passing this gate.
+All three use LangGraph interrupt() and require MemorySaver checkpointer.
+
+**Submission Agent** (route_by_source.py, submit_internal.py, package_and_handoff.py, 
+record_application.py)
+First determines whether the opportunity is internal or external using employer_id 
+from the linkedin_jobs table. employer_id == 1 means internal, NULL means external.
+For internal jobs: submits CV and Cover Letter directly to platform backend (stub 
+for now, to be wired during integration).
+For all external opportunities (external jobs, masters, phd, scholarships): 
+assembles the final tailored package and hands it off to the user.
+Records the application outcome in both cases. For jobs, also stores scrape_status 
+and scrape_confidence in the application record for potential future use when 
+attempting external submission automation.
+
+### Orchestration
+
+START
+→ load_opportunity (receive opportunity_type + id from frontend, query correct table)
+→ determine_requirements
+if opportunity_type == job:
+→ scrape_application_page (use url_direct if present, else url)
+→ evaluate_scrape (assess quality: full | partial | failed)
+→ if full: use scraped requirements
+→ if partial or failed: fall back to assumed defaults [CV, Cover Letter]
+→ store scrape_status and scrape_confidence in state
+if opportunity_type == masters or phd:
+→ skip scraping
+→ parse requirements from data json field
+→ assume [CV, SOP] as baseline
+if opportunity_type == scholarship:
+→ skip scraping
+→ parse eligibility from data json field
+→ assume [CV, Cover Letter] as baseline
+→ eligibility_and_readiness
+→ ineligible: end_with_explanation → END
+→ pending missing profile info: human_gate_0 → (user completes profile) → continue
+→ ready: continue
+→ asset_mapping
+→ human_gate_1 (user reviews document mapping, selects or uploads documents)
+→ application_tailoring
+→ application_evaluation
+→ if failed and iteration_count < 2: loop back to application_tailoring
+→ if passed or iteration_count == 2: continue
+→ human_gate_2 (user reviews and approves final package)
+→ route_by_source
+if opportunity_type == job and employer_id == 1:
+→ submit_internal → record_application → END
+else:
+→ package_and_handoff → record_application → END
+
+Key orchestration rules:
+- Scraping is only attempted for job opportunities, never for programs or scholarships
+- Use url_direct if present for scraping, fall back to url if not
+- Never block the workflow on a failed scrape, always degrade to assumed requirements
+- Store scrape_status and scrape_confidence in state throughout so the user is 
+  always informed whether requirements were scraped or assumed
+- Internal vs external is determined by employer_id in linkedin_jobs, not site column
+- human_gate_0 is conditional and only triggered when eligibility check finds 
+  missing profile information
+- For now internal submission only requires CV and Cover Letter fields
+- All three opportunity types share the same pipeline after determine_requirements; 
+  only the scraping step and the final routing differ
+
+### Assumed default requirements by opportunity type
+
+| Opportunity type | Default required documents |
+|---|---|
+| Job (external or internal) | CV, Cover Letter |
+| Masters / PhD | CV, SOP |
+| Scholarship | CV, Cover Letter |
+
+### State schema (AutoApplyState)
+
+Define in workflows/auto_apply/state.py:
+- opportunity_type: job | masters | phd | scholarship
+- opportunity_id: str
+- opportunity_data: dict (raw DB record)
+- scraped_requirements: dict (status, requirements list, confidence, source)
+- normalized_requirements: list (final requirements list after scrape or assumption)
+- eligibility_result: dict (decision, reasons, missing_fields)
+- asset_mapping: dict (requirement to document mapping with tailoring depth)
+- human_review_0: dict (user response to missing profile info gate, if triggered)
+- human_review_1: dict (user selections from gate 1)
+- tailored_documents: dict (document type to tailored content)
+- evaluation_result: dict
+- human_review_2: dict (user approval from gate 2)
+- application_package: dict (final documents ready for handoff or submission)
+- application_record: dict (logged outcome, includes scrape_status and scrape_confidence for jobs)
+- iteration_count: int
+- result: dict (status, error_code, user_message)
+
+### Future implementation steps (post integration)
+
+These are intentionally out of scope for the current implementation but 
+should be tracked for future development:
+
+**Requirements review human gate**
+After determine_requirements, surface the normalized requirements list to the 
+user as a reviewable checklist before asset mapping begins. Similar to the 
+ChangeProposal review in document feedback. User can confirm what they can 
+provide, flag items they cannot provide right now (e.g. financial documents, 
+transcripts), and upload additional documents on the spot. Anything flagged 
+as unavailable is noted in the final package rather than blocking the workflow. 
+This makes asset mapping cleaner since it works with a confirmed set of assets.
+
+**External application form submission**
+For external job opportunities where scraping was fully successful, attempt to 
+automatically fill and submit the application form using browser automation 
+(Playwright or equivalent). This requires handling multi-step forms, file upload 
+fields, and graceful fallback when anti-bot mechanisms are encountered. 
+Scrape confidence and scraped field structure should be stored in the application 
+record during current implementation to make this step easier to add later.
+
+---
+
+## Implementation Status
 
 ### Completed
-- Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing
-- Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, parse_user_instructions, get_opportunity_context, build_context_pack); state.py and schemas.py extended with all Phase 1+ fields and ChangeProposal/EvaluationResult schemas
-- Phase 2: Parallel analysis nodes (analyze_structure, analyze_style, analyze_content_gaps, analyze_ats, analyze_opportunity_alignment); graph wired with LangGraph Send fan-out from build_context_pack, converging at synthesize_feedback
-- Phase 3: Synthesis & Planning (synthesize_feedback); graph wired with MemorySaver checkpointer for human_gate interrupt support
-- Phase 4: Evaluation loop (evaluate_output); conditional routing back to synthesize_feedback on failure, capped at MAX_EVAL_ITERATIONS=2; synthesize_feedback passes prior evaluation issues to LLM on retry
-- Phase 5: Human gate (human_gate); interrupt() suspends graph and surfaces proposals to frontend; resume via Command(resume=decisions) where decisions maps string proposal IDs to {"action": "accept"|"reject", "comment": "..."}
-- Phase 6: Rewrite (finalize); applies accepted proposals right-to-left to preserve positions, resolves overlapping spans by confidence, LLM coherence smoothing pass, produces diff summary; result.details contains final_document and diff for frontend
 
-### In progress
+**Document Feedback Workflow**
+- Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing
+- Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, 
+  parse_user_instructions, get_opportunity_context, build_context_pack); 
+  state.py and schemas.py extended with all Phase 1+ fields and 
+  ChangeProposal/EvaluationResult schemas
+- Phase 2: Parallel analysis nodes (analyze_structure, analyze_style, 
+  analyze_content_gaps, analyze_ats, analyze_opportunity_alignment); 
+  graph wired with LangGraph Send fan-out from build_context_pack
+- Phase 3: Synthesis & Planning (synthesize_feedback); graph wired with 
+  MemorySaver checkpointer
+- Phase 4: Evaluation loop (evaluate_output); conditional routing back to 
+  synthesize_feedback on failure, capped at MAX_EVAL_ITERATIONS=2
+- Phase 5: Human gate (human_gate); interrupt() suspends graph and surfaces 
+  proposals to frontend; resume via Command(resume=decisions)
+- Phase 6: Rewrite (finalize); applies accepted proposals right-to-left, 
+  resolves overlapping spans by confidence, LLM coherence smoothing pass, 
+  produces diff summary
+
+**Auto-Apply Workflow**
+- Opportunity Intelligence: load_opportunity.py (stub DB lookup for all four types),
+  scrape_application_page.py (requests-based fetch with graceful failure),
+  evaluate_scrape.py (LLM structured output + heuristic fallback),
+  determine_requirements.py (scrape → parse data json → assumed defaults)
+- Eligibility: eligibility_and_readiness.py (deadline, hard constraints, profile
+  completeness checks); end_with_explanation.py; human_gate_0.py (stub interrupt)
+- Asset Mapping: asset_mapping.py (LLM structured output + heuristic depth
+  classification); AssetMap / AssetMappingOutput schemas; human_gate_1.py
+  (full interrupt/resume with per-document override and upload support)
+- Tailoring & Evaluation: application_tailoring.py (LLM apply-mode rewrite +
+  heuristic fallback per depth); application_evaluation.py (length, placeholder,
+  keyword-coverage checks with 2-iteration retry loop)
+- Human Review: human_gate_2.py (full interrupt/resume, approve/reject with
+  per-document feedback)
+- Submission: submit_internal.py (stub backend POST); package_and_handoff.py
+  (assembles package with scrape provenance for jobs); record_application.py
+  (logs outcome, timestamp, doc types, scrape metadata)
+- graph.py fully wired end-to-end; run.py CLI entry point
+
+### In Progress
 - Nothing currently in progress
 
-### Not started
+### Not Started
+- Nothing
 
-- Auto-apply workflow (not started)
-
-### Known issues
-- common/state.py is intentionally a shared base for future workflows, currently empty, do not delete
+---
 
 ## Integration TODO
 
-Items that are currently stubbed, hardcoded, or mocked and must be replaced during
-backend / frontend / database integration. Grouped by area.
+Items currently stubbed, hardcoded, or mocked that must be replaced during
+backend / frontend / database integration.
 
 ### Authentication and user identity
-
-- **`state.py`** — No `user_id` field in `DocFeedbackState`. The API layer must inject
-  the authenticated user's ID into state at invocation time so nodes can scope DB queries.
-- **`fetch_profile_snapshot.py`** — Returns a hardcoded `_STUB_PROFILE` dict (user
-  "Alex Johnson"). Replace with a real DB lookup keyed on `state["user_id"]`.
+- **state.py** — No user_id field in DocFeedbackState. API layer must inject 
+  authenticated user ID into state at invocation time.
+- **fetch_profile_snapshot.py** — Returns hardcoded stub profile. Replace with 
+  real DB lookup keyed on state["user_id"].
 
 ### Opportunity context
-
-- **`get_opportunity_context.py`** — Returns a hardcoded `_MOCK_OPPORTUNITY` whenever
-  the user's instructions contain job-related keywords. Real implementation must:
-  - Accept a structured opportunity input from the frontend (job URL, paste of JD, or
-    saved opportunity ID) rather than inferring intent from free text.
-  - Look up or scrape/parse the opportunity and return structured data
-    (title, org, description, requirements, keywords).
+- **get_opportunity_context.py** — Returns hardcoded mock opportunity. Real 
+  implementation must accept structured opportunity input from frontend and 
+  look up or parse the opportunity properly.
 
 ### File ingestion and storage
+- **load_document.py** — Reads from local filesystem path. In production files 
+  will arrive as multipart uploads or from object storage.
+- **tools/documents.py** — DOCX tables and images silently ignored. PDF scanned 
+  pages return empty text with no OCR fallback. Wire in OCR for scanned docs.
 
-- **`load_document.py`** — Reads the file from a local filesystem path via
-  `file.get("path")`. In production the file will arrive as a multipart upload or
-  be stored in object storage (S3/GCS). Options: materialise bytes to a temp path in
-  the API layer before invoking the graph, or extend `extract_text_from_file` to
-  accept `bytes` directly (the `bytes` field already exists in `FileInput` but is
-  unused).
-- **`tools/documents.py`** — Several known extraction gaps to address:
-  - DOCX: tables and images are silently ignored; `page_count` is always `None`.
-  - PDF: scanned / image-based pages return empty text with no OCR fallback. Wire in
-    an OCR library (e.g. pytesseract, AWS Textract, Google Document AI) for scanned docs.
+### Graph state persistence
+- **graph.py** — MemorySaver is non-durable. Replace with AsyncPostgresSaver 
+  pointing at production database.
+- **run.py** — No thread_id passed to graph.invoke(). API layer must generate 
+  and store thread IDs for interrupt/resume to work across requests.
 
-### Graph state persistence and checkpointing
-
-- **`graph.py`** — `MemorySaver` is an in-process, non-durable checkpointer. Replace
-  with `AsyncPostgresSaver` (from `langgraph-checkpoint-postgres`) pointing at the
-  production database for persistence across API requests and process restarts.
-- **`run.py`** — The CLI calls `graph.invoke(...)` without a `config` dict. Now that a
-  checkpointer is active, every invocation requires
-  `config={"configurable": {"thread_id": "<unique-run-id>"}}` or LangGraph will
-  generate a new thread on every call. The API layer must generate and store thread IDs
-  so interrupted runs (human gate) can be resumed.
-
-### LLM provider and configuration
-
-- **`common/llm.py`** — Only OpenAI (`langchain-openai`) is wired up. Add support for
-  other providers as needed (Anthropic, Azure OpenAI, etc.).
-- **`config/settings.py`** — Currently an empty stub. Wire in a real settings module
-  (e.g. pydantic-settings reading from environment / secrets manager) and route all
-  configuration through it instead of scattered `os.getenv` calls.
+### LLM and configuration
+- **common/llm.py** — Only OpenAI wired up. Add other providers as needed.
+- **config/settings.py** — Empty stub. Wire in real settings module using 
+  pydantic-settings.
 
 ### Analysis quality
-
-- **`analyze_ats.py`** — `_ATS_KEYWORDS` is a static, role-agnostic list. It should be
-  supplemented or replaced by keywords extracted from `opportunity_context.keywords`
-  (already in `context_pack`) and the user's `target_roles` from the profile snapshot.
-- **All analysis nodes** — `parsed_instructions` (including `focus_areas`,
-  `target_role`, and `explicit_constraints`) is assembled in `context_pack` and passed
-  to every node, but none of the analysis nodes currently read it to narrow or
-  prioritise their output. Each node should filter or weight findings based on the
-  user's stated intent and constraints.
-- **`synthesize_feedback.py` (heuristic path)** — `before_text` and `after_text` for
-  most heuristic proposals are placeholder strings (e.g. `"[Current Skills section]"`)
-  rather than actual text spans extracted from `doc_sections`. The LLM path handles
-  this correctly. If the heuristic path needs to remain accurate without an LLM, each
-  proposal generator should locate and quote the relevant span from `doc_sections`.
-
-### Not-yet-implemented nodes (empty stubs)
-
-- **`run.py`** — No `thread_id` passed to `graph.invoke()`; required now that checkpointer is active. Callers must pass `config={"configurable": {"thread_id": "<id>"}}` for interrupt/resume to work correctly.
+- **analyze_ats.py** — Static keyword list. Should use keywords from 
+  opportunity_context and user target_roles.
+- **All analysis nodes** — parsed_instructions is available in context_pack 
+  but not yet used to narrow or prioritize findings.
+- **synthesize_feedback.py heuristic path** — before_text and after_text are 
+  placeholder strings rather than actual spans from doc_sections.
 
 ### API / frontend surface
+- No HTTP API layer yet. run.py is CLI only. A FastAPI service layer is needed 
+  to handle authenticated file upload, graph invocation, streaming or polling 
+  for intermediate state, and returning structured JSON to the frontend.
 
-- **No HTTP API layer yet.** `run.py` is a CLI-only entry point. A FastAPI (or
-  equivalent) service layer is needed to handle: authenticated file upload, graph
-  invocation with a scoped thread ID, streaming or polling for intermediate state,
-  and returning the final `result` / `proposals` as structured JSON to the frontend.
+### Auto-apply workflow
 
+**User identity and profile**
+- **eligibility_and_readiness.py** — `_STUB_PROFILE` is a hardcoded dict (name,
+  email, age, nationality, location, degree_level, disciplines, gpa,
+  uploaded_documents, document_texts). Replace `_get_stub_profile()` with a real
+  DB lookup keyed on `state["user_id"]`. `AutoApplyState` has no `user_id` field
+  yet; the API layer must inject it at invocation time.
+- **eligibility_and_readiness.py** — `uploaded_documents` values are plain
+  booleans. Real implementation needs file references (storage keys or URLs) so
+  downstream nodes can fetch actual content.
+- **eligibility_and_readiness.py** — `document_texts["CV"]` is a hardcoded stub
+  string. Replace with content fetched from object storage using the file
+  reference stored against the user's profile.
 
+**Opportunity database**
+- **load_opportunity.py** — `_fetch_opportunity()` returns one of four hardcoded
+  stub dicts (`_STUB_JOB`, `_STUB_MASTERS`, `_STUB_PHD`, `_STUB_SCHOLARSHIP`)
+  regardless of `opportunity_id`. Replace with real queries:
+  - job → `SELECT * FROM linkedin_jobs WHERE id = %s`
+  - masters/phd → `SELECT * FROM programs WHERE id = %s AND program_type = %s`
+  - scholarship → `SELECT * FROM scholarships WHERE id = %s`
+
+**Web scraping**
+- **scrape_application_page.py** — Uses a generic bot User-Agent string. Production
+  scraping will need rotating proxies, session cookies, and handling of JS-rendered
+  pages (Playwright or equivalent) for sites that block simple HTTP GET requests.
+
+**Internal submission**
+- **submit_internal.py** — `_post_to_backend()` is a no-op stub that logs and
+  returns a fake `platform_application_id`. Replace with a real authenticated
+  HTTP POST to the platform API. The required fields (endpoint URL, auth headers,
+  payload schema) must be defined during backend integration.
+
+**Graph state persistence**
+- **graph.py (auto_apply)** — Uses `MemorySaver`. Replace with `AsyncPostgresSaver`
+  for durable interrupt/resume across API requests. The API layer must generate
+  and persist `thread_id` per workflow run.
+
+**human_gate_0 interrupt/resume**
+- **human_gate_0.py** — Currently a stub that terminates the graph. Must be
+  replaced with a real `interrupt()` / `Command(resume=...)` cycle matching the
+  pattern in `human_gate_1.py`. After the user completes missing profile fields,
+  the graph should resume and re-run `eligibility_and_readiness` to confirm the
+  gap is closed before continuing.
+
+**Resume value contract quirk**
+- **human_gate_1.py, human_gate_2.py** — LangGraph re-interrupts when
+  `Command(resume=<falsy value>)` is passed (e.g. empty dict, None). The API
+  layer must always send a non-empty dict as the resume value. "Confirm all
+  defaults" for gate 1 uses `{"confirm": True}`; approval for gate 2 uses
+  `{"approved": True}`.
 
