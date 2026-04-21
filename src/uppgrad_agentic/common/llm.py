@@ -24,16 +24,24 @@ def get_llm() -> Optional[BaseChatModel]:
 
     # Auto-detect provider from available API keys
     if not provider:
-        if os.getenv("OPENAI_API_KEY"):
+        key = os.getenv("OPENAI_API_KEY")
+        if key:
             provider = "openai"
-            logger.info("Auto-detected LLM provider: openai (OPENAI_API_KEY found)")
+            logger.info("Auto-detected LLM provider: openai (OPENAI_API_KEY found, length=%d)", len(key))
         else:
-            logger.debug("No LLM provider configured and no API keys found — using heuristic fallback")
+            # Log ALL env var keys to help debug
+            all_keys = sorted(os.environ.keys())
+            logger.warning(
+                "No LLM provider configured. OPENAI_API_KEY not found in env. "
+                "Available env vars: %s",
+                ", ".join(all_keys),
+            )
             return None
 
     if provider == "openai":
         try:
             from langchain_openai import ChatOpenAI
+            logger.info("langchain_openai imported successfully")
         except ImportError as e:
             logger.error("langchain-openai not installed but provider=openai: %s", e)
             return None
