@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -16,8 +15,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Load the LaTeX CV template once at module level
 # ---------------------------------------------------------------------------
-_TEMPLATE_DIR = Path(__file__).resolve().parent.parent.parent.parent / "templates"
-_RESUME_TEMPLATE = (_TEMPLATE_DIR / "resume_template.tex").read_text(encoding="utf-8")
+import importlib.resources as _pkg_resources
+_RESUME_TEMPLATE = (
+    _pkg_resources.files("uppgrad_agentic.templates")
+    .joinpath("resume_template.tex")
+    .read_text(encoding="utf-8")
+)
 
 # ---------------------------------------------------------------------------
 # LaTeX generation prompt
