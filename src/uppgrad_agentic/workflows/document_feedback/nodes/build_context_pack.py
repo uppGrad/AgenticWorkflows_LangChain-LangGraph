@@ -4,8 +4,9 @@ from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 
 
 def build_context_pack(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "build_context_pack", "step_history": ["build_context_pack"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     doc_classification = state.get("doc_classification") or {}
 
@@ -25,4 +26,4 @@ def build_context_pack(state: DocFeedbackState) -> dict:
         "has_opportunity": bool(state.get("opportunity_context")),
     }
 
-    return {"context_pack": context_pack}
+    return {**updates, "context_pack": context_pack}

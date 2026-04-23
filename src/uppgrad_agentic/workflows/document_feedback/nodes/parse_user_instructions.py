@@ -146,27 +146,29 @@ def _heuristic_parse(instructions: str) -> ParsedInstructions:
 # ---------------------------------------------------------------------------
 
 def parse_user_instructions(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "parse_user_instructions", "step_history": ["parse_user_instructions"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     instructions = (state.get("user_instructions") or "").strip()
 
     # No instructions provided: return an empty-but-valid structure.
     if not instructions:
         return {
+            **updates,
             "parsed_instructions": ParsedInstructions(
                 intent="general document feedback",
                 tone_preferences=[],
                 target_role=None,
                 target_program=None,
                 explicit_constraints=[],
-            ).model_dump()
+            ).model_dump(),
         }
 
     llm = get_llm()
     if llm is None:
         parsed = _heuristic_parse(instructions)
-        return {"parsed_instructions": parsed.model_dump()}
+        return {**updates, "parsed_instructions": parsed.model_dump()}
 
     structured = llm.with_structured_output(ParsedInstructions)
     msgs = [
@@ -176,10 +178,10 @@ def parse_user_instructions(state: DocFeedbackState) -> dict:
 
     try:
         parsed: ParsedInstructions = structured.invoke(msgs)
-        return {"parsed_instructions": parsed.model_dump()}
+        return {**updates, "parsed_instructions": parsed.model_dump()}
     except Exception as e:
         parsed = _heuristic_parse(instructions)
         out = parsed.model_dump()
         out.setdefault("explicit_constraints", [])
         out["explicit_constraints"].append(f"[parse fallback: LLM failed — {e}]")
-        return {"parsed_instructions": out}
+        return {**updates, "parsed_instructions": out}

@@ -47,8 +47,9 @@ _VALID_DEPTHS = {"none", "light", "deep", "generate"}
 
 
 def human_gate_1(state: AutoApplyState) -> dict:
+    updates = {"current_step": "human_gate_1", "step_history": ["human_gate_1"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     asset_mapping: List[Dict[str, Any]] = state.get("asset_mapping") or []
     opportunity_data = state.get("opportunity_data") or {}
@@ -121,8 +122,9 @@ def human_gate_1(state: AutoApplyState) -> dict:
         }
 
     return {
+        **updates,
         "human_review_1": {
             "confirmed_mappings": confirmed_mappings,
             "additional_uploads": additional_uploads,
-        }
+        },
     }

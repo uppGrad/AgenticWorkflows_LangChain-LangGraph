@@ -29,12 +29,13 @@ def _fetch_url(url: str) -> tuple[int, str]:
 
 
 def scrape_application_page(state: AutoApplyState) -> dict:
+    updates = {"current_step": "scrape_application_page", "step_history": ["scrape_application_page"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     # Only runs for job opportunities
     if state.get("opportunity_type") != "job":
-        return {}
+        return updates
 
     opportunity_data = state.get("opportunity_data") or {}
     url_direct = opportunity_data.get("url_direct") or ""
@@ -44,6 +45,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
     if not target_url:
         logger.warning("scrape_application_page: no URL available in opportunity_data")
         return {
+            **updates,
             "scraped_requirements": {
                 "status": "failed",
                 "requirements": [],
@@ -52,7 +54,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
                 "raw_content": "",
                 "http_status": 0,
                 "error": "No URL available",
-            }
+            },
         }
 
     http_status, raw_content = _fetch_url(target_url)
@@ -60,6 +62,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
     if http_status == 0 or not raw_content:
         logger.warning("scrape_application_page: empty response from %s (http %s)", target_url, http_status)
         return {
+            **updates,
             "scraped_requirements": {
                 "status": "failed",
                 "requirements": [],
@@ -68,12 +71,13 @@ def scrape_application_page(state: AutoApplyState) -> dict:
                 "raw_content": "",
                 "http_status": http_status,
                 "error": "Empty or unreachable response",
-            }
+            },
         }
 
     if http_status >= 400:
         logger.warning("scrape_application_page: HTTP %s from %s", http_status, target_url)
         return {
+            **updates,
             "scraped_requirements": {
                 "status": "failed",
                 "requirements": [],
@@ -82,12 +86,13 @@ def scrape_application_page(state: AutoApplyState) -> dict:
                 "raw_content": "",
                 "http_status": http_status,
                 "error": f"HTTP {http_status}",
-            }
+            },
         }
 
     logger.info("scrape_application_page: fetched %d chars from %s", len(raw_content), target_url)
     # Store raw content; evaluate_scrape will assess quality and normalize requirements
     return {
+        **updates,
         "scraped_requirements": {
             "status": "partial",   # evaluate_scrape will set the final status
             "requirements": [],
@@ -95,5 +100,5 @@ def scrape_application_page(state: AutoApplyState) -> dict:
             "source": target_url,
             "raw_content": raw_content,
             "http_status": http_status,
-        }
+        },
     }

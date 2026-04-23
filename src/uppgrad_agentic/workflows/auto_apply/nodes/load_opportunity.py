@@ -139,49 +139,54 @@ def _fetch_opportunity(opportunity_type: str, opportunity_id: str) -> dict | Non
 
 
 def load_opportunity(state: AutoApplyState) -> dict:
+    updates = {"current_step": "load_opportunity", "step_history": ["load_opportunity"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type")
     opportunity_id = state.get("opportunity_id")
 
     if not opportunity_type:
         return {
+            **updates,
             "result": {
                 "status": "error",
                 "error_code": "MISSING_OPPORTUNITY_TYPE",
                 "user_message": "No opportunity type was provided.",
-            }
+            },
         }
 
     if not opportunity_id:
         return {
+            **updates,
             "result": {
                 "status": "error",
                 "error_code": "MISSING_OPPORTUNITY_ID",
                 "user_message": "No opportunity ID was provided.",
-            }
+            },
         }
 
     valid_types = ("job", "masters", "phd", "scholarship")
     if opportunity_type not in valid_types:
         return {
+            **updates,
             "result": {
                 "status": "error",
                 "error_code": "INVALID_OPPORTUNITY_TYPE",
                 "user_message": f"Unknown opportunity type '{opportunity_type}'. Must be one of: {', '.join(valid_types)}.",
-            }
+            },
         }
 
     record = _fetch_opportunity(opportunity_type, opportunity_id)
 
     if record is None:
         return {
+            **updates,
             "result": {
                 "status": "error",
                 "error_code": "OPPORTUNITY_NOT_FOUND",
                 "user_message": f"No {opportunity_type} opportunity found with ID '{opportunity_id}'.",
-            }
+            },
         }
 
-    return {"opportunity_data": record}
+    return {**updates, "opportunity_data": record}

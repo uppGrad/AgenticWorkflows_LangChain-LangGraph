@@ -42,8 +42,9 @@ def _post_to_backend(
 
 
 def submit_internal(state: AutoApplyState) -> dict:
+    updates = {"current_step": "submit_internal", "step_history": ["submit_internal"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_id = state.get("opportunity_id", "unknown")
     opportunity_data = state.get("opportunity_data") or {}
@@ -62,6 +63,7 @@ def submit_internal(state: AutoApplyState) -> dict:
     }
 
     return {
+        **updates,
         "application_package": application_package,
         "result": {
             "status": "ok",

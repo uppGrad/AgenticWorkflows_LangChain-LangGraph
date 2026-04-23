@@ -147,12 +147,13 @@ def _llm_evaluate(raw_content: str, llm) -> ScrapeResult | None:
 
 
 def evaluate_scrape(state: AutoApplyState) -> dict:
+    updates = {"current_step": "evaluate_scrape", "step_history": ["evaluate_scrape"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     # Only runs for job opportunities
     if state.get("opportunity_type") != "job":
-        return {}
+        return updates
 
     scraped = state.get("scraped_requirements") or {}
     source = scraped.get("source", "")
@@ -160,10 +161,11 @@ def evaluate_scrape(state: AutoApplyState) -> dict:
     # If scraping itself already failed (no raw content), surface that result directly
     if scraped.get("status") == "failed" and not scraped.get("raw_content"):
         return {
+            **updates,
             "scraped_requirements": {
                 **scraped,
                 "requirements": [r.model_dump() for r in _DEFAULT_JOB_REQUIREMENTS],
-            }
+            },
         }
 
     raw_content = scraped.get("raw_content", "")
@@ -187,10 +189,11 @@ def evaluate_scrape(state: AutoApplyState) -> dict:
         requirements = result.requirements
 
     return {
+        **updates,
         "scraped_requirements": {
             "status": result.status,
             "requirements": [r.model_dump() for r in requirements],
             "confidence": result.confidence,
             "source": source,
-        }
+        },
     }

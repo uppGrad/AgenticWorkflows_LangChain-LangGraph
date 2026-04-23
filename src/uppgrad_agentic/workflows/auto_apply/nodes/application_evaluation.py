@@ -123,8 +123,9 @@ def _evaluate_document(
 # ---------------------------------------------------------------------------
 
 def application_evaluation(state: AutoApplyState) -> dict:
+    updates = {"current_step": "application_evaluation", "step_history": ["application_evaluation"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     tailored_documents: Dict[str, Any] = state.get("tailored_documents") or {}
     opportunity_data: Dict[str, Any] = state.get("opportunity_data") or {}
@@ -152,6 +153,7 @@ def application_evaluation(state: AutoApplyState) -> dict:
         logger.info("  issue: %s", issue)
 
     return {
+        **updates,
         "evaluation_result": {
             "passed": passed,
             "issues": all_issues,

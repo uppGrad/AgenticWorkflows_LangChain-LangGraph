@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
 
@@ -78,6 +79,10 @@ class DocFeedbackState(TypedDict, total=False):
     final_document: str  # LaTeX source code
     final_pdf_bytes: Optional[bytes]  # compiled PDF binary
     diff: Dict[str, Any]  # {"applied": [...], "rejected": [...], "conflicts": [...], ...}
+
+    # frontend progress tracking
+    current_step: Optional[str]
+    step_history: Annotated[List[str], operator.add]
 
     # final response for frontend
     result: WorkflowResult

@@ -49,8 +49,9 @@ _PREVIEW_CHARS = 400
 
 
 def human_gate_2(state: AutoApplyState) -> dict:
+    updates = {"current_step": "human_gate_2", "step_history": ["human_gate_2"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     tailored_documents: Dict[str, Any] = state.get("tailored_documents") or {}
     opportunity_data = state.get("opportunity_data") or {}
@@ -102,8 +103,9 @@ def human_gate_2(state: AutoApplyState) -> dict:
     }
 
     return {
+        **updates,
         "human_review_2": {
             "approved": approved,
             "feedback": feedback,
-        }
+        },
     }

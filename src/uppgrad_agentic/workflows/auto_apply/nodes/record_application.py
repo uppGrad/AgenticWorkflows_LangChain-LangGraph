@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 def record_application(state: AutoApplyState) -> dict:
     # Always runs, even after an error path, to capture the outcome.
+    updates = {"current_step": "record_application", "step_history": ["record_application"]}
     opportunity_id = state.get("opportunity_id", "unknown")
     opportunity_type = state.get("opportunity_type", "unknown")
     application_package: Dict[str, Any] = state.get("application_package") or {}
@@ -60,4 +61,4 @@ def record_application(state: AutoApplyState) -> dict:
         outcome, opportunity_type, docs_in_package,
     )
 
-    return {"application_record": record}
+    return {**updates, "application_record": record}

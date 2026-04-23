@@ -140,11 +140,12 @@ _MAX_OPP_CHARS = 2000
 # ---------------------------------------------------------------------------
 
 def analyze_opportunity_alignment(context_pack: dict) -> dict:
+    updates = {"step_history": ["analyze_opportunity_alignment"]}
     opportunity_context = context_pack.get("opportunity_context") or {}
 
     # No opportunity provided — nothing to align against
     if not opportunity_context:
-        return {"analysis_results": {"opportunity_alignment": {}}}
+        return {**updates, "analysis_results": {"opportunity_alignment": {}}}
 
     doc_sections = context_pack.get("doc_sections") or {}
     doc_type = context_pack.get("doc_type", "UNKNOWN")
@@ -152,7 +153,7 @@ def analyze_opportunity_alignment(context_pack: dict) -> dict:
     llm = get_llm()
     if llm is None:
         result = _heuristic(doc_sections, opportunity_context)
-        return {"analysis_results": {"opportunity_alignment": result.model_dump()}}
+        return {**updates, "analysis_results": {"opportunity_alignment": result.model_dump()}}
 
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
     opp_text = str(opportunity_context)[:_MAX_OPP_CHARS]
@@ -171,9 +172,9 @@ def analyze_opportunity_alignment(context_pack: dict) -> dict:
 
     try:
         result: OpportunityAlignmentAnalysis = structured.invoke(msgs)
-        return {"analysis_results": {"opportunity_alignment": result.model_dump()}}
+        return {**updates, "analysis_results": {"opportunity_alignment": result.model_dump()}}
     except Exception as e:
         result = _heuristic(doc_sections, opportunity_context)
         out = result.model_dump()
         out["recommendations"] = out.get("recommendations", []) + [f"[LLM failed, used heuristic: {e}]"]
-        return {"analysis_results": {"opportunity_alignment": out}}
+        return {**updates, "analysis_results": {"opportunity_alignment": out}}

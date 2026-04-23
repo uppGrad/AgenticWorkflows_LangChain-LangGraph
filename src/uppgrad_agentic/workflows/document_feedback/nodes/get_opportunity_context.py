@@ -42,21 +42,22 @@ _MOCK_OPPORTUNITY: dict = {
 
 
 def get_opportunity_context(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "get_opportunity_context", "step_history": ["get_opportunity_context"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     # If the caller pre-injected opportunity_context (e.g., Django adapter),
     # skip the stub/mock logic and use the real data already in state.
     if state.get("opportunity_context"):
-        return {}
+        return updates
 
     instructions = (state.get("user_instructions") or "").strip()
 
     if instructions and _OPPORTUNITY_SIGNALS.search(instructions):
         # User appears to be targeting a specific opportunity — return the mock
         # so the opportunity-alignment analysis path has data to work with.
-        return {"opportunity_context": _MOCK_OPPORTUNITY}
+        return {**updates, "opportunity_context": _MOCK_OPPORTUNITY}
 
     # No opportunity context provided: return an empty dict so downstream nodes
     # can skip the opportunity-alignment analysis branch cleanly.
-    return {"opportunity_context": {}}
+    return {**updates, "opportunity_context": {}}

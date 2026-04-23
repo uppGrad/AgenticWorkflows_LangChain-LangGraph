@@ -6,12 +6,14 @@ from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 def end_with_error(state: DocFeedbackState) -> dict:
     # No-op node: ensures we always have a result for the frontend.
     # If already set, keep it; else set generic.
+    updates = {"current_step": "end_with_error", "step_history": ["end_with_error"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
     return {
+        **updates,
         "result": {
             "status": "error",
             "error_code": "UNKNOWN_ERROR",
             "user_message": "Something went wrong. Please try again.",
-        }
+        },
     }

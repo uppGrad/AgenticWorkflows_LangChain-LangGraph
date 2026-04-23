@@ -235,8 +235,9 @@ def _llm_asset_mapping(
 # ---------------------------------------------------------------------------
 
 def asset_mapping(state: AutoApplyState) -> dict:
+    updates = {"current_step": "asset_mapping", "step_history": ["asset_mapping"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
@@ -248,7 +249,7 @@ def asset_mapping(state: AutoApplyState) -> dict:
 
     if not normalized_requirements:
         logger.warning("asset_mapping: no normalized_requirements in state — returning empty mapping")
-        return {"asset_mapping": []}
+        return {**updates, "asset_mapping": []}
 
     llm = get_llm()
     mappings: List[AssetMap] | None = None
@@ -267,4 +268,4 @@ def asset_mapping(state: AutoApplyState) -> dict:
         llm is not None and mappings is not None,
     )
 
-    return {"asset_mapping": [m.model_dump() for m in mappings]}
+    return {**updates, "asset_mapping": [m.model_dump() for m in mappings]}

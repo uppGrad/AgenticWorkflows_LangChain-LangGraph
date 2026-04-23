@@ -4,11 +4,13 @@ from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
 
 def end_with_explanation(state: AutoApplyState) -> dict:
+    updates = {"current_step": "end_with_explanation", "step_history": ["end_with_explanation"]}
     eligibility = state.get("eligibility_result") or {}
     reasons = eligibility.get("reasons") or []
     reason_text = " ".join(reasons) if reasons else "You are not eligible for this opportunity."
 
     return {
+        **updates,
         "result": {
             "status": "error",
             "error_code": "INELIGIBLE",
@@ -17,5 +19,5 @@ def end_with_explanation(state: AutoApplyState) -> dict:
                 f"{reason_text}"
             ),
             "details": {"eligibility_result": eligibility},
-        }
+        },
     }

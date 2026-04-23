@@ -335,8 +335,9 @@ def _heuristic_proposals(
 # ---------------------------------------------------------------------------
 
 def synthesize_feedback(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "synthesize_feedback", "step_history": ["synthesize_feedback"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     analysis_results = state.get("analysis_results") or {}
     context_pack = state.get("context_pack") or {}
@@ -352,7 +353,7 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
     llm = get_llm()
     if llm is None:
         proposals = _heuristic_proposals(analysis_results, doc_sections)
-        return {"proposals": [p.model_dump() for p in proposals]}
+        return {**updates, "proposals": [p.model_dump() for p in proposals]}
 
     analysis_text = json.dumps(analysis_results, indent=2)[:_MAX_ANALYSIS_CHARS]
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
@@ -396,10 +397,10 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
 
         # Post-process: drop proposals with hallucinated before_text
         validated = _validate_proposals(raw_proposals, doc_sections)
-        return {"proposals": validated}
+        return {**updates, "proposals": validated}
     except Exception as e:
         proposals = _heuristic_proposals(analysis_results, doc_sections)
         result = [p.model_dump() for p in proposals]
         if result:
             result[0]["rationale"] += f" [LLM failed, used heuristic: {e}]"
-        return {"proposals": result}
+        return {**updates, "proposals": result}

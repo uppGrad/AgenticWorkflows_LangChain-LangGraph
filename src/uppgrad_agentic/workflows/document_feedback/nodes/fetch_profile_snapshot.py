@@ -38,14 +38,15 @@ _STUB_PROFILE: dict = {
 
 
 def fetch_profile_snapshot(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "fetch_profile_snapshot", "step_history": ["fetch_profile_snapshot"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     # If the caller pre-injected profile_snapshot (e.g., Django adapter),
     # skip the stub and use the real data already in state.
     if state.get("profile_snapshot"):
-        return {}
+        return updates
 
     # Fallback: return the hardcoded stub for standalone/CLI usage so
     # downstream nodes have realistic data to work with.
-    return {"profile_snapshot": _STUB_PROFILE}
+    return {**updates, "profile_snapshot": _STUB_PROFILE}

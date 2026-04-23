@@ -233,8 +233,9 @@ def _check_profile_completeness(
 # ---------------------------------------------------------------------------
 
 def eligibility_and_readiness(state: AutoApplyState) -> dict:
+    updates = {"current_step": "eligibility_and_readiness", "step_history": ["eligibility_and_readiness"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
@@ -254,7 +255,7 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
             reasons=[deadline_reason],
             missing_fields=[],
         )
-        return {"eligibility_result": result.model_dump()}
+        return {**updates, "eligibility_result": result.model_dump()}
 
     # ------------------------------------------------------------------
     # 2. Hard eligibility constraints — per opportunity type
@@ -275,7 +276,7 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
             reasons=issues,
             missing_fields=[],
         )
-        return {"eligibility_result": result.model_dump()}
+        return {**updates, "eligibility_result": result.model_dump()}
 
     # ------------------------------------------------------------------
     # 3. Profile completeness check
@@ -303,7 +304,7 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
             reasons=pending_reasons,
             missing_fields=missing_fields,
         )
-        return {"eligibility_result": result.model_dump()}
+        return {**updates, "eligibility_result": result.model_dump()}
 
     # ------------------------------------------------------------------
     # 4. Ready
@@ -313,4 +314,4 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
         reasons=["All eligibility checks passed and required documents are present."],
         missing_fields=[],
     )
-    return {"eligibility_result": result.model_dump()}
+    return {**updates, "eligibility_result": result.model_dump()}

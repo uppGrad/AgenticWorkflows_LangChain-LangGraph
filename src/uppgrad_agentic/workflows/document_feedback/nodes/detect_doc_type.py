@@ -87,8 +87,9 @@ def _heuristic_classify(text: str, user_instructions: str) -> DocTypeClassificat
 
 
 def detect_doc_type_and_relevance(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "detect_doc_type_and_relevance", "step_history": ["detect_doc_type_and_relevance"]}
     if state.get("result", {}).get("status") == "error":
-        return {}  # already failed upstream
+        return updates
 
     raw = state.get("raw_text", "")
     user_instructions = state.get("user_instructions", "") or ""
@@ -97,7 +98,7 @@ def detect_doc_type_and_relevance(state: DocFeedbackState) -> dict:
     llm = get_llm()
     if llm is None:
         cls = _heuristic_classify(snippet, user_instructions)
-        return {"doc_classification": cls.model_dump()}
+        return {**updates, "doc_classification": cls.model_dump()}
 
     # Structured output with Pydantic schema
     structured = llm.with_structured_output(DocTypeClassification)
@@ -114,10 +115,10 @@ def detect_doc_type_and_relevance(state: DocFeedbackState) -> dict:
 
     try:
         cls: DocTypeClassification = structured.invoke(msg)
-        return {"doc_classification": cls.model_dump()}
+        return {**updates, "doc_classification": cls.model_dump()}
     except Exception as e:
         # fallback if model/structured parsing fails
         cls = _heuristic_classify(snippet, user_instructions)
         out = cls.model_dump()
         out["reasons"] = (out.get("reasons") or []) + [f"LLM classify failed; used heuristic fallback: {e}"]
-        return {"doc_classification": out}
+        return {**updates, "doc_classification": out}

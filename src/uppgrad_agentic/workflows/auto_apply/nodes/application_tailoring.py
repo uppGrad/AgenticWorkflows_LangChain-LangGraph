@@ -278,8 +278,9 @@ def _resolve_source_text(
 # ---------------------------------------------------------------------------
 
 def application_tailoring(state: AutoApplyState) -> dict:
+    updates = {"current_step": "application_tailoring", "step_history": ["application_tailoring"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
@@ -290,7 +291,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
 
     if not confirmed_mappings:
         logger.warning("application_tailoring: no confirmed_mappings in human_review_1 — skipping")
-        return {"tailored_documents": {}}
+        return {**updates, "tailored_documents": {}}
 
     profile = _get_stub_profile()
     llm = get_llm()
@@ -350,4 +351,4 @@ def application_tailoring(state: AutoApplyState) -> dict:
             doc_type, tailoring_depth, llm_used, len(content),
         )
 
-    return {"tailored_documents": tailored}
+    return {**updates, "tailored_documents": tailored}

@@ -130,6 +130,7 @@ _MAX_CHARS = 6000
 # ---------------------------------------------------------------------------
 
 def analyze_style(context_pack: dict) -> dict:
+    updates = {"step_history": ["analyze_style"]}
     doc_type = context_pack.get("doc_type", "UNKNOWN")
     doc_sections = context_pack.get("doc_sections") or {}
     full_text = " ".join(doc_sections.values())[:_MAX_CHARS]
@@ -137,7 +138,7 @@ def analyze_style(context_pack: dict) -> dict:
     llm = get_llm()
     if llm is None:
         result = _heuristic(doc_type, doc_sections)
-        return {"analysis_results": {"style": result.model_dump()}}
+        return {**updates, "analysis_results": {"style": result.model_dump()}}
 
     structured = llm.with_structured_output(StyleAnalysis)
     msgs = [
@@ -152,9 +153,9 @@ def analyze_style(context_pack: dict) -> dict:
 
     try:
         result: StyleAnalysis = structured.invoke(msgs)
-        return {"analysis_results": {"style": result.model_dump()}}
+        return {**updates, "analysis_results": {"style": result.model_dump()}}
     except Exception as e:
         result = _heuristic(doc_type, doc_sections)
         out = result.model_dump()
         out["issues"] = out.get("issues", []) + [f"[LLM failed, used heuristic: {e}]"]
-        return {"analysis_results": {"style": out}}
+        return {**updates, "analysis_results": {"style": out}}

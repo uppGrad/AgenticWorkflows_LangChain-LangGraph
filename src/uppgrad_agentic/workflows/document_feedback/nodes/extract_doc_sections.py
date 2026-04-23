@@ -81,8 +81,9 @@ def _split_by_headers(text: str, pattern: re.Pattern) -> Dict[str, str]:
 
 
 def extract_doc_sections(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "extract_doc_sections", "step_history": ["extract_doc_sections"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     raw_text = state.get("raw_text", "") or ""
     doc_type = (state.get("doc_classification") or {}).get("doc_type", "UNKNOWN")
@@ -98,4 +99,4 @@ def extract_doc_sections(state: DocFeedbackState) -> dict:
         pattern = _header_pattern(_CV_HEADERS)
 
     sections = _split_by_headers(raw_text, pattern)
-    return {"doc_sections": sections}
+    return {**updates, "doc_sections": sections}

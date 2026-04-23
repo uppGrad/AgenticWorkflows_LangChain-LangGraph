@@ -149,8 +149,9 @@ def _parse_scholarship_requirements(data: dict) -> List[NormalizedRequirement]:
 
 
 def determine_requirements(state: AutoApplyState) -> dict:
+    updates = {"current_step": "determine_requirements", "step_history": ["determine_requirements"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
@@ -165,7 +166,7 @@ def determine_requirements(state: AutoApplyState) -> dict:
 
         if scrape_status == "full" and scraped_reqs:
             logger.info("determine_requirements: using fully scraped requirements (%d items)", len(scraped_reqs))
-            return {"normalized_requirements": scraped_reqs}
+            return {**updates, "normalized_requirements": scraped_reqs}
 
         if scrape_status == "partial" and scraped_reqs:
             # Merge scraped with defaults, deduplicating by document_type
@@ -179,10 +180,10 @@ def determine_requirements(state: AutoApplyState) -> dict:
                 len(scraped_reqs),
                 len(merged) - len(scraped_reqs),
             )
-            return {"normalized_requirements": merged}
+            return {**updates, "normalized_requirements": merged}
 
         logger.info("determine_requirements: scrape failed/empty — using assumed defaults for job")
-        return {"normalized_requirements": [r.model_dump() for r in _DEFAULTS["job"]]}
+        return {**updates, "normalized_requirements": [r.model_dump() for r in _DEFAULTS["job"]]}
 
     # ------------------------------------------------------------------
     # Masters / PhD: parse from data json
@@ -193,10 +194,10 @@ def determine_requirements(state: AutoApplyState) -> dict:
             parsed = _parse_program_requirements(data)
             if parsed:
                 logger.info("determine_requirements: parsed %d requirements from program data json", len(parsed))
-                return {"normalized_requirements": [r.model_dump() if hasattr(r, "model_dump") else r for r in parsed]}
+                return {**updates, "normalized_requirements": [r.model_dump() if hasattr(r, "model_dump") else r for r in parsed]}
 
         logger.info("determine_requirements: no parseable data json — using assumed defaults for %s", opportunity_type)
-        return {"normalized_requirements": [r.model_dump() for r in _DEFAULTS[opportunity_type]]}
+        return {**updates, "normalized_requirements": [r.model_dump() for r in _DEFAULTS[opportunity_type]]}
 
     # ------------------------------------------------------------------
     # Scholarship: parse from data json
@@ -207,16 +208,17 @@ def determine_requirements(state: AutoApplyState) -> dict:
             parsed = _parse_scholarship_requirements(data)
             if parsed:
                 logger.info("determine_requirements: parsed %d requirements from scholarship data json", len(parsed))
-                return {"normalized_requirements": [r.model_dump() if hasattr(r, "model_dump") else r for r in parsed]}
+                return {**updates, "normalized_requirements": [r.model_dump() if hasattr(r, "model_dump") else r for r in parsed]}
 
         logger.info("determine_requirements: no parseable scholarship data — using assumed defaults")
-        return {"normalized_requirements": [r.model_dump() for r in _DEFAULTS["scholarship"]]}
+        return {**updates, "normalized_requirements": [r.model_dump() for r in _DEFAULTS["scholarship"]]}
 
     # Unknown type — already validated upstream, but guard anyway
     return {
+        **updates,
         "result": {
             "status": "error",
             "error_code": "INVALID_OPPORTUNITY_TYPE",
             "user_message": f"Cannot determine requirements for unknown opportunity type: {opportunity_type}",
-        }
+        },
     }

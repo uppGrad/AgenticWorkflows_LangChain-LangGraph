@@ -228,8 +228,9 @@ def _heuristic_evaluate(
 # ---------------------------------------------------------------------------
 
 def evaluate_output(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "evaluate_output", "step_history": ["evaluate_output"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     proposals = state.get("proposals") or []
     raw_text = state.get("raw_text") or ""
@@ -242,6 +243,7 @@ def evaluate_output(state: DocFeedbackState) -> dict:
     if llm is None:
         result = _heuristic_evaluate(proposals, raw_text, profile_snapshot, current_iteration)
         return {
+            **updates,
             "evaluation_result": result.model_dump(),
             "iteration_count": current_iteration + 1,
         }
@@ -275,6 +277,7 @@ def evaluate_output(state: DocFeedbackState) -> dict:
         result.issues.append(f"[LLM evaluator failed, used heuristic: {e}]")
 
     return {
+        **updates,
         "evaluation_result": result.model_dump(),
         "iteration_count": current_iteration + 1,
     }

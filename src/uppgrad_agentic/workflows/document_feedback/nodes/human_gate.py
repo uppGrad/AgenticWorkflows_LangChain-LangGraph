@@ -35,8 +35,9 @@ from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 
 
 def human_gate(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "human_gate", "step_history": ["human_gate"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     proposals: List[Dict[str, Any]] = state.get("proposals") or []
 
@@ -92,8 +93,9 @@ def human_gate(state: DocFeedbackState) -> dict:
             approved_proposals.append(proposal_without_id)
 
     return {
+        **updates,
         "human_review": {
             "approved_proposals": approved_proposals,
             "decisions": normalised_decisions,
-        }
+        },
     }

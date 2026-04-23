@@ -383,8 +383,9 @@ def _build_diff(
 # ---------------------------------------------------------------------------
 
 def finalize(state: DocFeedbackState) -> dict:
+    updates = {"current_step": "finalize", "step_history": ["finalize"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     raw_text = state.get("raw_text") or ""
     human_review = state.get("human_review") or {}
@@ -401,6 +402,7 @@ def finalize(state: DocFeedbackState) -> dict:
         )
     except Exception as e:
         return {
+            **updates,
             "result": {
                 "status": "error",
                 "error_code": "LATEX_GENERATION_FAILED",
@@ -412,7 +414,7 @@ def finalize(state: DocFeedbackState) -> dict:
                     "exception": str(e),
                     "approved_proposals": approved_proposals,
                 },
-            }
+            },
         }
 
     # ------------------------------------------------------------------
@@ -445,6 +447,7 @@ def finalize(state: DocFeedbackState) -> dict:
     # Step 4: Write results to state
     # ------------------------------------------------------------------
     return {
+        **updates,
         "final_document": latex_source,
         "final_pdf_bytes": pdf_bytes,
         "diff": diff,

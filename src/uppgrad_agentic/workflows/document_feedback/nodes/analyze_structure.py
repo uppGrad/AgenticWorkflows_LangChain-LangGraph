@@ -144,6 +144,7 @@ def _heuristic(doc_type: str, doc_sections: dict[str, str]) -> StructureAnalysis
 # ---------------------------------------------------------------------------
 
 def analyze_structure(context_pack: dict) -> dict:
+    updates = {"step_history": ["analyze_structure"]}
     doc_type = context_pack.get("doc_type", "UNKNOWN")
     doc_sections = context_pack.get("doc_sections") or {}
     sections_summary = "\n".join(
@@ -154,7 +155,7 @@ def analyze_structure(context_pack: dict) -> dict:
     llm = get_llm()
     if llm is None:
         result = _heuristic(doc_type, doc_sections)
-        return {"analysis_results": {"structure": result.model_dump()}}
+        return {**updates, "analysis_results": {"structure": result.model_dump()}}
 
     structured = llm.with_structured_output(StructureAnalysis)
     msgs = [
@@ -169,9 +170,9 @@ def analyze_structure(context_pack: dict) -> dict:
 
     try:
         result: StructureAnalysis = structured.invoke(msgs)
-        return {"analysis_results": {"structure": result.model_dump()}}
+        return {**updates, "analysis_results": {"structure": result.model_dump()}}
     except Exception as e:
         result = _heuristic(doc_type, doc_sections)
         out = result.model_dump()
         out["layout_issues"] = out.get("layout_issues", []) + [f"[LLM failed, used heuristic: {e}]"]
-        return {"analysis_results": {"structure": out}}
+        return {**updates, "analysis_results": {"structure": out}}

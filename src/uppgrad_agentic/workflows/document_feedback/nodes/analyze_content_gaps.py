@@ -134,6 +134,7 @@ _MAX_PROFILE_CHARS = 2000
 # ---------------------------------------------------------------------------
 
 def analyze_content_gaps(context_pack: dict) -> dict:
+    updates = {"step_history": ["analyze_content_gaps"]}
     doc_type = context_pack.get("doc_type", "UNKNOWN")
     doc_sections = context_pack.get("doc_sections") or {}
     profile_snapshot = context_pack.get("profile_snapshot") or {}
@@ -141,7 +142,7 @@ def analyze_content_gaps(context_pack: dict) -> dict:
     llm = get_llm()
     if llm is None:
         result = _heuristic(doc_sections, profile_snapshot)
-        return {"analysis_results": {"content_gaps": result.model_dump()}}
+        return {**updates, "analysis_results": {"content_gaps": result.model_dump()}}
 
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
     profile_text = str(profile_snapshot)[:_MAX_PROFILE_CHARS]
@@ -160,9 +161,9 @@ def analyze_content_gaps(context_pack: dict) -> dict:
 
     try:
         result: ContentGapsAnalysis = structured.invoke(msgs)
-        return {"analysis_results": {"content_gaps": result.model_dump()}}
+        return {**updates, "analysis_results": {"content_gaps": result.model_dump()}}
     except Exception as e:
         result = _heuristic(doc_sections, profile_snapshot)
         out = result.model_dump()
         out["recommendations"] = out.get("recommendations", []) + [f"[LLM failed, used heuristic: {e}]"]
-        return {"analysis_results": {"content_gaps": out}}
+        return {**updates, "analysis_results": {"content_gaps": out}}

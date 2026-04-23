@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
 
 OpportunityType = Literal["job", "masters", "phd", "scholarship"]
@@ -45,6 +46,10 @@ class AutoApplyState(TypedDict, total=False):
     # submission
     application_package: Dict[str, Any]       # final documents ready for handoff or submission
     application_record: Dict[str, Any]        # logged outcome
+
+    # frontend progress tracking
+    current_step: Optional[str]
+    step_history: Annotated[List[str], operator.add]
 
     # final response for frontend
     result: WorkflowResult

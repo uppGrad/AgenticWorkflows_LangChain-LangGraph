@@ -9,8 +9,9 @@ logger = logging.getLogger(__name__)
 
 
 def package_and_handoff(state: AutoApplyState) -> dict:
+    updates = {"current_step": "package_and_handoff", "step_history": ["package_and_handoff"]}
     if state.get("result", {}).get("status") == "error":
-        return {}
+        return updates
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
@@ -69,6 +70,7 @@ def package_and_handoff(state: AutoApplyState) -> dict:
     )
 
     return {
+        **updates,
         "application_package": package,
         "result": {
             "status": "ok",
