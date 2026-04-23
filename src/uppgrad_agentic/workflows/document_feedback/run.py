@@ -28,7 +28,7 @@ def main():
         },
         config={"configurable": {"thread_id": thread_id}},
     )
-    print(json.dumps(out, indent=2, ensure_ascii=False))
+    print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
 
 
 if __name__ == "__main__":
