@@ -409,6 +409,14 @@ doc types (CV, SOP, Cover Letter), bug audit completed.
 - Phase 6: Rewrite (finalize); applies accepted proposals right-to-left, 
   resolves overlapping spans by confidence, LLM coherence smoothing pass, 
   produces diff summary
+- Bug fix: json.dumps crash in run.py when graph suspends at human_gate (Interrupt
+  object not JSON serializable); fixed with default=str
+- Frontend progress tracking: current_step (Optional[str]) and step_history
+  (Annotated[List[str], operator.add]) added to DocFeedbackState; all 17 nodes
+  updated to set indicators. Sequential nodes set both fields; the 5 parallel
+  analysis nodes set only step_history (concurrent current_step writes would
+  conflict). build_context_pack sets current_step="parallel_analysis" on its
+  successful return so the frontend has a meaningful indicator during the fan-out.
 
 **Auto-Apply Workflow** — fully implemented end-to-end, smoke tested across all four
 opportunity types (job, masters, phd, scholarship), routing verified at every
@@ -431,6 +439,9 @@ conditional edge, bug audit completed.
   (assembles package with scrape provenance for jobs); record_application.py
   (logs outcome, timestamp, doc types, scrape metadata)
 - graph.py fully wired end-to-end; run.py CLI entry point
+- Frontend progress tracking: current_step and step_history added to AutoApplyState;
+  all 15 nodes updated. Auto-apply has no parallel fan-out so all nodes set both
+  fields. No parallel_analysis sentinel needed.
 
 ### In Progress
 - Nothing currently in progress
