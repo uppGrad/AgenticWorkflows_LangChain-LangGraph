@@ -1,0 +1,16 @@
+Statement of Purpose
+
+Introduction
+I am applying to the MSc Computer Science program at Example University to deepen my expertise in machine learning and distributed systems.
+
+Academic Background
+I completed my BSc in Computer Science at the University of London in 2021 with a GPA of 3.7. During my studies, I developed strong foundations in algorithms, data structures, and software engineering principles.
+
+Research Interests and Research Experience
+My primary research interest lies at the intersection of natural language processing and scalable systems. I conducted an independent study project on transformer architectures during my final year.
+
+Goals and Career Goals
+My short-term goal is to complete this MSc and contribute original research in NLP. Long-term, I aspire to lead applied research teams in industry or academia.
+
+Conclusion
+I am confident that Example University's rigorous program and research environment will help me achieve these goals. I look forward to contributing to the department.

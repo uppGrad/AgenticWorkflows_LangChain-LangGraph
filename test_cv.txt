@@ -1,0 +1,24 @@
+Alex Johnson
+alex.johnson@email.com | London, UK | github.com/alexj
+
+EXPERIENCE
+
+Junior Software Engineer, TechStart Ltd, 2021–2023
+- Developed and maintained REST APIs using Python and Flask
+- Improved database query performance by 40% through indexing
+- Collaborated in an agile team of 8 engineers
+
+Software Engineering Intern, DataCo, Summer 2020
+- Built data ingestion pipelines processing 500K daily records
+- Wrote unit and integration tests, achieving 85% coverage
+
+EDUCATION
+
+BSc Computer Science, University of London, 2018–2021
+GPA: 3.7/4.0
+
+SKILLS
+
+Languages: Python, JavaScript, SQL, Go (basic)
+Tools: Git, Docker, PostgreSQL, Redis, AWS (EC2, S3, Lambda)
+Practices: REST APIs, Agile/Scrum, CI/CD, test-driven development

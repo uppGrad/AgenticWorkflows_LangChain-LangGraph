@@ -58,12 +58,12 @@ src/uppgrad_agentic/
       nodes/       # One file per node function
       prompts.py   # System/human prompt strings
       tests/       # Smoke test + unit test stubs (currently empty)
-    auto_apply/          # Not yet implemented
-      state.py     # AutoApplyState TypedDict (to be created)
-      schemas.py   # Pydantic models (to be created)
-      graph.py     # build_graph() (to be created)
-      run.py       # CLI entry point (to be created)
-      nodes/       # One file per node function (to be created) 
+    auto_apply/          # Fully implemented end-to-end
+      state.py     # AutoApplyState TypedDict
+      schemas.py   # Pydantic models (NormalizedRequirement, AssetMap, EligibilityResult, etc.)
+      graph.py     # build_graph() — assembles and compiles the LangGraph StateGraph
+      run.py       # CLI entry point: python -m uppgrad_agentic.workflows.auto_apply.run
+      nodes/       # One file per node function
 ```
 
 ### General patterns
@@ -360,13 +360,38 @@ fields, and graceful fallback when anti-bot mechanisms are encountered.
 Scrape confidence and scraped field structure should be stored in the application 
 record during current implementation to make this step easier to add later.
 
+### Scraping status
+
+Current implementation in scrape_application_page.py makes a plain requests.get()
+call which has effectively zero success rate against LinkedIn pages due to
+bot detection, JavaScript rendering, and login walls. The fallback to assumed
+default requirements [CV, Cover Letter] works correctly and gracefully.
+
+Planned improvement (next implementation step):
+Replace requests.get() with a Playwright-based scraper that:
+1. Navigates to url_direct if present in DB, else navigates to url
+2. If on LinkedIn job page, finds and follows the Apply button to reach url_direct
+3. Scrapes the actual application page at url_direct for required documents,
+   form fields, and special instructions
+4. Returns structured requirements with high confidence if successful
+
+Since scraping only triggers once per user auto-apply action (not bulk),
+LinkedIn ban risk is low. Playwright with stealth patches is the recommended
+approach. This is a planned improvement, not yet implemented.
+
+Also note: LLM-powered scraping libraries like Firecrawl, Crawl4AI, and
+Scrapegraph-ai are worth evaluating as alternatives or complements to Playwright
+for structured requirement extraction. Crawl4AI is open source and free.
+Evaluate these before implementing the Playwright approach.
+
 ---
 
 ## Implementation Status
 
 ### Completed
 
-**Document Feedback Workflow**
+**Document Feedback Workflow** — fully implemented, smoke tested across all three
+doc types (CV, SOP, Cover Letter), bug audit completed.
 - Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing
 - Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, 
   parse_user_instructions, get_opportunity_context, build_context_pack); 
@@ -385,7 +410,9 @@ record during current implementation to make this step easier to add later.
   resolves overlapping spans by confidence, LLM coherence smoothing pass, 
   produces diff summary
 
-**Auto-Apply Workflow**
+**Auto-Apply Workflow** — fully implemented end-to-end, smoke tested across all four
+opportunity types (job, masters, phd, scholarship), routing verified at every
+conditional edge, bug audit completed.
 - Opportunity Intelligence: load_opportunity.py (stub DB lookup for all four types),
   scrape_application_page.py (requests-based fetch with graceful failure),
   evaluate_scrape.py (LLM structured output + heuristic fallback),
@@ -511,4 +538,68 @@ backend / frontend / database integration.
   layer must always send a non-empty dict as the resume value. "Confirm all
   defaults" for gate 1 uses `{"confirm": True}`; approval for gate 2 uses
   `{"approved": True}`.
+
+**Stub DB calls — all four nodes import from the same stub**
+- **load_opportunity.py** — `_fetch_opportunity()` ignores `opportunity_id`
+  entirely; returns the same hardcoded record for any ID of a given type.
+  The not-found error path (`OPPORTUNITY_NOT_FOUND`) is therefore untestable
+  with the current stub. Replace with real table queries keyed on both type
+  and ID.
+- **eligibility_and_readiness.py, asset_mapping.py, application_tailoring.py** —
+  all three import `_get_stub_profile()` from `eligibility_and_readiness.py`.
+  Replace with a single shared profile-fetching utility keyed on `state["user_id"]`
+  once the API layer injects `user_id` into state.
+
+**human_gate_0 is a dead stub**
+- **human_gate_0.py** — Does not call `interrupt()`. Returns a plain dict and
+  the graph edge goes directly to END. Any workflow where eligibility=`pending`
+  terminates immediately instead of suspending for user input. `record_application`
+  never runs on this path, so no application is logged. Must be replaced with a
+  real `interrupt()` / `Command(resume=...)` cycle matching `human_gate_1.py`,
+  followed by a re-run of `eligibility_and_readiness` to confirm the gap is closed.
+
+**Stub profile marks all documents as unavailable**
+- **eligibility_and_readiness.py:_STUB_PROFILE** — `uploaded_documents` has
+  `Cover Letter: False`, `SOP: False`, `References: False`, etc. This causes
+  every opportunity type to trigger `eligibility=pending` and route to the dead
+  `human_gate_0`. The full post-eligibility pipeline (asset_mapping → tailoring
+  → evaluation → human_gate_2 → submission) is unreachable through the graph
+  without patching the stub. Add a testing mode flag or a separate "all docs
+  uploaded" fixture profile to make integration testing possible without a real DB.
+
+**AssetMap.requirement_type naming is misleading**
+- **asset_mapping.py, schemas.py** — `AssetMap.requirement_type` stores the
+  document type name (e.g. "CV", "Cover Letter") not the requirement category
+  ("document", "language", "other"). The field should be renamed `document_type`
+  to match its actual content. Verify downstream consumers (`human_gate_1.py`,
+  `application_tailoring.py`) before renaming, as both key confirmed_mappings
+  by this field value.
+
+**Heuristic SOP/Personal Statement produces placeholder text**
+- **application_tailoring.py:_heuristic_tailor** — When LLM is unavailable,
+  the heuristic generator for SOP and Personal Statement embeds the literal
+  string `[Source material summary — real generation requires LLM]` in the
+  output. `application_evaluation` correctly flags this as an unfilled placeholder,
+  causing the evaluation loop to retry (then proceed at MAX_EVAL_ITERATIONS).
+  The final document handed to the user contains this placeholder string.
+  Either remove the placeholder and generate minimal coherent prose without an
+  LLM, or gate SOP/Personal Statement generation on LLM availability and surface
+  a clear message to the user when it is not configured.
+
+**submit_internal is a stub POST**
+- **submit_internal.py** — `_post_to_backend()` is a no-op that logs and returns
+  a fake `platform_application_id`. Replace with a real authenticated HTTP POST
+  to the platform API once the endpoint URL, auth headers, and payload schema
+  are defined during backend integration.
+
+**Graph state persistence — auto-apply**
+- **graph.py (auto_apply)** — Uses `MemorySaver`. Replace with `AsyncPostgresSaver`
+  for durable interrupt/resume across API requests. The API layer must generate
+  and persist `thread_id` per workflow run, same as the document feedback workflow.
+
+**No FastAPI service layer for auto-apply**
+- No HTTP API layer exists for auto-apply. `run.py` is CLI only. A FastAPI service
+  layer is needed to handle authenticated invocation, interrupt/resume across
+  requests, streaming or polling for intermediate state (eligibility result,
+  asset mapping, tailored documents), and returning structured JSON to the frontend.
 

@@ -1,0 +1,18 @@
+Alex Johnson
+alex.johnson@email.com | London, UK
+
+Dear Hiring Manager,
+
+Opening
+I am writing to express my strong interest in the Software Engineer position at Acme Corp. With over two years of professional experience in Python-based backend development, I am excited about this opportunity to contribute to your team.
+
+Body
+In my current role at TechStart Ltd, I developed and maintained REST APIs serving thousands of daily users. I improved database query performance by 40% through careful indexing and query optimization. My experience building data pipelines at DataCo gave me strong skills in reliability engineering.
+
+I am particularly drawn to Acme Corp because of your focus on scalable backend systems, which aligns directly with my experience using Python, Docker, and PostgreSQL.
+
+Closing
+I would welcome the opportunity to discuss how my background can contribute to Acme Corp's mission. I have attached my CV for your consideration and look forward to speaking with you.
+
+Yours sincerely,
+Alex Johnson
