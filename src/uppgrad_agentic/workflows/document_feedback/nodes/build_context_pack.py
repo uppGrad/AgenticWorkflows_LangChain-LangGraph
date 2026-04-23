@@ -26,4 +26,4 @@ def build_context_pack(state: DocFeedbackState) -> dict:
         "has_opportunity": bool(state.get("opportunity_context")),
     }
 
-    return {**updates, "context_pack": context_pack}
+    return {**updates, "current_step": "parallel_analysis", "context_pack": context_pack}
