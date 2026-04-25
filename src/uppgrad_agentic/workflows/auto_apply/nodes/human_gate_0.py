@@ -1,24 +1,42 @@
 from __future__ import annotations
 
-# Stub — will be implemented with LangGraph interrupt() during human-in-the-loop phase.
-# Triggered when eligibility_and_readiness returns decision="pending" due to missing
-# profile fields or documents. Presents missing_fields to the user and suspends the
-# graph until they complete their profile and re-submit.
+from langgraph.types import interrupt
 
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
+
+MAX_GATE_0_ITERATIONS = 2
 
 
 def human_gate_0(state: AutoApplyState) -> dict:
     updates = {"current_step": "human_gate_0", "step_history": ["human_gate_0"]}
+    if state.get("result", {}).get("status") == "error":
+        return updates
+
+    iteration = state.get("gate_0_iteration_count", 0)
+    if iteration >= MAX_GATE_0_ITERATIONS:
+        return {
+            **updates,
+            "result": {
+                "status": "error",
+                "error_code": "PROFILE_INCOMPLETE_AFTER_RETRIES",
+                "user_message": (
+                    "Profile is still incomplete after the maximum number of completion attempts. "
+                    "Please update your profile and start a new application session."
+                ),
+            },
+        }
+
     eligibility = state.get("eligibility_result") or {}
-    missing = eligibility.get("missing_fields") or []
+    payload = {
+        "type": "profile_completion",
+        "missing_fields": eligibility.get("missing_fields", []),
+        "reasons": eligibility.get("reasons", []),
+        "iteration": iteration,
+    }
+    response = interrupt(payload)
+
     return {
         **updates,
-        "result": {
-            "status": "ok",
-            "user_message": (
-                "[STUB] human_gate_0: workflow suspended pending profile completion. "
-                f"Missing: {', '.join(missing)}"
-            ),
-        },
+        "human_review_0": response or {},
+        "gate_0_iteration_count": iteration + 1,
     }
