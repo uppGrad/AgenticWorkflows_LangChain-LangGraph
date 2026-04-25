@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Stub DB records — replaced with real DB queries during backend integration
@@ -146,6 +150,15 @@ def load_opportunity(state: AutoApplyState) -> dict:
     # Pre-loaded by backend adapter (Spec A1) — pass through with no DB hit.
     if state.get("opportunity_data"):
         return updates
+
+    # Reaching here means no pre-loaded opportunity_data → falling through to
+    # the in-repo stub records. Expected in CLI/local-dev mode only; in
+    # production the backend adapter must always pre-load opportunity_data.
+    logger.warning(
+        "load_opportunity: state['opportunity_data'] absent — falling back to "
+        "in-repo stub records. This is expected only in CLI/local-dev mode; in "
+        "production the backend adapter must pre-load opportunity_data."
+    )
 
     opportunity_type = state.get("opportunity_type")
     opportunity_id = state.get("opportunity_id")
