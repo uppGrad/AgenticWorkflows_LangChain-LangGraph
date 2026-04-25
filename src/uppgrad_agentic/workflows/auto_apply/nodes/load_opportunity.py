@@ -143,6 +143,10 @@ def load_opportunity(state: AutoApplyState) -> dict:
     if state.get("result", {}).get("status") == "error":
         return updates
 
+    # Pre-loaded by backend adapter (Spec A1) — pass through with no DB hit.
+    if state.get("opportunity_data"):
+        return updates
+
     opportunity_type = state.get("opportunity_type")
     opportunity_id = state.get("opportunity_id")
 
