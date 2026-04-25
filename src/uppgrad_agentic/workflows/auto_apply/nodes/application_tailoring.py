@@ -13,6 +13,31 @@ from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 logger = logging.getLogger(__name__)
 
 _MAX_SOURCE_CHARS = 6_000
+
+# Per-doc-type output caps (Spec §10.Q5)
+_DOC_TYPE_CAPS = {
+    "CV": 8000,
+    "Cover Letter": 3000,
+    "SOP": 6000,
+    "Personal Statement": 6000,
+}
+_DEFAULT_CAP = 5000
+
+
+def _truncate_to_cap(content: str, doc_type: str) -> str:
+    """Truncate tailored output to the per-doc-type cap.
+
+    If the cap is exceeded, truncate at the last paragraph boundary that fits;
+    otherwise hard-cut at the cap. Caps prevent runaway LLM output from
+    breaking PDF rendering and frontend display.
+    """
+    cap = _DOC_TYPE_CAPS.get(doc_type, _DEFAULT_CAP)
+    if len(content) <= cap:
+        return content
+    boundary = content.rfind("\n\n", 0, cap)
+    if boundary > cap // 2:
+        return content[:boundary]
+    return content[:cap]
 _MAX_OPP_CHARS = 3_000
 
 # ---------------------------------------------------------------------------
@@ -340,7 +365,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
             )
 
         tailored[doc_type] = {
-            "content": content,
+            "content": _truncate_to_cap(content, doc_type),
             "tailoring_depth": tailoring_depth,
             "source": source_document,
             "llm_used": llm_used,
