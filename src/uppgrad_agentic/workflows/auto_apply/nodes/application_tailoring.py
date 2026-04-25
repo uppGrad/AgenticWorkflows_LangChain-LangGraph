@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from uppgrad_agentic.common.llm import get_llm
-from uppgrad_agentic.workflows.auto_apply.nodes.eligibility_and_readiness import _get_stub_profile
+from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
 logger = logging.getLogger(__name__)
@@ -293,7 +293,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
         logger.warning("application_tailoring: no confirmed_mappings in human_review_1 — skipping")
         return {**updates, "tailored_documents": {}}
 
-    profile = _get_stub_profile()
+    profile = resolve_profile(state)
     llm = get_llm()
     tailored: Dict[str, Any] = {}
 

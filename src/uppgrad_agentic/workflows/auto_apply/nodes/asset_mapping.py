@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Stub profile accessor — shared definition lives in eligibility_and_readiness.
 # Importing it directly keeps a single source of truth for the stub.
 # ---------------------------------------------------------------------------
-from uppgrad_agentic.workflows.auto_apply.nodes.eligibility_and_readiness import _get_stub_profile
+from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
 
 # ---------------------------------------------------------------------------
 # Document types the system can write/generate vs. ones the user must supply
@@ -242,7 +242,7 @@ def asset_mapping(state: AutoApplyState) -> dict:
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
     normalized_requirements = state.get("normalized_requirements") or []
-    profile = _get_stub_profile()
+    profile = resolve_profile(state)
     uploaded: Dict[str, bool] = {
         k: bool(v) for k, v in (profile.get("uploaded_documents") or {}).items()
     }
