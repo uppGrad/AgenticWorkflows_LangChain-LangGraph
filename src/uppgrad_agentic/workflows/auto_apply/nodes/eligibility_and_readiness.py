@@ -240,7 +240,8 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
     normalized_requirements = state.get("normalized_requirements") or []
-    profile = _get_stub_profile()
+    from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
+    profile = resolve_profile(state)
 
     reasons: List[str] = []
     missing_fields: List[str] = []
