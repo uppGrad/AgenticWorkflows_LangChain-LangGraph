@@ -33,6 +33,30 @@ def scrape_application_page(state: AutoApplyState) -> dict:
             },
         }
 
+    # Fast path: discovery already verified + fetched the URL. Use that content
+    # instead of re-fetching (avoids the second-look thin-detection conflict
+    # AND halves the request count, reducing ban risk).
+    pre_fetched = (state.get("discovered_page_content") or "").strip()
+    if pre_fetched:
+        pre_status = state.get("discovered_http_status") or 200
+        logger.info(
+            "scrape_application_page: using pre-fetched content from discovery (%d chars, status=%s) for %s",
+            len(pre_fetched), pre_status, target_url,
+        )
+        return {
+            **updates,
+            "scraped_requirements": {
+                "status": "partial",
+                "requirements": [],
+                "confidence": 0.0,
+                "source": target_url,
+                "raw_content": pre_fetched,
+                "http_status": pre_status,
+            },
+        }
+
+    # Slow path: discovery didn't fetch (url_direct, cache hit without text).
+    # Fetch fresh via the tiered fetcher.
     fetch = fetch_url_with_fallback(target_url)
 
     if not fetch.success or fetch.thin:
@@ -58,7 +82,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
     return {
         **updates,
         "scraped_requirements": {
-            "status": "partial",   # evaluate_scrape sets the final status
+            "status": "partial",
             "requirements": [],
             "confidence": 0.0,
             "source": target_url,

@@ -32,6 +32,11 @@ class AutoApplyState(TypedDict, total=False):
     discovery_method: Optional[str]
     discovery_confidence: Optional[float]
 
+    # Verified page content from discovery — propagated to scrape_application_page
+    # so we don't re-fetch the same URL twice (Phase 2 of v2.1 follow-up).
+    discovered_page_content: Optional[str]
+    discovered_http_status: Optional[int]
+
     # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
     gate_0_iteration_count: int
 

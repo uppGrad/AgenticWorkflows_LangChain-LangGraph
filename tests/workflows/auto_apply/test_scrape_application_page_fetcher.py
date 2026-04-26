@@ -71,3 +71,46 @@ def test_short_circuits_on_upstream_error():
     state["result"] = {"status": "error"}
     out = scrape_application_page(state)
     assert "scraped_requirements" not in out
+
+
+def test_uses_pre_fetched_content_when_present():
+    """When discovery already verified + fetched, scrape uses that content
+    instead of re-fetching the same URL."""
+    state = _state(discovered="https://boards.greenhouse.io/acme/jobs/1", method="ats")
+    state["discovered_page_content"] = "Pre-fetched apply page content from discovery."
+    state["discovered_http_status"] = 200
+
+    # Patch fetch_url_with_fallback so we can detect if it was called
+    with patch(
+        "uppgrad_agentic.workflows.auto_apply.nodes.scrape_application_page.fetch_url_with_fallback",
+    ) as fake_fetch:
+        out = scrape_application_page(state)
+
+    # Fast path: no network call
+    fake_fetch.assert_not_called()
+    sr = out["scraped_requirements"]
+    assert sr["status"] == "partial"
+    assert sr["raw_content"] == "Pre-fetched apply page content from discovery."
+    assert sr["http_status"] == 200
+
+
+def test_falls_back_to_fetch_when_no_pre_fetched_content():
+    """url_direct path doesn't pre-fetch — scrape still fetches via web_fetcher."""
+    from uppgrad_agentic.tools.web_fetcher import FetchResult
+    state = _state(discovered="https://acme.com/apply/1", method="url_direct")
+    # discovered_page_content not set
+    fake_fetch_result = FetchResult(
+        success=True, thin=False,
+        text="Fresh fetch content for url_direct path.",
+        http_status=200,
+    )
+    with patch(
+        "uppgrad_agentic.workflows.auto_apply.nodes.scrape_application_page.fetch_url_with_fallback",
+        return_value=fake_fetch_result,
+    ) as fake_fetch:
+        out = scrape_application_page(state)
+
+    fake_fetch.assert_called_once_with("https://acme.com/apply/1")
+    sr = out["scraped_requirements"]
+    assert sr["status"] == "partial"
+    assert sr["raw_content"] == "Fresh fetch content for url_direct path."
