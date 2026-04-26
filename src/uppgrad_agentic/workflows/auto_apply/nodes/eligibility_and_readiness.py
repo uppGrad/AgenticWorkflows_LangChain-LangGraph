@@ -112,10 +112,12 @@ def _check_deadline(opportunity_data: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def _check_job_eligibility(opportunity_data: Dict[str, Any], profile: Dict[str, Any]) -> List[str]:
-    issues: List[str] = []
+    """Return compatibility warnings (not hard-block reasons) for a job posting.
 
-    if opportunity_data.get("is_closed"):
-        issues.append("This job posting is closed and no longer accepting applications.")
+    NOTE: is_closed is filtered by the backend adapter at session start; no need to
+    re-check here.
+    """
+    issues: List[str] = []
 
     if not opportunity_data.get("is_remote", False):
         job_location = (opportunity_data.get("location") or "").lower()
@@ -272,36 +274,27 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
             reasons=[deadline_reason],
             missing_fields=[],
         )
-        return {**updates, "eligibility_result": result.model_dump()}
+        return {**updates, "eligibility_result": result.model_dump(),
+                "compatibility_warnings": []}
 
     # ------------------------------------------------------------------
-    # 2. Hard eligibility constraints — per opportunity type
+    # 2. Compatibility warnings (NOT blocks). Surface in handoff package.
     # ------------------------------------------------------------------
     if opportunity_type == "job":
-        issues = _check_job_eligibility(opportunity_data, profile)
+        warnings = _check_job_eligibility(opportunity_data, profile)
     elif opportunity_type in ("masters", "phd"):
-        issues = _check_program_eligibility(opportunity_data, profile)
+        warnings = _check_program_eligibility(opportunity_data, profile)
     elif opportunity_type == "scholarship":
-        issues = _check_scholarship_eligibility(opportunity_data, profile)
+        warnings = _check_scholarship_eligibility(opportunity_data, profile)
     else:
-        issues = []
-
-    if issues:
-        # Hard eligibility failures → ineligible (not pending, user cannot fix these)
-        result = EligibilityResult(
-            decision="ineligible",
-            reasons=issues,
-            missing_fields=[],
-        )
-        return {**updates, "eligibility_result": result.model_dump()}
+        warnings = []
 
     # ------------------------------------------------------------------
-    # 3. Profile completeness check
+    # 3. Profile completeness check (gate 0 trigger)
     # ------------------------------------------------------------------
     missing_fields = _check_profile_completeness(profile, normalized_requirements)
 
     if missing_fields:
-        # Document uploads are fixable by the user → pending
         doc_missing = [f for f in missing_fields if f.startswith("document:")]
         profile_missing = [f for f in missing_fields if not f.startswith("document:")]
 
@@ -321,14 +314,16 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
             reasons=pending_reasons,
             missing_fields=missing_fields,
         )
-        return {**updates, "eligibility_result": result.model_dump()}
+        return {**updates, "eligibility_result": result.model_dump(),
+                "compatibility_warnings": warnings}
 
     # ------------------------------------------------------------------
     # 4. Ready
     # ------------------------------------------------------------------
     result = EligibilityResult(
         decision="ready",
-        reasons=["All eligibility checks passed and required documents are present."],
+        reasons=["All hard checks passed; required documents are present or generatable."],
         missing_fields=[],
     )
-    return {**updates, "eligibility_result": result.model_dump()}
+    return {**updates, "eligibility_result": result.model_dump(),
+            "compatibility_warnings": warnings}
