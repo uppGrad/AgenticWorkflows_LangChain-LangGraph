@@ -816,3 +816,93 @@ unrelated to this work.
 - `submit_internal._post_to_backend` was removed; the equivalent ORM-write
   path now lives in `backend/ai_services/auto_apply_adapter.finalize_internal_submission`.
 
+---
+
+## 2026-04-27 — Discovery v2 + Eligibility Cleanup
+
+This section summarises the changes shipped on the `feature/discovery-v2`
+branch (PR #2). Replaces the LinkedIn-fetch-then-fail scrape path with a
+search-based discovery pipeline (Brave) + httpx-first fetcher with optional
+Playwright fallback. Plus a small eligibility-node redesign that separates
+compatibility *warnings* from material-readiness *gating*.
+
+**Spec / plan refs:**
+- Plan: `docs/superpowers/plans/2026-04-26-discovery-v2.md`
+- Original (paused) plan: `docs/superpowers/plans/2026-04-26-apply-url-discovery.md` — superseded by v2
+
+### Feature additions in the agentic repo
+
+**State:**
+- `compatibility_warnings: List[str]` — non-blocking warnings (location/age/degree-level) carried alongside the eligibility decision and surfaced into `application_package.warnings`.
+- `discovered_page_content: Optional[str]` + `discovered_http_status: Optional[int]` — verified page content propagated from discovery to scrape so we don't double-fetch.
+
+**`tools/search.py`** — new. `SearchProvider` ABC + `BraveSearchProvider`. Opt-in via `UPPGRAD_SEARCH_PROVIDER=brave` + `BRAVE_SEARCH_API_KEY`. Mirrors `get_llm()` factory pattern.
+
+**`tools/web_fetcher.py`** — new. Tiered fetcher:
+- httpx-first (fast, cheap, no browser)
+- Playwright/Crawl4AI fallback when (a) httpx is thin AND (b) `UPPGRAD_BROWSER_SCRAPE_ENABLED=true`. Crawl4AI lazy-imported; gracefully no-ops when not installed.
+- `_detect_thin` heuristic flags 4xx, short bodies, and ≥2 anti-bot keywords.
+
+**`tools/url_discovery.py`** — new. Multi-factor verification + 3-tier orchestration:
+- **Verification gates** (after live testing surfaced false positives):
+  - Title fuzzy match ≥85 (hard prerequisite).
+  - **Corroborator count** from {company-in-text, location-match, posted-time-match, description-keyword-overlap}. ATS / generic need 2; careers needs 1 (domain proves company).
+  - Confidence scaled by extra corroborators beyond minimum.
+  - Thin pages (captcha walls, 4xx, JS shells) rejected at the fetcher gate before scoring.
+- **3-tier search** (ATS → company careers → generic):
+  - Tier 1 ATS: `"<title>" "<company>" (site:greenhouse.io OR site:lever.co OR ...)`.
+  - Tier 2 careers: `"<title>" site:<company-domain>` — but skipped when `company_url` resolves to a blocklisted domain (linkedin.com, indeed.com, glassdoor.com, social/aggregator sites). LinkedIn-jobs `company_url` is usually the LinkedIn company page URL, not a real careers site, so this blocklist saves the wasted Brave call.
+  - Tier 3 generic: `"<title>" "<company>" apply` (no `site:` constraint).
+- **Single-fetch architecture** — `DiscoveryResult.text` carries verified content forward; `scrape_application_page` consumes it instead of re-fetching the same URL.
+
+**`nodes/discover_apply_url.py`** — new graph node sitting between `load_opportunity` and `scrape_application_page` (jobs only; skipped for internal jobs and non-job opportunity types). Cache-hit short-circuit honored.
+
+**`nodes/scrape_application_page.py`** — rewritten. Uses pre-fetched content from `state['discovered_page_content']` when present; falls back to fresh httpx fetch for url_direct paths and cache hits without text.
+
+**`nodes/eligibility_and_readiness.py`** — refactored. Hard-blocks ONLY for deadline-passed and missing user-supplied (non-generatable) docs. Compatibility issues (location, age, degree-level, discipline, nationality) become warnings stored in `state['compatibility_warnings']`, NOT decisions that drive `'ineligible'`. Removed redundant `is_closed` re-check (already filtered at session start).
+
+**`nodes/package_and_handoff.py`** + **`nodes/submit_internal.py`** — both now include `warnings` in the `application_package`.
+
+**`graph.py`** — `discover_apply_url` wired between `load_opportunity` and `scrape_application_page` for jobs.
+
+### Backend additions
+
+- `ApplicationSession.compatibility_warnings = JSONField(default=list)` — surfaced via `ApplicationSessionSerializer`.
+- `JobApplyUrlDiscovery` model (PK=`job_id`, fields: discovered_url, discovery_method, discovery_confidence, discovered_at, last_verified_at). Cross-user cache. 14-day staleness gate.
+- Adapter: `_lookup_discovery_cache` (pre-invoke) + `_persist_discovery_to_cache` (post-invoke, upserts via `update_or_create`, skips for `failed` and `skipped_internal`).
+
+### Bugs detected during live testing (and fixed)
+
+1. **False-positive verification on title+company alone.** A linkedin_jobs row for Celonis CVP in Schwyz, Switzerland matched a Greenhouse URL for the same role in Cleveland, Ohio purely on title fuzz + same-company. Fixed by requiring corroborators beyond title+company. Live cross-check is now required before declaring any discovery test "successful."
+2. **Double httpx fetch on the same URL.** Verification fetched a candidate, then `scrape_application_page` re-fetched the same URL within a second. Wasteful and increases ban risk. Fixed by propagating verified text through state.
+3. **Thin-detector second-look conflict.** `_detect_thin` could veto a page that verification had already accepted (real Greenhouse pages contain "404"/"captcha" keywords incidentally — JS paths, hidden fields). Fixed by rejecting thin pages at the verification gate, never letting them reach a second-look during scrape.
+4. **`site:linkedin.com` careers tier waste.** `linkedin_jobs.company_url` is usually a LinkedIn company-page URL, so `_build_careers_query` was firing `site:linkedin.com` queries that found nothing useful. Fixed via `_CAREERS_DOMAIN_BLOCKLIST`.
+
+### Live verification results (cross-checked against source data)
+
+Tested against Neon dev branch with real Brave Search + real OpenAI LLM:
+
+| Job | Location | Discovery | Cross-check verdict |
+|---|---|---|---|
+| Celonis CVP (id 202599) | Schwyz, Switzerland | `failed` | ✅ Correct — Greenhouse only had Cleveland role for that title |
+| GitHub Senior Solutions Engineer (id 199838) | Germany | `failed` | ✅ Correct — GitHub uses Workday (JS-rendered, would need browser fallback) |
+| Anthropic SA Munich (id 200082) | Munich, Germany | `failed` | ✅ Correct — Greenhouse had Paris and NYC variants of the role, no Munich match. Also: confirmed by user this listing is a "tracker-only" ghost posting — no real apply destination exists. |
+
+Cache rows after 3 failed runs: 0 (correct: cache only stores successful matches).
+
+### Future work
+
+**Critical:**
+- **Browser fallback in production.** With `UPPGRAD_BROWSER_SCRAPE_ENABLED=false`, discovery's success rate against Workday-hosted careers (a meaningful share of large-company postings) is near zero. Turning on Crawl4AI/Playwright in prod requires Railway Chromium setup (1GB+ per instance, lazy-imported, env-gated). Plan covers the integration; the deployment piece is the open task.
+- **LinkedIn ghost-posting detection upstream.** A meaningful share of `linkedin_jobs` rows are "tracker-only" postings: LinkedIn's apply button doesn't go anywhere external (just bookmarks the listing to the user's tracker). Discovery correctly returns `failed` for these but burns Brave calls finding nothing real. **Real fix is in the scraper (`bitirme/linkedin_jobspy/scraper.py`)** — detect apply-flow type at ingestion and store as `apply_type` field. Then the backend filters tracker-only jobs out of the auto-apply candidate set entirely. Until then, see "negative caching" below.
+
+**Important but not blocking:**
+- **Negative caching for `failed` discoveries with short TTL** (e.g., 7 days). Saves Brave budget on repeat ghost-posting attempts. Risk: misses cases where the company posts to Greenhouse a few days later — but acceptable for the long-tail ghost cases.
+- **UI signal for ghost postings.** When `url_direct` is empty AND discovery returns `failed`, surface "We couldn't find an external apply page for this job" on the apply screen.
+- **Description-keyword extraction** is purely frequency-based after stopword filtering. A more rigorous approach (TF-IDF against a corpus of similar job descriptions, or named-entity extraction) would produce better corroborators but adds complexity. Acceptable for v1; revisit if the live false-negative rate is high.
+- **Verification still relies on raw HTML.** Greenhouse pages contain JSON-LD structured data (`<script type="application/ld+json">`) with title/location/etc. Parsing those would be more robust than regex on body text. Not urgent — fuzzy matching against body works empirically.
+
+**Carried over from earlier — still relevant:**
+- All items in the previous "Integration TODO" / "Auto-Apply" sections.
+- The eligibility-cleanup question is now resolved (compatibility checks are warnings, not blocks).
+
