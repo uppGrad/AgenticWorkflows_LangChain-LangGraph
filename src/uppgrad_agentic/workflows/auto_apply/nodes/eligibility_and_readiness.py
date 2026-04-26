@@ -209,6 +209,18 @@ def _check_profile_completeness(
     profile: Dict[str, Any],
     normalized_requirements: List[Dict[str, Any]],
 ) -> List[str]:
+    """Return a list of missing fields/documents that BLOCK auto-apply.
+
+    A document is only "missing" in the blocking sense if the system cannot
+    write it from CV + profile data. Documents in `_GENERATABLE` (Cover Letter,
+    SOP, Personal Statement, etc.) are *not* flagged as missing here — they
+    flow through to asset_mapping which assigns tailoring_depth='generate',
+    and gate 1 lets the user override with their own upload if desired.
+    """
+    # Lazy import to avoid a circular dependency between the eligibility node
+    # (graph entry) and the asset_mapping node.
+    from uppgrad_agentic.workflows.auto_apply.nodes.asset_mapping import _GENERATABLE
+
     missing: List[str] = []
 
     if not profile.get("name"):
@@ -222,8 +234,12 @@ def _check_profile_completeness(
         req_type = req.get("requirement_type", "")
         if req_type != "document":
             continue
-        if not uploaded.get(doc_type):
-            missing.append(f"document:{doc_type}")
+        if uploaded.get(doc_type):
+            continue
+        # Skip docs the system can generate from CV + profile.
+        if doc_type in _GENERATABLE:
+            continue
+        missing.append(f"document:{doc_type}")
 
     return missing
 
