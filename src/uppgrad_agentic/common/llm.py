@@ -53,3 +53,19 @@ def get_llm() -> Optional[BaseChatModel]:
     # Add more providers later (anthropic, azure, etc.)
     logger.warning("Unknown LLM provider: %s — returning None", provider)
     return None
+
+
+def get_search_provider():
+    """Return a SearchProvider instance or None if not configured.
+
+    Mirrors get_llm() opt-in pattern. Callers MUST handle None by returning
+    a degraded result, never by raising.
+    """
+    provider_name = os.getenv("UPPGRAD_SEARCH_PROVIDER", "").lower()
+    if provider_name != "brave":
+        return None
+    api_key = os.getenv("BRAVE_SEARCH_API_KEY", "")
+    if not api_key:
+        return None
+    from uppgrad_agentic.tools.search import BraveSearchProvider
+    return BraveSearchProvider(api_key=api_key)

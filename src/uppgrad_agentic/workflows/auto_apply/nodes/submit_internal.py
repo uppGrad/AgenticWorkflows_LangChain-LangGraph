@@ -28,6 +28,7 @@ def submit_internal(state: AutoApplyState) -> dict:
         "CV": cv_content,
         "Cover Letter": cl_content,
         "submission_type": "internal",
+        "warnings": list(state.get("compatibility_warnings") or []),
     }
 
     logger.info(

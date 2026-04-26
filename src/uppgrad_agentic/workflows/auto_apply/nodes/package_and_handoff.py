@@ -51,6 +51,7 @@ def package_and_handoff(state: AutoApplyState) -> dict:
             "application_url": url,
         },
         "submission_type": "handoff",
+        "warnings": list(state.get("compatibility_warnings") or []),
     }
 
     # For jobs: include scrape provenance so the user knows whether requirements

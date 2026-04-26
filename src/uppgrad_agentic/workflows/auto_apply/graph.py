@@ -19,6 +19,7 @@ from uppgrad_agentic.workflows.auto_apply.nodes.human_gate_2 import human_gate_2
 from uppgrad_agentic.workflows.auto_apply.nodes.submit_internal import submit_internal
 from uppgrad_agentic.workflows.auto_apply.nodes.package_and_handoff import package_and_handoff
 from uppgrad_agentic.workflows.auto_apply.nodes.record_application import record_application
+from uppgrad_agentic.workflows.auto_apply.nodes.discover_apply_url import discover_apply_url_node
 
 MAX_EVAL_ITERATIONS = 2
 
@@ -31,8 +32,14 @@ def _route_after_load(state: AutoApplyState) -> str:
     if state.get("result", {}).get("status") == "error":
         return "end_with_error"
     if state.get("opportunity_type") == "job":
-        return "scrape_application_page"
+        return "discover_apply_url"
     return "determine_requirements"
+
+
+def _route_after_discovery(state: AutoApplyState) -> str:
+    if state.get("result", {}).get("status") == "error":
+        return "end_with_error"
+    return "scrape_application_page"
 
 
 def _route_after_scrape(state: AutoApplyState) -> str:
@@ -105,6 +112,7 @@ def build_graph(checkpointer=None):
 
     # Opportunity Intelligence phase
     g.add_node("load_opportunity", load_opportunity)
+    g.add_node("discover_apply_url", discover_apply_url_node)
     g.add_node("scrape_application_page", scrape_application_page)
     g.add_node("evaluate_scrape", evaluate_scrape)
     g.add_node("determine_requirements", determine_requirements)
@@ -142,8 +150,17 @@ def build_graph(checkpointer=None):
         "load_opportunity",
         _route_after_load,
         {
-            "scrape_application_page": "scrape_application_page",
+            "discover_apply_url": "discover_apply_url",
             "determine_requirements": "determine_requirements",
+            "end_with_error": "end_with_error",
+        },
+    )
+
+    g.add_conditional_edges(
+        "discover_apply_url",
+        _route_after_discovery,
+        {
+            "scrape_application_page": "scrape_application_page",
             "end_with_error": "end_with_error",
         },
     )
