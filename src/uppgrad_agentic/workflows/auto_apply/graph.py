@@ -73,6 +73,12 @@ def _route_after_app_evaluation(state: AutoApplyState) -> str:
     return "application_tailoring"
 
 
+def _route_after_gate_0(state: AutoApplyState) -> str:
+    if state.get("result", {}).get("status") == "error":
+        return "end_with_error"
+    return "eligibility_and_readiness"
+
+
 def _route_after_gate2(state: AutoApplyState) -> str:
     if state.get("result", {}).get("status") == "error":
         return "end_with_error"
@@ -176,8 +182,16 @@ def build_graph(checkpointer=None):
         },
     )
 
-    # human_gate_0: interrupt/resume wired in human-in-the-loop phase
-    g.add_edge("human_gate_0", END)
+    # human_gate_0 routes back to eligibility re-check after profile update,
+    # or to end_with_error when the iteration cap fires inside the node.
+    g.add_conditional_edges(
+        "human_gate_0",
+        _route_after_gate_0,
+        {
+            "eligibility_and_readiness": "eligibility_and_readiness",
+            "end_with_error": "end_with_error",
+        },
+    )
 
     # -----------------------------------------------------------------------
     # Edges — Asset Mapping

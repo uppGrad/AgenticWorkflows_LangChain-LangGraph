@@ -1,6 +1,6 @@
 [project]
 name = "uppgrad-agentic"
-version = "0.1.0"
+version = "0.2.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,16 @@ dependencies = [
 
 [tool.uv]
 package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

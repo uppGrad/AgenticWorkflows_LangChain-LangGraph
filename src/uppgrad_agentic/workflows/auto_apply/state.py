@@ -24,6 +24,17 @@ class AutoApplyState(TypedDict, total=False):
     scraped_requirements: Dict[str, Any]      # ScrapeResult dict: status, requirements, confidence, source
     normalized_requirements: List[Dict[str, Any]]  # list of NormalizedRequirement dicts
 
+    # injected by backend adapter (Spec A1) — replaces _get_stub_profile lookups
+    profile_snapshot: Dict[str, Any]
+
+    # apply-URL discovery (Spec A6) — populated when discovery feature ships
+    discovered_apply_url: Optional[str]
+    discovery_method: Optional[str]
+    discovery_confidence: Optional[float]
+
+    # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
+    gate_0_iteration_count: int
+
     # eligibility
     eligibility_result: Dict[str, Any]        # EligibilityResult dict: decision, reasons, missing_fields
 

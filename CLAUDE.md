@@ -614,3 +614,205 @@ backend / frontend / database integration.
   requests, streaming or polling for intermediate state (eligibility result,
   asset mapping, tailored documents), and returning structured JSON to the frontend.
 
+---
+
+## 2026-04-26 — Backend Integration (auto-apply)
+
+This section summarises the changes shipped on the
+`feature/auto-apply-backend-integration` branch. The backend (`backend/ai_services`)
+now drives `auto_apply` end-to-end against Neon, mirroring the existing
+`document_feedback` adapter pattern. **The agentic repo no longer needs a
+FastAPI layer of its own — backend integration is via the Django adapter.**
+
+### Spec / plan references
+- Spec: `docs/superpowers/specs/2026-04-26-auto-apply-backend-integration.md`
+- Plan: `docs/superpowers/plans/2026-04-26-auto-apply-backend-integration.md`
+- Discovery plan (paused): `docs/superpowers/plans/2026-04-26-apply-url-discovery.md`
+
+### Feature additions in the agentic repo (Phase A)
+
+**State surface extended** (`workflows/auto_apply/state.py`):
+- `profile_snapshot: Dict[str, Any]` — injected by backend adapter; replaces
+  `_get_stub_profile()` lookups in nodes.
+- `discovered_apply_url`, `discovery_method`, `discovery_confidence` —
+  pre-wired for the deferred discovery feature so nothing else needs to
+  migrate when discovery ships.
+- `gate_0_iteration_count: int` — caps the eligibility re-check loop after
+  gate 0 (max 2 retries, then `INELIGIBLE`).
+
+**`workflows/auto_apply/_profile.py` — new** : `resolve_profile(state)` returns
+`state['profile_snapshot']` when present, else falls back to the in-repo stub.
+Emits a **WARNING** log on the fallback path so production logs surface any
+case where the backend didn't inject a real snapshot. Used by
+`eligibility_and_readiness`, `asset_mapping`, and `application_tailoring`.
+
+**`workflows/auto_apply/control.py` — new** : `cancel_session(thread_id, checkpointer)`
+out-of-band cancel via `graph.update_state()`. Writes
+`result.status='error', error_code='CANCELLED'` into the live checkpoint;
+the existing top-of-node short-circuit pattern drains the graph to END.
+Idempotent and best-effort — does not raise on unknown threads.
+
+**`nodes/load_opportunity.py`** : short-circuits when `state['opportunity_data']`
+is already populated (backend pre-load path). Falls back to in-repo stub
+records for CLI mode, with a **WARNING** log on the fallback path.
+
+**`nodes/human_gate_0.py`** : real `interrupt()` cycle (was a dead stub).
+Iteration cap of 2; on cap-out returns `result.error_code='PROFILE_INCOMPLETE_AFTER_RETRIES'`.
+Routes back to `eligibility_and_readiness` for a re-check after the user
+completes their profile.
+
+**`graph.py`** : `human_gate_0` edge changed from `→ END` to a conditional
+loop back to `eligibility_and_readiness` (or `end_with_error` on cap-out).
+Added `_route_after_gate_0`.
+
+**`nodes/submit_internal.py`** : recordss submission *intent* only — no
+fake `platform_application_id`. Backend adapter writes the real
+`Application` row via Django ORM after the graph terminates with
+`submission_type='internal'` (no HTTP loopback from agentic → backend).
+
+**`nodes/application_tailoring.py`** : per-doc-type output caps
+(`_truncate_to_cap`) — CV ≤ 8000, Cover Letter ≤ 3000, SOP / Personal Statement
+≤ 6000, default 5000. Boundary-aware (truncates at last paragraph break that
+fits in the upper half of the cap; otherwise hard-cut). Prevents runaway
+LLM output from breaking PDF rendering and frontend display.
+
+**`nodes/eligibility_and_readiness.py`** :
+- Switched profile lookup to `resolve_profile(state)` (per A2).
+- `_check_profile_completeness` now consults `_GENERATABLE` from
+  `asset_mapping.py` and **does not flag a missing doc as `pending` if the
+  system can write it from CV + profile** (Cover Letter, SOP, Personal
+  Statement, Research Proposal, Writing Sample, Motivation Letter, References
+  no longer block at gate 0). Documents in `_USER_SUPPLIED` (Transcript,
+  English Proficiency Test) still trigger gate 0 as before.
+
+### Backend adapter (Phase B — lives in `backend/ai_services/`)
+
+Mirrors `graph_adapter.py` for document_feedback:
+- `auto_apply_adapter.py` — `build_auto_apply_opportunity_snapshot`,
+  `build_auto_apply_profile_snapshot`, `start_session`, three
+  `resume_session_gate_{0,1,2}` handlers, `finalize_internal_submission`,
+  `cancel_session`, `_pending_node_after_invoke` (graph-state inspection),
+  `_persist_state_after_phase` (graph state → DB row).
+- `ApplicationSession` Django model with partial unique constraint
+  (one active session per `(student, opportunity_type, opportunity_id)`).
+- Per-status TTL janitor (`janitor.py`):
+  `PROCESSING`/15m, `FINALIZING`/30m, `AWAITING_*`/7 days.
+- ReportLab text→PDF renderer (`document_renderer.py`) for
+  internal-submit `Application.resume_file`.
+- DRF views + URLs for start / list / detail / cancel and three per-gate
+  resume endpoints.
+
+### Bugs detected during live integration testing
+
+These were caught by driving the workflow against live Neon dev. Fixed in
+commit `417e614` on the backend repo's feature branch:
+
+1. **Gate-suspension detection lagged by one node.** Persist logic checked
+   `result_state['current_step']` to identify which gate was held. But
+   `interrupt()` suspends the graph **before** the node returns its updates
+   dict — so `current_step` reflects the last fully-completed node, not
+   the gate. Fix: read the pending node from `graph.get_state(config).next`.
+   Documented in `_pending_node_after_invoke()` in the adapter.
+
+2. **Gate 0 resume kept stale `profile_snapshot`.** When the graph looped
+   back to eligibility after gate 0, it re-read the original initial-state
+   snapshot — so even after the user uploaded missing docs, eligibility
+   still saw stale data and re-fired the gate. Fix: backend's
+   `resume_session_gate_0` builds a fresh snapshot post-update and injects
+   it via `graph.update_state(config, {"profile_snapshot": fresh})` before
+   resuming. The graph runner now accepts `state_overrides` for this
+   pattern.
+
+3. **`INELIGIBLE` error_code unmapped.** `end_with_explanation` sets
+   `result.error_code='INELIGIBLE'` for hard-block ineligibility verdicts
+   (deadline passed, location mismatch, age limit, etc.). Backend's persist
+   logic recognised only `CANCELLED` and `PROFILE_INCOMPLETE_AFTER_RETRIES`
+   and was falling through to generic `ERROR`. Fix: map `INELIGIBLE` to
+   `Status.INELIGIBLE`.
+
+4. **Hard-block ineligibility design — open issue (not yet fixed).** The
+   existing `_check_job_eligibility`, `_check_program_eligibility`, and
+   `_check_scholarship_eligibility` functions hard-terminate the workflow
+   when on-site location doesn't match the user's location, when scholarship
+   age caps are exceeded, etc. **This is too aggressive for v1** — these
+   should be soft warnings the UI surfaces on the apply screen, not hard
+   workflow blocks. Pending team discussion before changing.
+
+5. **Eligibility blocked on generatable docs (fixed in commit `47753d1`).**
+   `_check_profile_completeness` flagged every missing required document as
+   `pending`, gating the user at `human_gate_0` even for documents the
+   system was designed to write itself (Cover Letter, SOP, etc.). Fix: skip
+   docs in `_GENERATABLE` from the missing list (described in feature
+   additions above).
+
+### Verification
+
+**Live end-to-end paths driven against Neon dev branch
+(project `summer-math-90128942`, branch `br-green-thunder-agbs7e8y`)**:
+
+- ✅ External-job → `completed_handoff` (with assumed `[CV, Cover Letter]`
+  defaults; LinkedIn scrape correctly evaluated as `failed` and degraded).
+- ✅ External-job → `completed_handoff` with **real Koray CV (143KB PDF,
+  2914 chars extracted) + real OpenAI gpt-4o-mini tailoring**, 16 graph
+  steps, properly formatted output.
+- ✅ Internal-job (employer_id=1) → `completed_submitted`. Real `Application`
+  row written via Django ORM with PDF resume + tailored cover letter,
+  `ApplicationSession.application` FK populated.
+- ✅ Gate 0 retry loop verified: pending → resume → eligibility re-runs
+  with fresh snapshot → ready → asset_mapping. Step history shows the
+  loop explicitly.
+- ✅ Cancel mid-flight: marker correctly written to live PostgresSaver
+  checkpoint with `error_code='CANCELLED'`.
+- ✅ Hard-ineligibility path: caught the location-mismatch case, flipped
+  session to `INELIGIBLE` (after fix #3 above).
+
+**Test counts**: 41 unit tests in agentic repo, 27 new unit tests in
+backend `ai_services`. Pre-existing 1 backend test failure on `main` is
+unrelated to this work.
+
+### Future work
+
+**Critical / blocking for production:**
+- **Hard-block ineligibility design (#4 above).** Move location, age,
+  degree-level, nationality checks from hard `INELIGIBLE` to soft warnings
+  surfaced on the apply UI. The user should be able to apply anyway.
+  Needs team alignment before implementation.
+- **Discovery + Crawl4AI for jobs.** Until the discovery plan ships, all
+  external jobs use assumed `[CV, Cover Letter]` defaults regardless of
+  what the employer actually requires. Plan exists at
+  `docs/superpowers/plans/2026-04-26-apply-url-discovery.md`, paused
+  pending backend integration completion (now done).
+
+**Important but not blocking:**
+- **Gate 1 `additional_uploads` plumbing on the backend side.** The
+  serializer accepts `additional_uploads: List[FileField]` but the adapter
+  doesn't yet save those files anywhere or thread the extracted text into
+  the resume payload's `content` fields. Today users can only confirm the
+  default mapping or set `tailoring_depth='none'` for stored docs; they
+  can't yet upload a fresh document at gate 1. Scope 1.5 work.
+- **Polymorphic `StudentDocument` store** (Spec §11.3, Scope 2). v1 only
+  supports CV from `StudentCV`. Cover Letter / SOP / Personal Statement
+  are always *generated*, never read from a stored user file. Adding a
+  generic `StudentDocument` table would let users save and reuse these.
+- **Gate 2 "edit and re-tailor" loop** (Spec §11.10). v1 hard-cancels on
+  rejection at gate 2. A loop back to `application_tailoring` with
+  per-document feedback as edit instructions would let the user iterate
+  without starting fresh.
+- **External form auto-submission** (Spec §11.2). Browser automation /
+  Playwright path for external jobs where discovery succeeded with high
+  confidence. Would create real `Application` rows for external jobs too.
+- **Email handoff delivery** (Spec §11.5). Currently handoff is in-app only.
+- **Per-session LLM cost budgeting** (Spec T3). Worst-case ~15-20 LLM calls
+  per session; no token cap today.
+- **GDPR / retention policy** (Spec T4). Tailored documents and scraped
+  content live forever in `ApplicationSession` rows + PostgresSaver
+  checkpoints.
+- **Cooperative cancel inside nodes** (Spec T1). Currently the cancel
+  marker is observed only at the next node boundary — the currently-
+  executing node finishes (worst case ~30-60s of LLM cost wasted).
+
+**Carried over from earlier — still relevant:**
+- All items in the "Integration TODO" section above remain valid.
+- `submit_internal._post_to_backend` was removed; the equivalent ORM-write
+  path now lives in `backend/ai_services/auto_apply_adapter.finalize_internal_submission`.
+
