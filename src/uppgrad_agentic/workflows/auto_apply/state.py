@@ -35,6 +35,12 @@ class AutoApplyState(TypedDict, total=False):
     # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
     gate_0_iteration_count: int
 
+    # compatibility warnings (Spec follow-up — deadline-passed + missing
+    # user-supplied docs are the only hard-block reasons; everything else
+    # like location mismatch / age cap / degree level becomes a non-blocking
+    # warning the UI surfaces on the apply screen and the handoff package).
+    compatibility_warnings: List[str]
+
     # eligibility
     eligibility_result: Dict[str, Any]        # EligibilityResult dict: decision, reasons, missing_fields
 
