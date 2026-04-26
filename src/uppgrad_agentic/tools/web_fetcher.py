@@ -76,3 +76,65 @@ def fetch_url(url: str) -> FetchResult:
         http_status=resp.status_code,
         thin_signals=signals,
     )
+
+
+import asyncio
+
+
+def _browser_fallback_enabled() -> bool:
+    return os.getenv("UPPGRAD_BROWSER_SCRAPE_ENABLED", "").lower() in ("true", "1", "yes")
+
+
+def _build_async_crawler():
+    """Construct a Crawl4AI crawler. Raises ImportError if crawl4ai missing.
+
+    Patched in tests to inject a fake crawler.
+    """
+    from crawl4ai import AsyncWebCrawler  # noqa: lazy import — heavy
+    return AsyncWebCrawler(verbose=False)
+
+
+async def _crawl_with_browser(url: str, timeout_seconds: float = 25.0) -> FetchResult:
+    """Use Crawl4AI / Playwright to fetch a URL when httpx returned thin content."""
+    crawler = _build_async_crawler()  # may raise ImportError; caller handles
+
+    async with crawler:
+        try:
+            result = await crawler.arun(url=url, page_timeout=int(timeout_seconds * 1000))
+        except Exception as exc:
+            logger.warning("web_fetcher: crawl4ai error for %s — %s", url, exc)
+            return FetchResult(
+                success=False, thin=True, text="",
+                http_status=0, error=str(exc),
+                thin_signals=["browser_error"], used_browser=True,
+            )
+
+    if not getattr(result, "success", False):
+        return FetchResult(
+            success=False, thin=True, text="",
+            http_status=getattr(result, "status_code", 0) or 0,
+            error=getattr(result, "error_message", "") or "crawl unsuccessful",
+            thin_signals=["crawl_unsuccessful"], used_browser=True,
+        )
+
+    md = (getattr(result, "markdown", "") or "")[:_MAX_BYTES]
+    thin, signals = _detect_thin(md, getattr(result, "status_code", 200))
+    return FetchResult(
+        success=True, thin=thin, text=md,
+        http_status=getattr(result, "status_code", 200) or 200,
+        thin_signals=signals, used_browser=True,
+    )
+
+
+def fetch_url_with_fallback(url: str) -> FetchResult:
+    """Fetch with httpx; escalate to Playwright/Crawl4AI when configured AND httpx is thin."""
+    httpx_result = fetch_url(url)
+    if not httpx_result.thin:
+        return httpx_result
+    if not _browser_fallback_enabled():
+        return httpx_result
+    try:
+        return asyncio.run(_crawl_with_browser(url))
+    except ImportError:
+        logger.warning("web_fetcher: crawl4ai not installed — returning httpx result")
+        return httpx_result
