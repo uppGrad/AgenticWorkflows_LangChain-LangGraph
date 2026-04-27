@@ -207,3 +207,106 @@ def test_generic_tier_needs_two_corroborators():
     )
     score = score_candidate(inputs)
     assert score.passed is False  # only 1 corroborator
+
+
+# ─── ATS slug-mismatch guard (Bug #9 — surfaced live on GitHub 199838) ──────
+
+def test_ats_url_slug_mismatch_rejects_match():
+    """For ATS tier, the URL host+path identifies the employer definitively
+    (`boards.greenhouse.io/<company-slug>/...`, `jobs.lever.co/<slug>/...`).
+    A candidate whose ATS slug does NOT match the queried company must NOT
+    pass verification — even when title fuzz is 100, the company name appears
+    in the body as a required-tools mention, AND description keywords overlap.
+    Live failure shape (GitHub 199838 → Forma.ai posting):
+        passed=True, confidence=0.80
+        reasons=['title fuzzy 100.0', 'company match', 'keywords 5/10', 'corroborators 2/2']"""
+    description = (
+        "We are hiring a Senior Solutions Engineer to support sales and customer "
+        "success teams. Strong experience with kubernetes, terraform, and "
+        "databricks integration is a plus. Familiarity with sales engineering "
+        "workflows and partner programs required."
+    )
+    inputs = VerifyInputs(
+        candidate_url="https://job-boards.greenhouse.io/formaaiinc/jobs/4687346005",
+        candidate_title="Senior Solutions Engineer at Forma.ai",
+        candidate_text=(
+            "Senior Solutions Engineer at Forma.ai. Build working knowledge of "
+            "our data architecture, repositories, and tooling (e.g., Databricks, "
+            "S3, GitHub). Strong experience with kubernetes and terraform. "
+            "Sales engineering workflows. Customer success integration. "
+            + "Detailed role content. " * 200
+        ),
+        candidate_posted_at=None,
+        job=_job(title="Senior Solutions Engineer", company="GitHub",
+                 location="Germany", description=description),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is False, (
+        f"slug 'formaaiinc' does not match company 'GitHub'; expected reject. "
+        f"reasons={score.reasons}"
+    )
+
+
+def test_ats_url_slug_match_allows_match():
+    """When the ATS slug matches the company, ATS verification proceeds normally."""
+    inputs = VerifyInputs(
+        candidate_url="https://boards.greenhouse.io/github/jobs/4554047",
+        candidate_title="Senior Solutions Engineer at GitHub",
+        candidate_text="Senior Solutions Engineer at GitHub. Berlin, Germany. " * 50,
+        candidate_posted_at=None,
+        job=_job(title="Senior Solutions Engineer", company="GitHub", location="Germany"),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is True
+
+
+def test_ats_url_slug_match_with_normalized_company_name():
+    """The slug check should be tolerant to common normalization: lowercase,
+    strip non-alphanumeric, partial substring. `notionhq` slug should match
+    company `Notion`."""
+    inputs = VerifyInputs(
+        candidate_url="https://jobs.ashbyhq.com/notionhq/role-1",
+        candidate_title="Solutions Engineer, EMEA at Notion",
+        candidate_text="Solutions Engineer, EMEA at Notion. Dublin, Ireland. " * 50,
+        candidate_posted_at=None,
+        job=_job(title="Solutions Engineer, EMEA", company="Notion",
+                 location="Dublin, County Dublin, Ireland"),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is True
+
+
+def test_ats_url_with_unknown_host_falls_back_to_text_check():
+    """If the candidate URL's host isn't a known ATS pattern we recognize, the
+    slug-extraction can't run — we must fall back to the existing text-based
+    company corroborator without rejecting outright."""
+    inputs = VerifyInputs(
+        candidate_url="https://unknown-board.example.com/role/123",
+        candidate_title="Senior Backend Engineer at Acme Corp",
+        candidate_text="Acme Corp is hiring in London, UK. " * 50,
+        candidate_posted_at=None,
+        job=_job(),  # company "Acme Corp"
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    # Falls back to text-based verification; with company + location
+    # corroborators that's 2/2 — passes.
+    assert score.passed is True
+
+
+def test_careers_tier_unaffected_by_slug_check():
+    """Careers tier already constrains to the company's own domain via
+    `site:<company-domain>` at search time. Slug-check shouldn't be applied."""
+    inputs = VerifyInputs(
+        candidate_url="https://acmecorp.com/careers/role",
+        candidate_title="Senior Backend Engineer",
+        candidate_text="Backend engineer in London. Apply via this form.",
+        candidate_posted_at=None,
+        job=_job(),
+        tier="careers",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is True

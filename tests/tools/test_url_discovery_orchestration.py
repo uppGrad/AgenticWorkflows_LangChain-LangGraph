@@ -182,6 +182,100 @@ def test_careers_tier_skipped_for_linkedin_company_url(monkeypatch):
     assert _build_careers_query("X", "https://celonis.com") == '"X" site:celonis.com'
 
 
+# ─── Bug E — closed-posting detection + propagation ─────────────────────────
+
+def test_closed_posting_phrase_does_not_count_as_successful_match(monkeypatch):
+    """An aggregator (Base10, Wellfound, Built In, etc.) showing a stale
+    'This job is no longer accepting applications' listing must NOT be
+    accepted as a successful discovery hit, even if title/company/location
+    corroborate. The page is real but not actionable."""
+    job = _job(company="Notion", title="Solutions Engineer, EMEA")
+    job["location"] = "Dublin, County Dublin, Ireland"
+    fake_search = MagicMock()
+    # Tier 1 ATS empty, tier 2 careers empty, tier 3 generic returns the closed aggregator
+    fake_search.search.side_effect = [
+        [],  # ATS
+        [SearchResult(
+            url="https://careers.base10.vc/companies/notion-2/jobs/1-emea",
+            title="Solutions Engineer, EMEA @ Notion | Base10 Job Board",
+            snippet="This job is no longer accepting applications",
+        )],
+    ]
+    closed_page = (
+        "Solutions Engineer, EMEA at Notion. Dublin, Ireland. " * 50
+        + "This job is no longer accepting applications. " * 5
+    )
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback",
+                        MagicMock(return_value=FetchResult(
+                            success=True, thin=False, text=closed_page, http_status=200,
+                        )))
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method != "generic" and not result.method.startswith("url"), (
+        f"closed listings must not be treated as a successful match; got {result.method}")
+
+
+def test_closed_posting_surfaced_with_method_closed_when_no_open_match(monkeypatch):
+    """When every tier exhausted finds only closed listings, surface ONE of
+    them as a `method='closed'` result with `posting_closed=True` and the
+    URL preserved — so the workflow can tell the user the posting is closed
+    along with the default-package handoff."""
+    job = _job(company="Notion", title="Solutions Engineer, EMEA")
+    job["location"] = "Dublin, County Dublin, Ireland"
+    fake_search = MagicMock()
+    fake_search.search.return_value = [
+        SearchResult(
+            url="https://careers.base10.vc/companies/notion-2/jobs/1",
+            title="Solutions Engineer, EMEA @ Notion",
+            snippet="This job is no longer accepting applications",
+        ),
+    ]
+    closed_page = (
+        "Solutions Engineer, EMEA at Notion. Dublin, Ireland. " * 50
+        + "This job is no longer accepting applications. " * 5
+    )
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback",
+                        MagicMock(return_value=FetchResult(
+                            success=True, thin=False, text=closed_page, http_status=200,
+                        )))
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method == "closed"
+    assert result.posting_closed is True
+    assert "base10" in result.url
+
+
+def test_closed_listing_skipped_when_open_listing_available_in_later_tier(monkeypatch):
+    """Closed in tier 1 must not block an open match in a later tier."""
+    job = _job(company="Notion", title="Solutions Engineer, EMEA",
+               company_url="https://notion.com")
+    job["location"] = "Dublin, County Dublin, Ireland"
+    fake_search = MagicMock()
+    fake_search.search.side_effect = [
+        # ATS: closed Base10 (would be rejected by slug-mismatch anyway, but
+        # use a host w/o slug check to test the closed-skip path explicitly).
+        [SearchResult(
+            url="https://random-aggregator.example.com/notion-emea",
+            title="Solutions Engineer, EMEA @ Notion",
+            snippet="This job is no longer accepting applications",
+        )],
+        # Careers: a real open Notion page
+        [SearchResult(url="https://notion.com/careers/role-1",
+                      title="Solutions Engineer, EMEA", snippet="")],
+    ]
+    closed_text = ("Solutions Engineer, EMEA at Notion. Dublin, Ireland. " * 30
+                   + "This job is no longer accepting applications. " * 5)
+    open_text = "Solutions Engineer, EMEA at Notion. Dublin, Ireland. Apply now. " * 30
+
+    def fake_fetch(url):
+        text = closed_text if "random-aggregator" in url else open_text
+        return FetchResult(success=True, thin=False, text=text, http_status=200)
+
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback", fake_fetch)
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method == "careers"
+    assert result.posting_closed is False
+    assert "notion.com/careers" in result.url
+
+
 def test_strict_verification_rejects_wrong_location_match(monkeypatch):
     """Regression guard: a Greenhouse URL for the right title+company but a
     DIFFERENT location must not pass verification. Live test caught a Schwyz,

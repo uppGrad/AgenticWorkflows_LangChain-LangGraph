@@ -40,6 +40,12 @@ _CORROBORATORS_REQUIRED = {
 _DESCRIPTION_KEYWORD_HIT_THRESHOLD = 3   # ≥3 of extracted distinctive terms must appear
 _DESCRIPTION_KEYWORD_LIMIT = 10          # extract at most 10 distinctive tokens
 
+# Minimum fuzzy-match score for company-vs-slug normalization. Below this we
+# treat the slug as a different company and reject the candidate outright.
+# Example normalizations: 'github' vs 'github' = 100, 'notion' vs 'notionhq' = ~80
+# (substring match), 'github' vs 'formaaiinc' = ~10 → reject.
+_SLUG_FUZZY_MIN = 70
+
 # Stopwords for keyword extraction. Kept small and focused on common
 # job-description boilerplate that would otherwise dominate frequency counts.
 _DESCRIPTION_STOPWORDS = {
@@ -73,10 +79,33 @@ class VerificationScore:
 @dataclass
 class DiscoveryResult:
     url: str
-    method: str            # 'url_direct' | 'ats' | 'careers' | 'generic' | 'failed'
+    method: str            # 'url_direct' | 'ats' | 'careers' | 'generic' | 'closed' | 'failed'
     confidence: float
     text: str = ""         # verified page content; populated when verification fetched
     http_status: int = 0
+    posting_closed: bool = False  # True when the listing exists but is no longer accepting applications
+
+
+# Phrases that definitively indicate a posting is closed/stale. A page that
+# verifies on title+company+location but contains any of these is NOT
+# actionable for auto-apply — we record it (with method='closed') so the
+# workflow can tell the user, and skip it during tier matching in case a
+# later tier finds the same role open elsewhere.
+_CLOSED_POSTING_PHRASES = [
+    "no longer accepting applications",
+    "this position has been filled",
+    "this job has been closed",
+    "applications closed",
+    "applications have closed",
+    "we are no longer accepting applications",
+]
+
+
+def _detect_closed_posting(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _CLOSED_POSTING_PHRASES)
 
 
 def _parse_iso_or_none(value: Optional[str]) -> Optional[datetime]:
@@ -106,6 +135,82 @@ def _extract_distinctive_keywords(description: str) -> List[str]:
     return [tok for tok, _ in counts.most_common(_DESCRIPTION_KEYWORD_LIMIT)]
 
 
+def _normalize_company(name: str) -> str:
+    """Lowercase + strip non-alphanumeric. 'GitHub Inc.' → 'githubinc'."""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def _extract_ats_company_slug(url: str) -> Optional[str]:
+    """Pull the company identifier from a known ATS URL pattern. Returns None
+    if the host doesn't match a recognized ATS or the slug can't be extracted.
+    Callers MUST treat None as 'unknown ATS, skip slug check' (do not reject).
+
+    Patterns supported (host → where the slug lives):
+      *.greenhouse.io path: /<slug>/jobs/<id>           (boards / job-boards)
+      jobs.lever.co path:   /<slug>/<id>
+      jobs.ashbyhq.com path:/<slug>/<id>
+      apply.workable.com:   /<slug>/j/<id>
+      jobs.jobvite.com:     /<slug>/...
+      *.recruitee.com:      subdomain
+      *.bamboohr.com:       subdomain (e.g., <slug>.bamboohr.com)
+      *.workable.com:       subdomain (when not 'apply')
+      *.myworkdayjobs.com:  subdomain (Workday tenant — may not match company,
+                            e.g., 'github.wd1.myworkdayjobs.com'. Returned as-is;
+                            slug check is fuzzy enough to handle this case.)
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    parts = [p for p in path.split("/") if p]
+
+    if host.endswith(".greenhouse.io") or host == "greenhouse.io":
+        if parts:
+            return parts[0]
+    if host == "jobs.lever.co" or host.endswith(".lever.co"):
+        if host == "jobs.lever.co" and parts:
+            return parts[0]
+    if host == "jobs.ashbyhq.com":
+        if parts:
+            return parts[0]
+    if host == "apply.workable.com":
+        if parts:
+            return parts[0]
+    if host == "jobs.jobvite.com":
+        if parts:
+            return parts[0]
+    if host.endswith(".recruitee.com"):
+        return host.split(".")[0]
+    if host.endswith(".bamboohr.com"):
+        return host.split(".")[0]
+    if host.endswith(".workable.com") and host != "apply.workable.com":
+        return host.split(".")[0]
+    if host.endswith(".myworkdayjobs.com"):
+        return host.split(".")[0]
+    if host.endswith(".smartrecruiters.com"):
+        # smartrecruiters: split between subdomain and path; prefer first path segment
+        if parts:
+            return parts[0]
+        return host.split(".")[0]
+    return None
+
+
+def _slug_matches_company(slug: str, company: str) -> bool:
+    """True when the URL slug plausibly identifies the company. Tolerant to
+    common normalization differences: 'NotionHQ' slug vs 'Notion' company,
+    'GitHub-inc' slug vs 'GitHub Inc' company.
+    """
+    s = _normalize_company(slug)
+    c = _normalize_company(company)
+    if not s or not c:
+        return False
+    if s == c or s in c or c in s:
+        return True
+    return fuzz.partial_ratio(s, c) >= _SLUG_FUZZY_MIN
+
+
 def score_candidate(inputs: VerifyInputs) -> VerificationScore:
     """Multi-factor verification: title fuzz (gate) + N corroborators (gate).
 
@@ -117,6 +222,23 @@ def score_candidate(inputs: VerifyInputs) -> VerificationScore:
     job = inputs.job
     job_title = (job.get("title") or "").strip()
     job_company = (job.get("company") or "").strip()
+
+    # ── ATS-tier hard guard: URL slug must identify the queried company ──
+    # The URL host+path of a known ATS unambiguously names the employer.
+    # Without this guard, a same-titled role at a different company whose
+    # description mentions the queried company name as a *tool* (e.g. GitHub,
+    # Stripe, Notion) trivially satisfies the textual company-match
+    # corroborator and false-passes verification. Live failure: GitHub query
+    # matched a Forma.ai Greenhouse posting via the Databricks/S3/GitHub
+    # tooling list. For unrecognized hosts we skip the guard (return None
+    # from the extractor) — text-based corroborators carry the load there.
+    if inputs.tier == "ats" and job_company:
+        slug = _extract_ats_company_slug(inputs.candidate_url)
+        if slug is not None and not _slug_matches_company(slug, job_company):
+            return VerificationScore(
+                passed=False, confidence=0.0,
+                reasons=[f"ATS slug '{slug}' does not match company '{job_company}'"],
+            )
 
     # ── Hard prerequisite: title fuzzy match against candidate body ──
     haystack = f"{inputs.candidate_title}\n{inputs.candidate_text[:2000]}"
@@ -236,14 +358,25 @@ def _build_generic_query(title: str, company: str) -> str:
     return f'"{title}" "{company}" apply'
 
 
+@dataclass
+class _VerifiedHit:
+    candidate: SearchResult
+    score: VerificationScore
+    fetch: FetchResult
+    posting_closed: bool = False
+
+
 def _verify_one(
     candidate: SearchResult, job: dict, tier: Tier,
-) -> Optional[Tuple[VerificationScore, FetchResult]]:
+) -> Optional[_VerifiedHit]:
     """Fetch + verify a candidate. Reject thin pages outright before scoring.
 
-    Returns (score, fetch) on a verified accept; None on any reject. The
-    FetchResult is propagated so the orchestrator can hand its `text` forward
-    instead of refetching the same URL during scrape.
+    Returns a `_VerifiedHit` on accept; None on any reject. Pages that pass
+    verification but contain closed-posting phrases are returned with
+    `posting_closed=True` — the orchestrator decides whether to surface them
+    (no other tier found an open match) or skip them (later tier hit open).
+    The FetchResult is propagated so the orchestrator can hand its `text`
+    forward instead of re-fetching the same URL during scrape.
     """
     fetch = fetch_url_with_fallback(candidate.url)
     if not fetch.success:
@@ -263,17 +396,27 @@ def _verify_one(
     score = score_candidate(inputs)
     if not score.passed:
         return None
-    return score, fetch
+    return _VerifiedHit(
+        candidate=candidate, score=score, fetch=fetch,
+        posting_closed=_detect_closed_posting(fetch.text),
+    )
 
 
 def _try_tier(
     candidates: List[SearchResult], job: dict, tier: Tier,
-) -> Optional[Tuple[SearchResult, VerificationScore, FetchResult]]:
+    closed_hits: List[_VerifiedHit],
+) -> Optional[_VerifiedHit]:
+    """Iterate candidates; return the first OPEN verified hit. Closed hits are
+    appended to `closed_hits` so the orchestrator can surface one as a
+    `method='closed'` result if no tier produces an open match."""
     for cand in candidates:
         verified = _verify_one(cand, job, tier)
-        if verified is not None:
-            score, fetch = verified
-            return cand, score, fetch
+        if verified is None:
+            continue
+        if verified.posting_closed:
+            closed_hits.append(verified)
+            continue
+        return verified
     return None
 
 
@@ -304,36 +447,47 @@ def discover_apply_url(
     if not title or not company:
         return DiscoveryResult(url="", method="failed", confidence=0.0)
 
+    closed_hits: List[_VerifiedHit] = []
+
     # Tier 1: ATS
     ats_results = search_provider.search(_build_ats_query(title, company), count=3)
-    hit = _try_tier(ats_results, job, "ats")
+    hit = _try_tier(ats_results, job, "ats", closed_hits)
     if hit:
-        cand, score, fetch = hit
         return DiscoveryResult(
-            url=cand.url, method="ats", confidence=score.confidence,
-            text=fetch.text, http_status=fetch.http_status,
+            url=hit.candidate.url, method="ats", confidence=hit.score.confidence,
+            text=hit.fetch.text, http_status=hit.fetch.http_status,
         )
 
     # Tier 2: Careers
     careers_q = _build_careers_query(title, job.get("company_url"))
     if careers_q:
         careers_results = search_provider.search(careers_q, count=3)
-        hit = _try_tier(careers_results, job, "careers")
+        hit = _try_tier(careers_results, job, "careers", closed_hits)
         if hit:
-            cand, score, fetch = hit
             return DiscoveryResult(
-                url=cand.url, method="careers", confidence=score.confidence,
-                text=fetch.text, http_status=fetch.http_status,
+                url=hit.candidate.url, method="careers", confidence=hit.score.confidence,
+                text=hit.fetch.text, http_status=hit.fetch.http_status,
             )
 
     # Tier 3: Generic
     generic_results = search_provider.search(_build_generic_query(title, company), count=3)
-    hit = _try_tier(generic_results, job, "generic")
+    hit = _try_tier(generic_results, job, "generic", closed_hits)
     if hit:
-        cand, score, fetch = hit
         return DiscoveryResult(
-            url=cand.url, method="generic", confidence=score.confidence,
-            text=fetch.text, http_status=fetch.http_status,
+            url=hit.candidate.url, method="generic", confidence=hit.score.confidence,
+            text=hit.fetch.text, http_status=hit.fetch.http_status,
+        )
+
+    # No open match anywhere. If we found ANY page that verified-but-closed,
+    # surface the first one as a 'closed' result so the workflow can tell the
+    # user the listing is closed alongside the default-package handoff.
+    if closed_hits:
+        first = closed_hits[0]
+        return DiscoveryResult(
+            url=first.candidate.url, method="closed",
+            confidence=first.score.confidence,
+            text=first.fetch.text, http_status=first.fetch.http_status,
+            posting_closed=True,
         )
 
     return DiscoveryResult(url="", method="failed", confidence=0.0)

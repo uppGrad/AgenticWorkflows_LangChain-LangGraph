@@ -16,6 +16,15 @@ dependencies = [
     "rapidfuzz>=3.10.0",
 ]
 
+[project.optional-dependencies]
+# Browser fallback for discover_apply_url. Lazy-imported in tools/web_fetcher.py
+# and gated by UPPGRAD_BROWSER_SCRAPE_ENABLED=true. Installs Playwright as a
+# transitive dep; after install run `playwright install chromium`. Heavy
+# (~1GB with browsers); do not pull in by default.
+browser = [
+    "crawl4ai>=0.8.6",
+]
+
 [tool.uv]
 package = true
 

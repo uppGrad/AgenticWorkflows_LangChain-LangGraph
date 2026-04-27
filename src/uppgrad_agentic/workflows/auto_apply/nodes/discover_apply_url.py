@@ -56,4 +56,5 @@ def discover_apply_url_node(state: AutoApplyState) -> dict:
         # don't re-fetch the same URL twice. Empty for url_direct/cache/failed.
         "discovered_page_content": result.text or None,
         "discovered_http_status": result.http_status,
+        "posting_closed": result.posting_closed,
     }

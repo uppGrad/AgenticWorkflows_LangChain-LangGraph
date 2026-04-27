@@ -27,10 +27,20 @@ def package_and_handoff(state: AutoApplyState) -> dict:
     )
     url = (
         opportunity_data.get("url_direct")
+        or state.get("discovered_apply_url")
         or opportunity_data.get("url")
         or opportunity_data.get("application_url")
         or ""
     )
+    posting_closed = bool(state.get("posting_closed"))
+
+    warnings = list(state.get("compatibility_warnings") or [])
+    if posting_closed:
+        warnings.append(
+            "This posting appears to no longer be accepting applications. "
+            "We've prepared your materials anyway in case the listing reopens "
+            "or you want to reach out directly."
+        )
 
     # Assemble the package — include full content for each tailored document
     package: Dict[str, Any] = {
@@ -51,7 +61,8 @@ def package_and_handoff(state: AutoApplyState) -> dict:
             "application_url": url,
         },
         "submission_type": "handoff",
-        "warnings": list(state.get("compatibility_warnings") or []),
+        "warnings": warnings,
+        "posting_closed": posting_closed,
     }
 
     # For jobs: include scrape provenance so the user knows whether requirements
