@@ -37,6 +37,11 @@ class AutoApplyState(TypedDict, total=False):
     discovered_page_content: Optional[str]
     discovered_http_status: Optional[int]
 
+    # True when discovery found a real listing page that says the posting is
+    # closed ("no longer accepting applications", etc.). Workflow surfaces
+    # this in the handoff package so the user knows alongside their materials.
+    posting_closed: bool
+
     # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
     gate_0_iteration_count: int
 
