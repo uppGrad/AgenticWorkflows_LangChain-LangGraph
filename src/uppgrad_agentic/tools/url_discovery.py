@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from rapidfuzz import fuzz
 
+from uppgrad_agentic.tools.ats_form_urls import resolve_application_form_url
 from uppgrad_agentic.tools.search import SearchProvider, SearchResult
 from uppgrad_agentic.tools.web_fetcher import FetchResult, fetch_url_with_fallback
 
@@ -82,8 +83,10 @@ class DiscoveryResult:
     method: str            # 'url_direct' | 'ats' | 'careers' | 'generic' | 'closed' | 'failed'
     confidence: float
     text: str = ""         # verified page content; populated when verification fetched
+    raw_html: str = ""     # raw rendered HTML when available (for downstream form-field extraction)
     http_status: int = 0
     posting_closed: bool = False  # True when the listing exists but is no longer accepting applications
+    form_url: Optional[str] = None  # Apply-form URL from per-ATS rules; None when not reachable (Workday auth wall)
 
 
 # Phrases that definitively indicate a posting is closed/stale. A page that
@@ -437,7 +440,10 @@ def discover_apply_url(
     url_direct = (job.get("url_direct") or "").strip()
     if url_direct:
         # url_direct path doesn't fetch during discovery — scrape will do it.
-        return DiscoveryResult(url=url_direct, method="url_direct", confidence=1.0)
+        return DiscoveryResult(
+            url=url_direct, method="url_direct", confidence=1.0,
+            form_url=resolve_application_form_url(url_direct),
+        )
 
     if search_provider is None:
         return DiscoveryResult(url="", method="failed", confidence=0.0)
@@ -455,7 +461,8 @@ def discover_apply_url(
     if hit:
         return DiscoveryResult(
             url=hit.candidate.url, method="ats", confidence=hit.score.confidence,
-            text=hit.fetch.text, http_status=hit.fetch.http_status,
+            text=hit.fetch.text, raw_html=hit.fetch.raw_html, http_status=hit.fetch.http_status,
+            form_url=resolve_application_form_url(hit.candidate.url),
         )
 
     # Tier 2: Careers
@@ -466,7 +473,8 @@ def discover_apply_url(
         if hit:
             return DiscoveryResult(
                 url=hit.candidate.url, method="careers", confidence=hit.score.confidence,
-                text=hit.fetch.text, http_status=hit.fetch.http_status,
+                text=hit.fetch.text, raw_html=hit.fetch.raw_html, http_status=hit.fetch.http_status,
+                form_url=resolve_application_form_url(hit.candidate.url),
             )
 
     # Tier 3: Generic
@@ -475,7 +483,8 @@ def discover_apply_url(
     if hit:
         return DiscoveryResult(
             url=hit.candidate.url, method="generic", confidence=hit.score.confidence,
-            text=hit.fetch.text, http_status=hit.fetch.http_status,
+            text=hit.fetch.text, raw_html=hit.fetch.raw_html, http_status=hit.fetch.http_status,
+            form_url=resolve_application_form_url(hit.candidate.url),
         )
 
     # No open match anywhere. If we found ANY page that verified-but-closed,
@@ -486,8 +495,10 @@ def discover_apply_url(
         return DiscoveryResult(
             url=first.candidate.url, method="closed",
             confidence=first.score.confidence,
-            text=first.fetch.text, http_status=first.fetch.http_status,
+            text=first.fetch.text, raw_html=first.fetch.raw_html,
+            http_status=first.fetch.http_status,
             posting_closed=True,
+            form_url=resolve_application_form_url(first.candidate.url),
         )
 
     return DiscoveryResult(url="", method="failed", confidence=0.0)

@@ -34,13 +34,29 @@ class AutoApplyState(TypedDict, total=False):
 
     # Verified page content from discovery — propagated to scrape_application_page
     # so we don't re-fetch the same URL twice (Phase 2 of v2.1 follow-up).
+    # `discovered_page_content` is markdown for the browser path / HTML for httpx
+    # (good for prose extraction). `discovered_raw_html` is always actual HTML
+    # (used by form-field extraction).
     discovered_page_content: Optional[str]
+    discovered_raw_html: Optional[str]
     discovered_http_status: Optional[int]
+
+    # Apply-form URL resolved by per-ATS rules. Equals discovered_apply_url for
+    # ATSes that keep the form on the same URL (Greenhouse, Workable). Differs
+    # for split-URL ATSes (Ashby /application, Lever /apply). None when the
+    # form is not reachable via simple URL navigation (Workday auth wall).
+    discovered_form_url: Optional[str]
 
     # True when discovery found a real listing page that says the posting is
     # closed ("no longer accepting applications", etc.). Workflow surfaces
     # this in the handoff package so the user knows alongside their materials.
     posting_closed: bool
+
+    # Structured application-form fields extracted from the rendered form HTML.
+    # One entry per <input>/<select>/<textarea> visible on the form, with type,
+    # label, options, and value-source classification. Consumed by future
+    # auto-submit step; surfaced in the handoff package today.
+    form_fields: List[Dict[str, Any]]
 
     # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
     gate_0_iteration_count: int

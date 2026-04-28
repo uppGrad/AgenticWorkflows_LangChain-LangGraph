@@ -59,10 +59,15 @@ def package_and_handoff(state: AutoApplyState) -> dict:
             "title": title,
             "organisation": org,
             "application_url": url,
+            "form_url": state.get("discovered_form_url"),
         },
         "submission_type": "handoff",
         "warnings": warnings,
         "posting_closed": posting_closed,
+        # Structured application-form fields (one per <input>/<select>/<textarea>),
+        # captured for future auto-submit. Empty list when discovery couldn't
+        # reach the form (Workday auth wall, no-form pages, etc.).
+        "form_fields": list(state.get("form_fields") or []),
     }
 
     # For jobs: include scrape provenance so the user knows whether requirements

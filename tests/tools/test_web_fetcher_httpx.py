@@ -139,6 +139,19 @@ def test_final_url_equals_original_when_no_redirect():
 
 
 @respx.mock
+def test_raw_html_populated_for_httpx_path():
+    """fetch_url should populate `raw_html` with the response body so the
+    form extractor gets actual HTML markup (not markdown). For server-rendered
+    ATSes (Greenhouse), this is sufficient — the <form> is in the initial HTML."""
+    body = "<html><body><form><input type='file' name='resume' /></form></body></html>"
+    respx.get("https://acme.com/jobs/1").mock(return_value=httpx.Response(200, text=body))
+    result = fetch_url("https://acme.com/jobs/1")
+    assert result.raw_html == body
+    # text and raw_html may diverge for browser path but coincide for httpx
+    assert result.text == result.raw_html
+
+
+@respx.mock
 def test_final_url_reflects_followed_redirect():
     """httpx with follow_redirects=True chases 301/302 and lands at the final
     URL. We must surface that final URL so downstream callers (browser

@@ -7,6 +7,7 @@ from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 from uppgrad_agentic.workflows.auto_apply.nodes.load_opportunity import load_opportunity
 from uppgrad_agentic.workflows.auto_apply.nodes.scrape_application_page import scrape_application_page
 from uppgrad_agentic.workflows.auto_apply.nodes.evaluate_scrape import evaluate_scrape
+from uppgrad_agentic.workflows.auto_apply.nodes.extract_form_fields import extract_form_fields
 from uppgrad_agentic.workflows.auto_apply.nodes.determine_requirements import determine_requirements
 from uppgrad_agentic.workflows.auto_apply.nodes.eligibility_and_readiness import eligibility_and_readiness
 from uppgrad_agentic.workflows.auto_apply.nodes.end_with_explanation import end_with_explanation
@@ -51,7 +52,7 @@ def _route_after_scrape(state: AutoApplyState) -> str:
 def _route_after_evaluate_scrape(state: AutoApplyState) -> str:
     if state.get("result", {}).get("status") == "error":
         return "end_with_error"
-    return "determine_requirements"
+    return "extract_form_fields"
 
 
 def _route_after_eligibility(state: AutoApplyState) -> str:
@@ -115,6 +116,7 @@ def build_graph(checkpointer=None):
     g.add_node("discover_apply_url", discover_apply_url_node)
     g.add_node("scrape_application_page", scrape_application_page)
     g.add_node("evaluate_scrape", evaluate_scrape)
+    g.add_node("extract_form_fields", extract_form_fields)
     g.add_node("determine_requirements", determine_requirements)
 
     # Eligibility phase
@@ -178,10 +180,14 @@ def build_graph(checkpointer=None):
         "evaluate_scrape",
         _route_after_evaluate_scrape,
         {
-            "determine_requirements": "determine_requirements",
+            "extract_form_fields": "extract_form_fields",
             "end_with_error": "end_with_error",
         },
     )
+
+    # extract_form_fields short-circuits internally on error/no-form-url, so
+    # a direct edge to determine_requirements is sufficient.
+    g.add_edge("extract_form_fields", "determine_requirements")
 
     # -----------------------------------------------------------------------
     # Edges — Eligibility

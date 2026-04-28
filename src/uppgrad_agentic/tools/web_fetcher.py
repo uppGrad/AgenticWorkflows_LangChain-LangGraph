@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 import httpx
 
@@ -41,9 +41,10 @@ _MIN_BODY_BYTES = 500
 class FetchResult:
     success: bool                    # HTTP fetch returned 2xx
     thin: bool                       # Content looks like anti-bot, JS shell, short, or 4xx
-    text: str                        # Body (HTML), truncated to _MAX_BYTES
+    text: str                        # Best-effort readable content. httpx: HTML. browser: markdown.
     http_status: int                 # Final response status (after httpx-followed redirects)
     final_url: str = ""              # Final URL after redirect chain (httpx resolves redirects natively)
+    raw_html: str = ""               # Raw rendered HTML when available (httpx: response body, browser: result.html)
     error: str = ""
     thin_signals: List[str] = field(default_factory=list)
     used_browser: bool = False       # True when we escalated to Playwright/Crawl4AI
@@ -97,6 +98,7 @@ def fetch_url(url: str) -> FetchResult:
         text=text,
         http_status=resp.status_code,
         final_url=str(resp.url),
+        raw_html=text,  # httpx response body IS HTML
         thin_signals=signals,
     )
 
@@ -162,11 +164,13 @@ async def _crawl_with_browser(url: str, timeout_seconds: float = 25.0) -> FetchR
         )
 
     md = (getattr(result, "markdown", "") or "")[:_MAX_BYTES]
+    raw_html = (getattr(result, "html", "") or "")[:_MAX_BYTES]
     thin, signals = _detect_thin(md, getattr(result, "status_code", 200))
     return FetchResult(
         success=True, thin=thin, text=md,
         http_status=getattr(result, "status_code", 200) or 200,
         final_url=final_url,
+        raw_html=raw_html,
         thin_signals=signals, used_browser=True,
     )
 
@@ -192,3 +196,21 @@ def fetch_url_with_fallback(url: str) -> FetchResult:
     except ImportError:
         logger.warning("web_fetcher: crawl4ai not installed — returning httpx result")
         return httpx_result
+
+
+def force_browser_fetch(url: str) -> Optional[FetchResult]:
+    """Render a URL with the browser regardless of httpx's thin verdict. Use
+    when the caller knows it needs JS-rendered content (e.g. form-field
+    extraction on a page that httpx returned as non-thin but where the form
+    area itself is rendered client-side, like mongodb.com/careers/<id> or any
+    Ashby/Workday SPA).
+
+    Returns None when browser fallback is disabled or crawl4ai isn't
+    installed; caller should treat that as "browser unavailable, give up"."""
+    if not _browser_fallback_enabled():
+        return None
+    try:
+        return asyncio.run(_crawl_with_browser(url))
+    except ImportError:
+        logger.warning("force_browser_fetch: crawl4ai not installed")
+        return None
