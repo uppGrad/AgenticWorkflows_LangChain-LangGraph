@@ -183,6 +183,33 @@ def test_browser_fallback_uses_final_url_after_httpx_resolved_redirects(monkeypa
 
 
 @respx.mock
+def test_browser_path_populates_raw_html_from_crawl4ai_result(monkeypatch):
+    """For the browser path, Crawl4AI exposes both `markdown` (cleaned text)
+    and `html` (raw rendered DOM after JS). The form extractor needs `html`,
+    so we surface it on FetchResult.raw_html. text remains markdown for the
+    existing prose-extraction path."""
+    monkeypatch.setenv("UPPGRAD_BROWSER_SCRAPE_ENABLED", "true")
+    body = "<html><body><noscript>You need to enable JavaScript to run this app.</noscript></body></html>"
+    respx.get("https://spa.com/jobs/1").mock(return_value=httpx.Response(200, text=body))
+    rendered_dom = "<form><label>Resume</label><input type='file' name='resume' required></form>"
+    rendered_md = "Real apply page rendered. " * 50
+    fake_result = MagicMock(
+        success=True, markdown=rendered_md, html=rendered_dom,
+        status_code=200, redirected_url="https://spa.com/jobs/1",
+    )
+    fake_crawler = AsyncMock()
+    fake_crawler.__aenter__.return_value = fake_crawler
+    fake_crawler.__aexit__.return_value = False
+    fake_crawler.arun = AsyncMock(return_value=fake_result)
+    with patch("uppgrad_agentic.tools.web_fetcher._build_async_crawler", return_value=fake_crawler):
+        result = fetch_url_with_fallback("https://spa.com/jobs/1")
+    assert result.used_browser is True
+    assert result.raw_html == rendered_dom
+    # text is the markdown (used by existing prose extraction)
+    assert "Real apply page rendered" in result.text
+
+
+@respx.mock
 def test_browser_escalation_still_fires_for_200_spa_shell(monkeypatch):
     """Regression guard for the fix above: 200 + SPA-shell body must still
     escalate to browser fallback (this is what the env-gated path is for)."""
