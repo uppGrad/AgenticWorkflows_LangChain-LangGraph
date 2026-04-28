@@ -55,6 +55,8 @@ def discover_apply_url_node(state: AutoApplyState) -> dict:
         # Verified page content propagated to scrape_application_page so we
         # don't re-fetch the same URL twice. Empty for url_direct/cache/failed.
         "discovered_page_content": result.text or None,
+        "discovered_raw_html": result.raw_html or None,
         "discovered_http_status": result.http_status,
+        "discovered_form_url": result.form_url,
         "posting_closed": result.posting_closed,
     }

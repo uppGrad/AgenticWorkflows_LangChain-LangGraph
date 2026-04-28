@@ -39,6 +39,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
     pre_fetched = (state.get("discovered_page_content") or "").strip()
     if pre_fetched:
         pre_status = state.get("discovered_http_status") or 200
+        pre_html = state.get("discovered_raw_html") or ""
         logger.info(
             "scrape_application_page: using pre-fetched content from discovery (%d chars, status=%s) for %s",
             len(pre_fetched), pre_status, target_url,
@@ -51,6 +52,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
                 "confidence": 0.0,
                 "source": target_url,
                 "raw_content": pre_fetched,
+                "raw_html": pre_html,
                 "http_status": pre_status,
             },
         }
@@ -72,6 +74,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
                 "confidence": 0.0,
                 "source": target_url,
                 "raw_content": "",
+                "raw_html": "",
                 "http_status": fetch.http_status,
                 "error": fetch.error or f"thin: {','.join(fetch.thin_signals)}",
             },
@@ -87,6 +90,7 @@ def scrape_application_page(state: AutoApplyState) -> dict:
             "confidence": 0.0,
             "source": target_url,
             "raw_content": fetch.text,
+            "raw_html": fetch.raw_html or "",
             "http_status": fetch.http_status,
         },
     }
