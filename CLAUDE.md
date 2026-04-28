@@ -37,8 +37,11 @@ The LLM is opt-in via environment variables. Without them, nodes fall back to he
 | Variable | Description | Default |
 |---|---|---|
 | `UPPGRAD_LLM_PROVIDER` | `openai` (only supported provider currently) | _(none — heuristic mode)_ |
-| `UPPGRAD_OPENAI_MODEL` | OpenAI model name | `gpt-4o-mini` |
+| `UPPGRAD_OPENAI_MODEL` | OpenAI model name | `gpt-5.4-mini` |
 | `OPENAI_API_KEY` | Required when provider is `openai` | _(none)_ |
+| `UPPGRAD_SEARCH_PROVIDER` | `brave` (only Brave Search supported currently) | _(none — discovery uses url_direct only)_ |
+| `BRAVE_SEARCH_API_KEY` | Required when search provider is `brave` | _(none)_ |
+| `UPPGRAD_BROWSER_SCRAPE_ENABLED` | `true` to enable Playwright/Crawl4AI fallback for thin httpx fetches | `false` |
 
 ## Architecture
 
@@ -48,15 +51,19 @@ The LLM is opt-in via environment variables. Without them, nodes fall back to he
 src/uppgrad_agentic/
   common/          # Shared utilities: LLM factory (llm.py), logging, guardrails, error types
   config/          # Settings (currently stub)
-  tools/           # File-level tools: documents.py (PDF/DOCX/TXT extraction), opportunities.py
+  tools/           # File-level tools: documents.py (PDF/DOCX/TXT extraction),
+                   #                  search.py (Brave search), web_fetcher.py
+                   #                  (httpx-first + Playwright/Crawl4AI fallback),
+                   #                  url_discovery.py (3-tier apply-URL discovery),
+                   #                  opportunities.py
   workflows/
-    document_feedback/   # The only implemented workflow so far
+    document_feedback/   # Fully implemented end-to-end
       state.py     # DocFeedbackState TypedDict — the single source of truth for graph state
       schemas.py   # Pydantic models used for LLM structured output (DocTypeClassification)
       graph.py     # build_graph() — assembles and compiles the LangGraph StateGraph
       run.py       # CLI entry point: python -m uppgrad_agentic.workflows.document_feedback.run
       nodes/       # One file per node function
-      prompts.py   # System/human prompt strings
+      prompts.py   # System/human prompt strings (unused — see Prompt pattern below)
       tests/       # Smoke test + unit test stubs (currently empty)
     auto_apply/          # Fully implemented end-to-end
       state.py     # AutoApplyState TypedDict
@@ -64,6 +71,8 @@ src/uppgrad_agentic/
       graph.py     # build_graph() — assembles and compiles the LangGraph StateGraph
       run.py       # CLI entry point: python -m uppgrad_agentic.workflows.auto_apply.run
       nodes/       # One file per node function
+      _profile.py  # resolve_profile() — prefers injected profile_snapshot, falls back to stub
+      control.py   # cancel_session() — out-of-band cancel via graph.update_state()
 ```
 
 ### General patterns
@@ -74,12 +83,23 @@ src/uppgrad_agentic/
 - **LLM pattern**: `get_llm()` in `common/llm.py` returns `None` when no provider is 
   configured. Every node that calls an LLM must handle the `None` case with a 
   heuristic fallback. See `detect_doc_type.py` for the reference implementation.
+- **Search/fetcher pattern**: `tools/search.get_search_provider()` and 
+  `tools/web_fetcher` follow the same opt-in factory pattern as `get_llm()`. 
+  Callers must handle the no-provider case by returning a degraded result, never 
+  by raising.
 - **Prompt pattern**: prompts live inline inside each node file, not in prompts.py. 
   This keeps each prompt next to its logic. prompts.py is unused and can be ignored.
 - **Human-in-the-loop**: any workflow that triggers external actions must include a 
-  human_gate node using LangGraph interrupt() before the action.
-- **Checkpointer**: MemorySaver is used for now. Will be replaced with 
-  AsyncPostgresSaver during backend integration.
+  human_gate node using LangGraph `interrupt()` before the action.
+- **Backend-first state injection**: nodes that historically owned stub data 
+  (`fetch_profile_snapshot`, `get_opportunity_context`, `load_opportunity`, 
+  `eligibility_and_readiness`, `asset_mapping`, `application_tailoring`) now check 
+  for pre-injected state from the backend adapter and use it when present, falling 
+  back to in-repo stubs for CLI / local-dev mode (with a WARNING log on the fallback 
+  path).
+- **Checkpointer**: `build_graph(checkpointer=...)` accepts an injected checkpointer. 
+  Production callers (the Django adapter) pass `PostgresSaver`. CLI defaults to 
+  `MemorySaver`.
 
 ### common/state.py
 Intentionally reserved as a shared base state for future workflows. Currently empty. 
@@ -204,12 +224,16 @@ Key columns for the workflow:
 
 ### Agent responsibilities
 
-**Opportunity Intelligence Agent** (load_opportunity.py, scrape_application_page.py, 
-evaluate_scrape.py, determine_requirements.py)
-Loads the opportunity record from the correct DB table based on opportunity_type.
-For jobs only: attempts to scrape the application page (url_direct if present, 
-else url), evaluates scrape quality as full, partial, or failed, and normalizes 
-scraped content into a structured requirements list.
+**Opportunity Intelligence Agent** (load_opportunity.py, discover_apply_url.py, 
+scrape_application_page.py, evaluate_scrape.py, determine_requirements.py)
+Loads the opportunity record from the correct DB table based on opportunity_type 
+(short-circuits when the backend adapter has pre-loaded `opportunity_data`).
+For jobs only: discovers the real apply URL via `discover_apply_url` (Brave 
+search through ATS / company-careers / generic tiers, with multi-factor 
+verification — see Discovery v2 below), then scrapes the application page 
+using the verified content from discovery (no double-fetch). Evaluates scrape 
+quality as full, partial, or failed and normalizes scraped content into a 
+structured requirements list.
 For programs and scholarships: skips scraping entirely and parses requirements 
 directly from the data json field in the DB record.
 If scraping fails or is partial, falls back to assumed default requirements based 
@@ -218,11 +242,15 @@ Stores scrape_status and scrape_confidence in state so downstream agents and the
 user are aware of whether requirements are real or assumed.
 
 **Applicant Eligibility and Readiness Agent** (eligibility_and_readiness.py)
-Checks hard constraints: deadline not passed, location fit, degree requirements 
-from data json, profile completeness against normalized requirements.
-Produces one of: ready | pending | ineligible | manual_review.
-If pending, triggers human_gate_0 to ask user to complete missing profile info 
-before continuing.
+Hard-blocks ONLY for: deadline passed, missing user-supplied (non-generatable) 
+documents (Transcript, English Proficiency Test). Compatibility issues 
+(location, age cap, degree-level, discipline, nationality) are non-blocking 
+warnings stored in `state['compatibility_warnings']` and surfaced to the user 
+through the application package. Documents the system can generate from CV + 
+profile (Cover Letter, SOP, Personal Statement, Research Proposal, etc.) do 
+not block — they flow through to asset_mapping with `tailoring_depth='generate'`.
+Decision: ready | pending | ineligible | manual_review. If pending, triggers 
+`human_gate_0`.
 
 **Asset Mapping Agent** (asset_mapping.py)
 Maps each normalized requirement to the best available user document.
@@ -235,54 +263,63 @@ directly without a proposal review step at this stage.
 Generates tailored version of each required document grounded in opportunity 
 context and the normalized requirements from the Opportunity Intelligence Agent.
 Parameterized by opportunity_type and tailoring depth from asset mapping.
+Per-doc-type output caps via `_truncate_to_cap` (CV ≤ 8000, Cover Letter ≤ 3000, 
+SOP / Personal Statement ≤ 6000, default 5000) prevent runaway LLM output from 
+breaking PDF rendering and frontend display. Boundary-aware truncation prefers 
+the last paragraph break that fits in the upper half of the cap; otherwise 
+hard-cut.
 
 **Application Evaluation Agent** (application_evaluation.py)
-Verifies full package for groundedness, requirement coverage, and hallucinations.
-Triggers refinement loop back to application_tailoring, capped at 2 iterations.
+Verifies full package for groundedness, requirement coverage, and hallucinations 
+(length, placeholder text, keyword coverage). Triggers refinement loop back to 
+application_tailoring, capped at 2 iterations.
 
 **Human Review Coordinator** (human_gate_0.py, human_gate_1.py, human_gate_2.py)
-Gate 0: only triggered if eligibility check finds missing profile info. Asks user 
-to complete required fields before workflow continues.
-Gate 1: after asset mapping, presents document mapping to user, collects document 
-selections and any additional uploads from local device.
-Gate 2: after evaluation, presents final tailored package for user approval before 
-submission or handoff. No materials are submitted without passing this gate.
-All three use LangGraph interrupt() and require MemorySaver checkpointer.
+Gate 0: triggered when eligibility finds missing user-supplied profile fields 
+or non-generatable documents. Real `interrupt()` cycle with iteration cap of 2 
+(`PROFILE_INCOMPLETE_AFTER_RETRIES`); on resume, graph routes back to 
+`eligibility_and_readiness` for a re-check.
+Gate 1: after asset mapping, presents document mapping to user, collects 
+document selections and any additional uploads from local device.
+Gate 2: after evaluation, presents final tailored package for user approval 
+before submission or handoff. No materials are submitted without passing this 
+gate.
+All three use LangGraph interrupt() and require a checkpointer 
+(MemorySaver for CLI, PostgresSaver in production).
 
-**Submission Agent** (route_by_source.py, submit_internal.py, package_and_handoff.py, 
+**Submission Agent** (submit_internal.py, package_and_handoff.py, 
 record_application.py)
-First determines whether the opportunity is internal or external using employer_id 
-from the linkedin_jobs table. employer_id == 1 means internal, NULL means external.
-For internal jobs: submits CV and Cover Letter directly to platform backend (stub 
-for now, to be wired during integration).
+Routing inside `_route_after_gate2`: internal jobs (employer_id == 1) → 
+submit_internal; everything else → package_and_handoff.
+For internal jobs: `submit_internal` records submission *intent* only; the 
+backend adapter writes the real `Application` row via Django ORM after the 
+graph terminates with `submission_type='internal'` (no HTTP loopback from 
+agentic → backend).
 For all external opportunities (external jobs, masters, phd, scholarships): 
 assembles the final tailored package and hands it off to the user.
-Records the application outcome in both cases. For jobs, also stores scrape_status 
-and scrape_confidence in the application record for potential future use when 
-attempting external submission automation.
+Records the application outcome in both cases. For jobs, also stores 
+scrape_status, scrape_confidence, and compatibility warnings in the 
+application record.
 
 ### Orchestration
 
 START
-→ load_opportunity (receive opportunity_type + id from frontend, query correct table)
-→ determine_requirements
+→ load_opportunity (receive opportunity_type + id from frontend, query correct table;
+                    short-circuits when backend pre-loaded opportunity_data)
 if opportunity_type == job:
-→ scrape_application_page (use url_direct if present, else url)
+→ discover_apply_url (3-tier Brave search → verified URL + content)
+→ scrape_application_page (uses pre-fetched discovery content; falls back to fresh httpx)
 → evaluate_scrape (assess quality: full | partial | failed)
-→ if full: use scraped requirements
-→ if partial or failed: fall back to assumed defaults [CV, Cover Letter]
-→ store scrape_status and scrape_confidence in state
+→ determine_requirements (full → use scraped, partial → merge with defaults, failed → defaults)
 if opportunity_type == masters or phd:
 → skip scraping
-→ parse requirements from data json field
-→ assume [CV, SOP] as baseline
+→ determine_requirements (parse from data json; assume [CV, SOP] as baseline)
 if opportunity_type == scholarship:
 → skip scraping
-→ parse eligibility from data json field
-→ assume [CV, Cover Letter] as baseline
+→ determine_requirements (parse from data json; assume [CV, Cover Letter] as baseline)
 → eligibility_and_readiness
 → ineligible: end_with_explanation → END
-→ pending missing profile info: human_gate_0 → (user completes profile) → continue
+→ pending missing profile info: human_gate_0 → eligibility_and_readiness (re-check, capped at 2)
 → ready: continue
 → asset_mapping
 → human_gate_1 (user reviews document mapping, selects or uploads documents)
@@ -298,14 +335,16 @@ else:
 → package_and_handoff → record_application → END
 
 Key orchestration rules:
-- Scraping is only attempted for job opportunities, never for programs or scholarships
-- Use url_direct if present for scraping, fall back to url if not
+- Discovery is only attempted for job opportunities (skipped for internal jobs and 
+  non-job types). Cache hits (cross-user, 14-day staleness) skip the search.
+- Verified content from discovery is propagated through state to scrape_application_page 
+  to avoid double-fetching the same URL.
 - Never block the workflow on a failed scrape, always degrade to assumed requirements
 - Store scrape_status and scrape_confidence in state throughout so the user is 
   always informed whether requirements were scraped or assumed
 - Internal vs external is determined by employer_id in linkedin_jobs, not site column
 - human_gate_0 is conditional and only triggered when eligibility check finds 
-  missing profile information
+  missing user-supplied documents or required profile fields
 - For now internal submission only requires CV and Cover Letter fields
 - All three opportunity types share the same pipeline after determine_requirements; 
   only the scraping step and the final routing differ
@@ -323,25 +362,32 @@ Key orchestration rules:
 Define in workflows/auto_apply/state.py:
 - opportunity_type: job | masters | phd | scholarship
 - opportunity_id: str
-- opportunity_data: dict (raw DB record)
+- opportunity_data: dict (raw DB record; pre-loaded by backend adapter in production)
+- profile_snapshot: dict (injected by backend adapter; replaces _get_stub_profile lookups)
+- discovered_apply_url, discovery_method, discovery_confidence: discovery output
+- discovered_page_content, discovered_http_status: verified content propagated to scrape
+- posting_closed: bool (true when discovery found a real listing that says the
+  posting is closed; surfaced in handoff package)
 - scraped_requirements: dict (status, requirements list, confidence, source)
 - normalized_requirements: list (final requirements list after scrape or assumption)
+- gate_0_iteration_count: int (caps the eligibility re-check loop after gate 0)
+- compatibility_warnings: List[str] (non-blocking warnings)
 - eligibility_result: dict (decision, reasons, missing_fields)
 - asset_mapping: dict (requirement to document mapping with tailoring depth)
 - human_review_0: dict (user response to missing profile info gate, if triggered)
 - human_review_1: dict (user selections from gate 1)
 - tailored_documents: dict (document type to tailored content)
 - evaluation_result: dict
+- iteration_count: int
 - human_review_2: dict (user approval from gate 2)
 - application_package: dict (final documents ready for handoff or submission)
 - application_record: dict (logged outcome, includes scrape_status and scrape_confidence for jobs)
-- iteration_count: int
+- current_step, step_history: frontend progress tracking
 - result: dict (status, error_code, user_message)
 
-### Future implementation steps (post integration)
+### Future work — agentic-side roadmap
 
-These are intentionally out of scope for the current implementation but 
-should be tracked for future development:
+These are intentionally out of scope for the current implementation:
 
 **Requirements review human gate**
 After determine_requirements, surface the normalized requirements list to the 
@@ -353,556 +399,385 @@ as unavailable is noted in the final package rather than blocking the workflow.
 This makes asset mapping cleaner since it works with a confirmed set of assets.
 
 **External application form submission**
-For external job opportunities where scraping was fully successful, attempt to 
-automatically fill and submit the application form using browser automation 
-(Playwright or equivalent). This requires handling multi-step forms, file upload 
-fields, and graceful fallback when anti-bot mechanisms are encountered. 
-Scrape confidence and scraped field structure should be stored in the application 
-record during current implementation to make this step easier to add later.
-
-### Scraping status
-
-Current implementation in scrape_application_page.py makes a plain requests.get()
-call which has effectively zero success rate against LinkedIn pages due to
-bot detection, JavaScript rendering, and login walls. The fallback to assumed
-default requirements [CV, Cover Letter] works correctly and gracefully.
-
-Planned improvement (next implementation step):
-Replace requests.get() with a Playwright-based scraper that:
-1. Navigates to url_direct if present in DB, else navigates to url
-2. If on LinkedIn job page, finds and follows the Apply button to reach url_direct
-3. Scrapes the actual application page at url_direct for required documents,
-   form fields, and special instructions
-4. Returns structured requirements with high confidence if successful
-
-Since scraping only triggers once per user auto-apply action (not bulk),
-LinkedIn ban risk is low. Playwright with stealth patches is the recommended
-approach. This is a planned improvement, not yet implemented.
-
-Also note: LLM-powered scraping libraries like Firecrawl, Crawl4AI, and
-Scrapegraph-ai are worth evaluating as alternatives or complements to Playwright
-for structured requirement extraction. Crawl4AI is open source and free.
-Evaluate these before implementing the Playwright approach.
+For external job opportunities where discovery succeeded with high confidence, 
+attempt to automatically fill and submit the application form using browser 
+automation (Playwright or equivalent). This requires handling multi-step forms, 
+file upload fields, and graceful fallback when anti-bot mechanisms are 
+encountered. Scrape confidence and scraped field structure are already stored 
+in the application record to make this step easier to add later.
 
 ---
 
 ## Implementation Status
 
-### Completed
+### Workflows — both fully implemented end-to-end
 
-**Document Feedback Workflow** — fully implemented, smoke tested across all three
-doc types (CV, SOP, Cover Letter), bug audit completed.
-- Phase 0: load_document.py, detect_doc_type.py, end_with_error.py, graph.py routing
-- Phase 1: Context Assembly nodes (fetch_profile_snapshot, extract_doc_sections, 
+**Document Feedback Workflow** — all 17 nodes wired across phases 0–6, smoke 
+tested across CV/SOP/Cover Letter, bug audit completed.
+- Phase 0: load_document, detect_doc_type, end_with_error, doc-type routing.
+- Phase 1: Context assembly (fetch_profile_snapshot, extract_doc_sections, 
   parse_user_instructions, get_opportunity_context, build_context_pack); 
-  state.py and schemas.py extended with all Phase 1+ fields and 
-  ChangeProposal/EvaluationResult schemas
-- Phase 2: Parallel analysis nodes (analyze_structure, analyze_style, 
-  analyze_content_gaps, analyze_ats, analyze_opportunity_alignment); 
-  graph wired with LangGraph Send fan-out from build_context_pack
-- Phase 3: Synthesis & Planning (synthesize_feedback); graph wired with 
-  MemorySaver checkpointer
-- Phase 4: Evaluation loop (evaluate_output); conditional routing back to 
-  synthesize_feedback on failure, capped at MAX_EVAL_ITERATIONS=2
-- Phase 5: Human gate (human_gate); interrupt() suspends graph and surfaces 
-  proposals to frontend; resume via Command(resume=decisions)
-- Phase 6: Rewrite (finalize); applies accepted proposals right-to-left, 
-  resolves overlapping spans by confidence, LLM coherence smoothing pass, 
-  produces diff summary
-- Bug fix: json.dumps crash in run.py when graph suspends at human_gate (Interrupt
-  object not JSON serializable); fixed with default=str
-- Frontend progress tracking: current_step (Optional[str]) and step_history
-  (Annotated[List[str], operator.add]) added to DocFeedbackState; all 17 nodes
-  updated to set indicators. Sequential nodes set both fields; the 5 parallel
-  analysis nodes set only step_history (concurrent current_step writes would
-  conflict). build_context_pack sets current_step="parallel_analysis" on its
-  successful return so the frontend has a meaningful indicator during the fan-out.
+  state.py and schemas.py extended with all Phase 1+ fields including 
+  ChangeProposal/EvaluationResult schemas.
+- Phase 2: Parallel analysis (analyze_structure, analyze_style, 
+  analyze_content_gaps, analyze_ats, analyze_opportunity_alignment); LangGraph 
+  Send fan-out from build_context_pack. analyze_ats consumes 
+  opportunity_context keywords in both LLM and heuristic paths.
+- Phase 3: synthesize_feedback with grounding validation (drops proposals 
+  whose `before_text` cannot be fuzzy-matched to the document).
+- Phase 4: evaluate_output evaluation loop, capped at MAX_EVAL_ITERATIONS=2.
+- Phase 5: human_gate using `interrupt()` with frontend-friendly resume payload.
+- Phase 6: finalize applies accepted proposals right-to-left, resolves overlapping 
+  spans by confidence, runs an LLM coherence smoothing pass, produces a diff 
+  summary and final document.
+- Frontend progress tracking: `current_step` (Optional[str]) and `step_history` 
+  (Annotated[List[str], operator.add]) on DocFeedbackState. Sequential nodes set 
+  both fields; the 5 parallel analysis nodes set only `step_history` (concurrent 
+  `current_step` writes would conflict). `build_context_pack` sets 
+  `current_step="parallel_analysis"` on its successful return so the frontend 
+  has a meaningful indicator during the fan-out.
 
-**Auto-Apply Workflow** — fully implemented end-to-end, smoke tested across all four
-opportunity types (job, masters, phd, scholarship), routing verified at every
-conditional edge, bug audit completed.
-- Opportunity Intelligence: load_opportunity.py (stub DB lookup for all four types),
-  scrape_application_page.py (requests-based fetch with graceful failure),
-  evaluate_scrape.py (LLM structured output + heuristic fallback),
-  determine_requirements.py (scrape → parse data json → assumed defaults)
-- Eligibility: eligibility_and_readiness.py (deadline, hard constraints, profile
-  completeness checks); end_with_explanation.py; human_gate_0.py (stub interrupt)
-- Asset Mapping: asset_mapping.py (LLM structured output + heuristic depth
-  classification); AssetMap / AssetMappingOutput schemas; human_gate_1.py
-  (full interrupt/resume with per-document override and upload support)
-- Tailoring & Evaluation: application_tailoring.py (LLM apply-mode rewrite +
-  heuristic fallback per depth); application_evaluation.py (length, placeholder,
-  keyword-coverage checks with 2-iteration retry loop)
-- Human Review: human_gate_2.py (full interrupt/resume, approve/reject with
-  per-document feedback)
-- Submission: submit_internal.py (stub backend POST); package_and_handoff.py
-  (assembles package with scrape provenance for jobs); record_application.py
-  (logs outcome, timestamp, doc types, scrape metadata)
-- graph.py fully wired end-to-end; run.py CLI entry point
-- Frontend progress tracking: current_step and step_history added to AutoApplyState;
-  all 15 nodes updated. Auto-apply has no parallel fan-out so all nodes set both
-  fields. No parallel_analysis sentinel needed.
+**Auto-Apply Workflow** — all 15 nodes wired end-to-end, smoke tested across 
+job/masters/phd/scholarship, routing verified at every conditional edge.
+- Opportunity Intelligence: load_opportunity (short-circuits on pre-loaded 
+  opportunity_data, falls back to in-repo stubs in CLI), discover_apply_url 
+  (Brave + 3-tier search + multi-factor verification), 
+  scrape_application_page (consumes pre-fetched discovery content; falls back 
+  to fresh httpx fetch via the tiered fetcher), evaluate_scrape (LLM structured 
+  output + heuristic fallback), determine_requirements (scrape → parse data 
+  json → assumed defaults).
+- Eligibility: eligibility_and_readiness (deadline + missing user-supplied 
+  docs hard-block; compatibility issues are non-blocking warnings); 
+  end_with_explanation; human_gate_0 (real `interrupt()` cycle with iteration 
+  cap, routes back to eligibility_and_readiness for a re-check).
+- Asset Mapping: asset_mapping (LLM structured output + heuristic depth 
+  classification using `_GENERATABLE` / `_USER_SUPPLIED` sets); 
+  AssetMap / AssetMappingOutput schemas; human_gate_1 (full interrupt/resume 
+  with per-document override and upload support).
+- Tailoring & Evaluation: application_tailoring (LLM apply-mode rewrite + 
+  heuristic fallback per depth, with per-doc-type output caps); 
+  application_evaluation (length, placeholder, keyword-coverage checks with 
+  2-iteration retry loop).
+- Human Review: human_gate_2 (full interrupt/resume, approve/reject with 
+  per-document feedback).
+- Submission: submit_internal records intent only (backend ORM writes the 
+  Application row); package_and_handoff (assembles package with scrape 
+  provenance, compatibility warnings, posting_closed flag for jobs); 
+  record_application (logs outcome, timestamp, doc types, scrape metadata).
+- graph.py fully wired end-to-end; run.py CLI entry point with `--thread-id`.
+- Frontend progress tracking: `current_step` and `step_history` on 
+  AutoApplyState; all 15 nodes set both fields. Auto-apply has no parallel 
+  fan-out so no `parallel_analysis` sentinel is needed.
+- Cancel support: `workflows/auto_apply/control.py:cancel_session(thread_id, 
+  checkpointer)` injects a CANCELLED marker into the live checkpoint via 
+  `graph.update_state()`. The next-node short-circuit pattern drains the graph 
+  to END.
 
-### In Progress
-- Nothing currently in progress
+### Backend integration — driven from `backend/ai_services/`
 
-### Not Started
-- Nothing
+Both agentic workflows are wired into the Django backend via dedicated adapter 
+modules. The backend, not the agentic repo, is the API surface for the 
+frontend. The agentic repo no longer needs a FastAPI layer of its own.
+
+**Document feedback adapter** (`graph_adapter.py`):
+- ORM-to-state converters: `build_profile_snapshot`, `build_opportunity_context` 
+  (handles job / program / scholarship / event types).
+- `start_session` / `resume_session` background-thread runners with stale-state 
+  cleanup via `cleanup_stale_sessions` (flat 15-min TTL).
+- `_build_checkpointed_graph` builds a `PostgresSaver`-backed graph; one-time 
+  `setup()` uses a direct (non-pooler) Neon URL with autocommit because 
+  `CREATE INDEX CONCURRENTLY` cannot run inside a transaction. Normal runtime 
+  uses the pooler URL with autocommit (without autocommit, checkpoint writes 
+  end up in an uncommitted transaction that rolls back on connection close, 
+  and the resumed graph cannot find its state).
+- OCR fallback (`_extract_text_with_ocr_fallback`) layers pdf2image + 
+  pytesseract on top of normal text extraction; lazy-imports gracefully when 
+  OCR libs are not installed.
+
+**Auto-apply adapter** (`auto_apply_adapter.py`):
+- Opportunity snapshot builder (`build_auto_apply_opportunity_snapshot`) 
+  handles all four types via `JobOpportunity` / `ProgramOpportunity` / 
+  `ScholarshipOpportunity` ORM lookups; returns None when the opportunity is 
+  missing or closed (gates session creation upstream).
+- Profile snapshot builder (`build_auto_apply_profile_snapshot`) reads the 
+  `Student` / `StudentCV` ORM, extracts CV text via the document-feedback 
+  adapter's OCR fallback, and produces the dict the agentic graph expects. 
+  v1 cap: only CV is sourced from a stored user file. Cover Letter / SOP / 
+  Personal Statement are always *generated* by application_tailoring 
+  (`tailoring_depth='generate'`).
+- `start_session` and three per-gate resume handlers 
+  (`resume_session_gate_{0,1,2}`).
+- Gate 0 resume rebuilds the profile snapshot post-update and injects it via 
+  `graph.update_state(config, {"profile_snapshot": fresh})` before resuming, 
+  so the eligibility re-check sees the new profile rather than the snapshot 
+  frozen at start.
+- Gate 2 resume freshness re-check: rebuilds the opportunity snapshot before 
+  resuming and short-circuits to INELIGIBLE if the opportunity has just 
+  closed during the wait.
+- `_pending_node_after_invoke` reads `graph.get_state(config).next` to 
+  determine which gate is held. `result_state['current_step']` cannot be 
+  used because `interrupt()` suspends BEFORE the node returns its updates dict 
+  — `current_step` reflects the last fully-completed node, not the gate.
+- `finalize_internal_submission` writes a real `Application` row via Django 
+  ORM (Spec A3 — no HTTP loopback to the agentic repo); the internal-submit 
+  path renders the tailored CV to PDF using ReportLab in `document_renderer.py` 
+  and saves it to `Application.resume_file`.
+- `cancel_session` calls into 
+  `uppgrad_agentic.workflows.auto_apply.control.cancel_session` to inject a 
+  CANCELLED marker into the live PostgresSaver checkpoint.
+- Per-status TTL janitor (`janitor.py`): PROCESSING/15m, FINALIZING/30m, 
+  AWAITING_*/7 days. The flat 15-min cap from FeedbackSession is wrong for 
+  ApplicationSession because human-gate states can legitimately last days.
+- Discovery cache: pre-invoke `_lookup_discovery_cache` (gates on 14-day 
+  staleness via `last_verified_at`) + post-invoke `_persist_discovery_to_cache` 
+  (upserts via `update_or_create`, skips for `failed` and `skipped_internal`).
+- Result-code mapping: `INELIGIBLE` and `PROFILE_INCOMPLETE_AFTER_RETRIES` 
+  flip session to `INELIGIBLE`; `CANCELLED` flips to `CANCELLED`; everything 
+  else with `result.status='error'` flips to `ERROR`.
+
+**Database models** (`models.py`):
+- `FeedbackSession` — document feedback state (status enum, proposals, 
+  decisions, final document/PDF, error_message, thread_id).
+- `ApplicationSession` — auto-apply state (status enum, per-gate response, 
+  eligibility result, asset mapping, tailored documents, application package, 
+  discovery fields, compatibility_warnings, application FK to 
+  `jobs.Application`); partial unique constraint enforces one active session 
+  per `(student, opportunity_type, opportunity_id)`.
+- `JobApplyUrlDiscovery` — cross-user apply-URL cache (PK=job_id, fields: 
+  discovered_url, discovery_method, discovery_confidence, discovered_at, 
+  last_verified_at). Stale rows are not deleted; the next successful discovery 
+  overwrites them.
+
+**DRF views and URL routes** (`views.py`, `urls.py`):
+- Document feedback: `FeedbackSessionListCreateView`, 
+  `FeedbackSessionDetailView`, `FeedbackSessionReviewView`, 
+  `FeedbackSessionCancelView` mounted at `/api/ai/feedback-sessions/...`.
+- Auto-apply: `ApplicationSessionListCreateView`, 
+  `ApplicationSessionDetailView`, `ApplicationSessionCancelView`, three 
+  per-gate resume views mounted at `/api/ai/application-sessions/...`. The 
+  `_GateResumeBaseView` looks up handlers via `globals()[handler_name]` so 
+  test patches of the module-level handlers take effect.
+
+### Discovery v2 — apply-URL discovery for jobs
+
+Replaces the old "fetch the LinkedIn page and fail" path with a search-based 
+discovery pipeline + a tiered fetcher. Lives entirely in `tools/`.
+
+**Components**:
+- `search.py` — `SearchProvider` ABC + `BraveSearchProvider`. Opt-in via 
+  `UPPGRAD_SEARCH_PROVIDER=brave` + `BRAVE_SEARCH_API_KEY`. Mirrors the 
+  `get_llm()` factory pattern.
+- `web_fetcher.py` — Tiered fetcher: httpx-first (fast, cheap, no browser); 
+  Playwright/Crawl4AI fallback when (a) httpx is thin AND (b) 
+  `UPPGRAD_BROWSER_SCRAPE_ENABLED=true`. Crawl4AI is lazy-imported and no-ops 
+  gracefully when not installed. `_detect_thin` flags 4xx, short bodies, and 
+  ≥2 anti-bot keywords.
+- `url_discovery.py` — Multi-factor verification + 3-tier orchestration.
+
+**Verification gates** (informed by live testing — see Live verification below):
+- Title fuzzy match ≥85 (hard prerequisite).
+- Corroborator count drawn from {company-in-text, location-match, 
+  posted-time-match, description-keyword-overlap}. ATS / generic tiers need 
+  ≥2 corroborators; the careers tier needs 1 (the domain itself proves the 
+  company).
+- Confidence is scaled by extra corroborators beyond the minimum.
+- Thin pages (captcha walls, 4xx, JS shells) are rejected at the fetcher gate 
+  before scoring; never given a second-look at scrape time.
+
+**3-tier search**:
+- Tier 1 ATS: `"<title>" "<company>" (site:greenhouse.io OR site:lever.co OR ...)`.
+- Tier 2 careers: `"<title>" site:<company-domain>` — skipped when 
+  `company_url` resolves to a blocklisted domain (linkedin.com, indeed.com, 
+  glassdoor.com, social/aggregator sites). LinkedIn-jobs `company_url` is 
+  usually the LinkedIn company page URL, not a real careers site, so the 
+  blocklist saves wasted Brave calls.
+- Tier 3 generic: `"<title>" "<company>" apply` (no `site:` constraint).
+
+**Single-fetch architecture**: `DiscoveryResult.text` carries verified content 
+forward via `state['discovered_page_content']`; `scrape_application_page` 
+consumes it instead of re-fetching the same URL. Halves the request count and 
+reduces ban risk.
+
+**Graph wiring**: `discover_apply_url` node sits between `load_opportunity` 
+and `scrape_application_page` for jobs (skipped for internal jobs and non-job 
+opportunity types). Cache-hit short-circuit honored.
+
+**Live verification** (Neon dev, real Brave + OpenAI, cross-checked against source data):
+
+| Job | Location | Discovery | Cross-check verdict |
+|---|---|---|---|
+| Celonis CVP (id 202599) | Schwyz, Switzerland | `failed` | ✅ Greenhouse only had Cleveland role; refusing the false positive is correct |
+| GitHub Senior Solutions Engineer (id 199838) | Germany | `failed` | ✅ GitHub uses Workday (JS-rendered); needs browser fallback |
+| Anthropic SA Munich (id 200082) | Munich, Germany | `failed` | ✅ Greenhouse had Paris and NYC variants only; user confirmed listing is a "tracker-only" ghost posting with no real apply destination |
+
+Cache rows after 3 failed runs: 0 (correct: cache only stores successful matches).
 
 ---
 
 ## Integration TODO
 
-Items currently stubbed, hardcoded, or mocked that must be replaced during
-backend / frontend / database integration.
-
-### Authentication and user identity
-- **state.py** — No user_id field in DocFeedbackState. API layer must inject 
-  authenticated user ID into state at invocation time.
-- **fetch_profile_snapshot.py** — Returns hardcoded stub profile. Replace with 
-  real DB lookup keyed on state["user_id"].
-
-### Opportunity context
-- **get_opportunity_context.py** — Returns hardcoded mock opportunity. Real 
-  implementation must accept structured opportunity input from frontend and 
-  look up or parse the opportunity properly.
-
-### File ingestion and storage
-- **load_document.py** — Reads from local filesystem path. In production files 
-  will arrive as multipart uploads or from object storage.
-- **tools/documents.py** — DOCX tables and images silently ignored. PDF scanned 
-  pages return empty text with no OCR fallback. Wire in OCR for scanned docs.
-
-### Graph state persistence
-- **graph.py** — MemorySaver is non-durable. Replace with AsyncPostgresSaver 
-  pointing at production database.
-- **run.py** — No thread_id passed to graph.invoke(). API layer must generate 
-  and store thread IDs for interrupt/resume to work across requests.
-
-### LLM and configuration
-- **common/llm.py** — Only OpenAI wired up. Add other providers as needed.
-- **config/settings.py** — Empty stub. Wire in real settings module using 
-  pydantic-settings.
-
-### Analysis quality
-- **analyze_ats.py** — Static keyword list. Should use keywords from 
-  opportunity_context and user target_roles.
-- **All analysis nodes** — parsed_instructions is available in context_pack 
-  but not yet used to narrow or prioritize findings.
-- **synthesize_feedback.py heuristic path** — before_text and after_text are 
-  placeholder strings rather than actual spans from doc_sections.
-
-### API / frontend surface
-- No HTTP API layer yet. run.py is CLI only. A FastAPI service layer is needed 
-  to handle authenticated file upload, graph invocation, streaming or polling 
-  for intermediate state, and returning structured JSON to the frontend.
-
-### Auto-apply workflow
-
-**User identity and profile**
-- **eligibility_and_readiness.py** — `_STUB_PROFILE` is a hardcoded dict (name,
-  email, age, nationality, location, degree_level, disciplines, gpa,
-  uploaded_documents, document_texts). Replace `_get_stub_profile()` with a real
-  DB lookup keyed on `state["user_id"]`. `AutoApplyState` has no `user_id` field
-  yet; the API layer must inject it at invocation time.
-- **eligibility_and_readiness.py** — `uploaded_documents` values are plain
-  booleans. Real implementation needs file references (storage keys or URLs) so
-  downstream nodes can fetch actual content.
-- **eligibility_and_readiness.py** — `document_texts["CV"]` is a hardcoded stub
-  string. Replace with content fetched from object storage using the file
-  reference stored against the user's profile.
-
-**Opportunity database**
-- **load_opportunity.py** — `_fetch_opportunity()` returns one of four hardcoded
-  stub dicts (`_STUB_JOB`, `_STUB_MASTERS`, `_STUB_PHD`, `_STUB_SCHOLARSHIP`)
-  regardless of `opportunity_id`. Replace with real queries:
-  - job → `SELECT * FROM linkedin_jobs WHERE id = %s`
-  - masters/phd → `SELECT * FROM programs WHERE id = %s AND program_type = %s`
-  - scholarship → `SELECT * FROM scholarships WHERE id = %s`
-
-**Web scraping**
-- **scrape_application_page.py** — Uses a generic bot User-Agent string. Production
-  scraping will need rotating proxies, session cookies, and handling of JS-rendered
-  pages (Playwright or equivalent) for sites that block simple HTTP GET requests.
-
-**Internal submission**
-- **submit_internal.py** — `_post_to_backend()` is a no-op stub that logs and
-  returns a fake `platform_application_id`. Replace with a real authenticated
-  HTTP POST to the platform API. The required fields (endpoint URL, auth headers,
-  payload schema) must be defined during backend integration.
-
-**Graph state persistence**
-- **graph.py (auto_apply)** — Uses `MemorySaver`. Replace with `AsyncPostgresSaver`
-  for durable interrupt/resume across API requests. The API layer must generate
-  and persist `thread_id` per workflow run.
-
-**human_gate_0 interrupt/resume**
-- **human_gate_0.py** — Currently a stub that terminates the graph. Must be
-  replaced with a real `interrupt()` / `Command(resume=...)` cycle matching the
-  pattern in `human_gate_1.py`. After the user completes missing profile fields,
-  the graph should resume and re-run `eligibility_and_readiness` to confirm the
-  gap is closed before continuing.
-
-**Resume value contract quirk**
-- **human_gate_1.py, human_gate_2.py** — LangGraph re-interrupts when
-  `Command(resume=<falsy value>)` is passed (e.g. empty dict, None). The API
-  layer must always send a non-empty dict as the resume value. "Confirm all
-  defaults" for gate 1 uses `{"confirm": True}`; approval for gate 2 uses
-  `{"approved": True}`.
-
-**Stub DB calls — all four nodes import from the same stub**
-- **load_opportunity.py** — `_fetch_opportunity()` ignores `opportunity_id`
-  entirely; returns the same hardcoded record for any ID of a given type.
-  The not-found error path (`OPPORTUNITY_NOT_FOUND`) is therefore untestable
-  with the current stub. Replace with real table queries keyed on both type
-  and ID.
-- **eligibility_and_readiness.py, asset_mapping.py, application_tailoring.py** —
-  all three import `_get_stub_profile()` from `eligibility_and_readiness.py`.
-  Replace with a single shared profile-fetching utility keyed on `state["user_id"]`
-  once the API layer injects `user_id` into state.
-
-**human_gate_0 is a dead stub**
-- **human_gate_0.py** — Does not call `interrupt()`. Returns a plain dict and
-  the graph edge goes directly to END. Any workflow where eligibility=`pending`
-  terminates immediately instead of suspending for user input. `record_application`
-  never runs on this path, so no application is logged. Must be replaced with a
-  real `interrupt()` / `Command(resume=...)` cycle matching `human_gate_1.py`,
-  followed by a re-run of `eligibility_and_readiness` to confirm the gap is closed.
-
-**Stub profile marks all documents as unavailable**
-- **eligibility_and_readiness.py:_STUB_PROFILE** — `uploaded_documents` has
-  `Cover Letter: False`, `SOP: False`, `References: False`, etc. This causes
-  every opportunity type to trigger `eligibility=pending` and route to the dead
-  `human_gate_0`. The full post-eligibility pipeline (asset_mapping → tailoring
-  → evaluation → human_gate_2 → submission) is unreachable through the graph
-  without patching the stub. Add a testing mode flag or a separate "all docs
-  uploaded" fixture profile to make integration testing possible without a real DB.
-
-**AssetMap.requirement_type naming is misleading**
-- **asset_mapping.py, schemas.py** — `AssetMap.requirement_type` stores the
-  document type name (e.g. "CV", "Cover Letter") not the requirement category
-  ("document", "language", "other"). The field should be renamed `document_type`
-  to match its actual content. Verify downstream consumers (`human_gate_1.py`,
-  `application_tailoring.py`) before renaming, as both key confirmed_mappings
-  by this field value.
-
-**Heuristic SOP/Personal Statement produces placeholder text**
-- **application_tailoring.py:_heuristic_tailor** — When LLM is unavailable,
-  the heuristic generator for SOP and Personal Statement embeds the literal
-  string `[Source material summary — real generation requires LLM]` in the
-  output. `application_evaluation` correctly flags this as an unfilled placeholder,
-  causing the evaluation loop to retry (then proceed at MAX_EVAL_ITERATIONS).
-  The final document handed to the user contains this placeholder string.
-  Either remove the placeholder and generate minimal coherent prose without an
-  LLM, or gate SOP/Personal Statement generation on LLM availability and surface
-  a clear message to the user when it is not configured.
-
-**submit_internal is a stub POST**
-- **submit_internal.py** — `_post_to_backend()` is a no-op that logs and returns
-  a fake `platform_application_id`. Replace with a real authenticated HTTP POST
-  to the platform API once the endpoint URL, auth headers, and payload schema
-  are defined during backend integration.
-
-**Graph state persistence — auto-apply**
-- **graph.py (auto_apply)** — Uses `MemorySaver`. Replace with `AsyncPostgresSaver`
-  for durable interrupt/resume across API requests. The API layer must generate
-  and persist `thread_id` per workflow run, same as the document feedback workflow.
-
-**No FastAPI service layer for auto-apply**
-- No HTTP API layer exists for auto-apply. `run.py` is CLI only. A FastAPI service
-  layer is needed to handle authenticated invocation, interrupt/resume across
-  requests, streaming or polling for intermediate state (eligibility result,
-  asset mapping, tailored documents), and returning structured JSON to the frontend.
-
----
-
-## 2026-04-26 — Backend Integration (auto-apply)
-
-This section summarises the changes shipped on the
-`feature/auto-apply-backend-integration` branch. The backend (`backend/ai_services`)
-now drives `auto_apply` end-to-end against Neon, mirroring the existing
-`document_feedback` adapter pattern. **The agentic repo no longer needs a
-FastAPI layer of its own — backend integration is via the Django adapter.**
-
-### Spec / plan references
-- Spec: `docs/superpowers/specs/2026-04-26-auto-apply-backend-integration.md`
-- Plan: `docs/superpowers/plans/2026-04-26-auto-apply-backend-integration.md`
-- Discovery plan (paused): `docs/superpowers/plans/2026-04-26-apply-url-discovery.md`
-
-### Feature additions in the agentic repo (Phase A)
-
-**State surface extended** (`workflows/auto_apply/state.py`):
-- `profile_snapshot: Dict[str, Any]` — injected by backend adapter; replaces
-  `_get_stub_profile()` lookups in nodes.
-- `discovered_apply_url`, `discovery_method`, `discovery_confidence` —
-  pre-wired for the deferred discovery feature so nothing else needs to
-  migrate when discovery ships.
-- `gate_0_iteration_count: int` — caps the eligibility re-check loop after
-  gate 0 (max 2 retries, then `INELIGIBLE`).
-
-**`workflows/auto_apply/_profile.py` — new** : `resolve_profile(state)` returns
-`state['profile_snapshot']` when present, else falls back to the in-repo stub.
-Emits a **WARNING** log on the fallback path so production logs surface any
-case where the backend didn't inject a real snapshot. Used by
-`eligibility_and_readiness`, `asset_mapping`, and `application_tailoring`.
-
-**`workflows/auto_apply/control.py` — new** : `cancel_session(thread_id, checkpointer)`
-out-of-band cancel via `graph.update_state()`. Writes
-`result.status='error', error_code='CANCELLED'` into the live checkpoint;
-the existing top-of-node short-circuit pattern drains the graph to END.
-Idempotent and best-effort — does not raise on unknown threads.
-
-**`nodes/load_opportunity.py`** : short-circuits when `state['opportunity_data']`
-is already populated (backend pre-load path). Falls back to in-repo stub
-records for CLI mode, with a **WARNING** log on the fallback path.
-
-**`nodes/human_gate_0.py`** : real `interrupt()` cycle (was a dead stub).
-Iteration cap of 2; on cap-out returns `result.error_code='PROFILE_INCOMPLETE_AFTER_RETRIES'`.
-Routes back to `eligibility_and_readiness` for a re-check after the user
-completes their profile.
-
-**`graph.py`** : `human_gate_0` edge changed from `→ END` to a conditional
-loop back to `eligibility_and_readiness` (or `end_with_error` on cap-out).
-Added `_route_after_gate_0`.
-
-**`nodes/submit_internal.py`** : recordss submission *intent* only — no
-fake `platform_application_id`. Backend adapter writes the real
-`Application` row via Django ORM after the graph terminates with
-`submission_type='internal'` (no HTTP loopback from agentic → backend).
-
-**`nodes/application_tailoring.py`** : per-doc-type output caps
-(`_truncate_to_cap`) — CV ≤ 8000, Cover Letter ≤ 3000, SOP / Personal Statement
-≤ 6000, default 5000. Boundary-aware (truncates at last paragraph break that
-fits in the upper half of the cap; otherwise hard-cut). Prevents runaway
-LLM output from breaking PDF rendering and frontend display.
-
-**`nodes/eligibility_and_readiness.py`** :
-- Switched profile lookup to `resolve_profile(state)` (per A2).
-- `_check_profile_completeness` now consults `_GENERATABLE` from
-  `asset_mapping.py` and **does not flag a missing doc as `pending` if the
-  system can write it from CV + profile** (Cover Letter, SOP, Personal
-  Statement, Research Proposal, Writing Sample, Motivation Letter, References
-  no longer block at gate 0). Documents in `_USER_SUPPLIED` (Transcript,
-  English Proficiency Test) still trigger gate 0 as before.
-
-### Backend adapter (Phase B — lives in `backend/ai_services/`)
-
-Mirrors `graph_adapter.py` for document_feedback:
-- `auto_apply_adapter.py` — `build_auto_apply_opportunity_snapshot`,
-  `build_auto_apply_profile_snapshot`, `start_session`, three
-  `resume_session_gate_{0,1,2}` handlers, `finalize_internal_submission`,
-  `cancel_session`, `_pending_node_after_invoke` (graph-state inspection),
-  `_persist_state_after_phase` (graph state → DB row).
-- `ApplicationSession` Django model with partial unique constraint
-  (one active session per `(student, opportunity_type, opportunity_id)`).
-- Per-status TTL janitor (`janitor.py`):
-  `PROCESSING`/15m, `FINALIZING`/30m, `AWAITING_*`/7 days.
-- ReportLab text→PDF renderer (`document_renderer.py`) for
-  internal-submit `Application.resume_file`.
-- DRF views + URLs for start / list / detail / cancel and three per-gate
-  resume endpoints.
-
-### Bugs detected during live integration testing
-
-These were caught by driving the workflow against live Neon dev. Fixed in
-commit `417e614` on the backend repo's feature branch:
-
-1. **Gate-suspension detection lagged by one node.** Persist logic checked
-   `result_state['current_step']` to identify which gate was held. But
-   `interrupt()` suspends the graph **before** the node returns its updates
-   dict — so `current_step` reflects the last fully-completed node, not
-   the gate. Fix: read the pending node from `graph.get_state(config).next`.
-   Documented in `_pending_node_after_invoke()` in the adapter.
-
-2. **Gate 0 resume kept stale `profile_snapshot`.** When the graph looped
-   back to eligibility after gate 0, it re-read the original initial-state
-   snapshot — so even after the user uploaded missing docs, eligibility
-   still saw stale data and re-fired the gate. Fix: backend's
-   `resume_session_gate_0` builds a fresh snapshot post-update and injects
-   it via `graph.update_state(config, {"profile_snapshot": fresh})` before
-   resuming. The graph runner now accepts `state_overrides` for this
-   pattern.
-
-3. **`INELIGIBLE` error_code unmapped.** `end_with_explanation` sets
-   `result.error_code='INELIGIBLE'` for hard-block ineligibility verdicts
-   (deadline passed, location mismatch, age limit, etc.). Backend's persist
-   logic recognised only `CANCELLED` and `PROFILE_INCOMPLETE_AFTER_RETRIES`
-   and was falling through to generic `ERROR`. Fix: map `INELIGIBLE` to
-   `Status.INELIGIBLE`.
-
-4. **Hard-block ineligibility design — open issue (not yet fixed).** The
-   existing `_check_job_eligibility`, `_check_program_eligibility`, and
-   `_check_scholarship_eligibility` functions hard-terminate the workflow
-   when on-site location doesn't match the user's location, when scholarship
-   age caps are exceeded, etc. **This is too aggressive for v1** — these
-   should be soft warnings the UI surfaces on the apply screen, not hard
-   workflow blocks. Pending team discussion before changing.
-
-5. **Eligibility blocked on generatable docs (fixed in commit `47753d1`).**
-   `_check_profile_completeness` flagged every missing required document as
-   `pending`, gating the user at `human_gate_0` even for documents the
-   system was designed to write itself (Cover Letter, SOP, etc.). Fix: skip
-   docs in `_GENERATABLE` from the missing list (described in feature
-   additions above).
-
-### Verification
-
-**Live end-to-end paths driven against Neon dev branch
-(project `summer-math-90128942`, branch `br-green-thunder-agbs7e8y`)**:
-
-- ✅ External-job → `completed_handoff` (with assumed `[CV, Cover Letter]`
-  defaults; LinkedIn scrape correctly evaluated as `failed` and degraded).
-- ✅ External-job → `completed_handoff` with **real Koray CV (143KB PDF,
-  2914 chars extracted) + real OpenAI gpt-4o-mini tailoring**, 16 graph
-  steps, properly formatted output.
-- ✅ Internal-job (employer_id=1) → `completed_submitted`. Real `Application`
-  row written via Django ORM with PDF resume + tailored cover letter,
-  `ApplicationSession.application` FK populated.
-- ✅ Gate 0 retry loop verified: pending → resume → eligibility re-runs
-  with fresh snapshot → ready → asset_mapping. Step history shows the
-  loop explicitly.
-- ✅ Cancel mid-flight: marker correctly written to live PostgresSaver
-  checkpoint with `error_code='CANCELLED'`.
-- ✅ Hard-ineligibility path: caught the location-mismatch case, flipped
-  session to `INELIGIBLE` (after fix #3 above).
-
-**Test counts**: 41 unit tests in agentic repo, 27 new unit tests in
-backend `ai_services`. Pre-existing 1 backend test failure on `main` is
-unrelated to this work.
-
-### Future work
-
-**Critical / blocking for production:**
-- **Hard-block ineligibility design (#4 above).** Move location, age,
-  degree-level, nationality checks from hard `INELIGIBLE` to soft warnings
-  surfaced on the apply UI. The user should be able to apply anyway.
-  Needs team alignment before implementation.
-- **Discovery + Crawl4AI for jobs.** Until the discovery plan ships, all
-  external jobs use assumed `[CV, Cover Letter]` defaults regardless of
-  what the employer actually requires. Plan exists at
-  `docs/superpowers/plans/2026-04-26-apply-url-discovery.md`, paused
-  pending backend integration completion (now done).
-
-**Important but not blocking:**
-- **Gate 1 `additional_uploads` plumbing on the backend side.** The
-  serializer accepts `additional_uploads: List[FileField]` but the adapter
-  doesn't yet save those files anywhere or thread the extracted text into
-  the resume payload's `content` fields. Today users can only confirm the
-  default mapping or set `tailoring_depth='none'` for stored docs; they
-  can't yet upload a fresh document at gate 1. Scope 1.5 work.
-- **Polymorphic `StudentDocument` store** (Spec §11.3, Scope 2). v1 only
-  supports CV from `StudentCV`. Cover Letter / SOP / Personal Statement
-  are always *generated*, never read from a stored user file. Adding a
-  generic `StudentDocument` table would let users save and reuse these.
-- **Gate 2 "edit and re-tailor" loop** (Spec §11.10). v1 hard-cancels on
-  rejection at gate 2. A loop back to `application_tailoring` with
-  per-document feedback as edit instructions would let the user iterate
-  without starting fresh.
-- **External form auto-submission** (Spec §11.2). Browser automation /
-  Playwright path for external jobs where discovery succeeded with high
-  confidence. Would create real `Application` rows for external jobs too.
-- **Email handoff delivery** (Spec §11.5). Currently handoff is in-app only.
-- **Per-session LLM cost budgeting** (Spec T3). Worst-case ~15-20 LLM calls
-  per session; no token cap today.
-- **GDPR / retention policy** (Spec T4). Tailored documents and scraped
-  content live forever in `ApplicationSession` rows + PostgresSaver
-  checkpoints.
-- **Cooperative cancel inside nodes** (Spec T1). Currently the cancel
-  marker is observed only at the next node boundary — the currently-
-  executing node finishes (worst case ~30-60s of LLM cost wasted).
-
-**Carried over from earlier — still relevant:**
-- All items in the "Integration TODO" section above remain valid.
-- `submit_internal._post_to_backend` was removed; the equivalent ORM-write
-  path now lives in `backend/ai_services/auto_apply_adapter.finalize_internal_submission`.
-
----
-
-## 2026-04-27 — Discovery v2 + Eligibility Cleanup
-
-This section summarises the changes shipped on the `feature/discovery-v2`
-branch (PR #2). Replaces the LinkedIn-fetch-then-fail scrape path with a
-search-based discovery pipeline (Brave) + httpx-first fetcher with optional
-Playwright fallback. Plus a small eligibility-node redesign that separates
-compatibility *warnings* from material-readiness *gating*.
-
-**Spec / plan refs:**
-- Plan: `docs/superpowers/plans/2026-04-26-discovery-v2.md`
-- Original (paused) plan: `docs/superpowers/plans/2026-04-26-apply-url-discovery.md` — superseded by v2
-
-### Feature additions in the agentic repo
-
-**State:**
-- `compatibility_warnings: List[str]` — non-blocking warnings (location/age/degree-level) carried alongside the eligibility decision and surfaced into `application_package.warnings`.
-- `discovered_page_content: Optional[str]` + `discovered_http_status: Optional[int]` — verified page content propagated from discovery to scrape so we don't double-fetch.
-
-**`tools/search.py`** — new. `SearchProvider` ABC + `BraveSearchProvider`. Opt-in via `UPPGRAD_SEARCH_PROVIDER=brave` + `BRAVE_SEARCH_API_KEY`. Mirrors `get_llm()` factory pattern.
-
-**`tools/web_fetcher.py`** — new. Tiered fetcher:
-- httpx-first (fast, cheap, no browser)
-- Playwright/Crawl4AI fallback when (a) httpx is thin AND (b) `UPPGRAD_BROWSER_SCRAPE_ENABLED=true`. Crawl4AI lazy-imported; gracefully no-ops when not installed.
-- `_detect_thin` heuristic flags 4xx, short bodies, and ≥2 anti-bot keywords.
-
-**`tools/url_discovery.py`** — new. Multi-factor verification + 3-tier orchestration:
-- **Verification gates** (after live testing surfaced false positives):
-  - Title fuzzy match ≥85 (hard prerequisite).
-  - **Corroborator count** from {company-in-text, location-match, posted-time-match, description-keyword-overlap}. ATS / generic need 2; careers needs 1 (domain proves company).
-  - Confidence scaled by extra corroborators beyond minimum.
-  - Thin pages (captcha walls, 4xx, JS shells) rejected at the fetcher gate before scoring.
-- **3-tier search** (ATS → company careers → generic):
-  - Tier 1 ATS: `"<title>" "<company>" (site:greenhouse.io OR site:lever.co OR ...)`.
-  - Tier 2 careers: `"<title>" site:<company-domain>` — but skipped when `company_url` resolves to a blocklisted domain (linkedin.com, indeed.com, glassdoor.com, social/aggregator sites). LinkedIn-jobs `company_url` is usually the LinkedIn company page URL, not a real careers site, so this blocklist saves the wasted Brave call.
-  - Tier 3 generic: `"<title>" "<company>" apply` (no `site:` constraint).
-- **Single-fetch architecture** — `DiscoveryResult.text` carries verified content forward; `scrape_application_page` consumes it instead of re-fetching the same URL.
-
-**`nodes/discover_apply_url.py`** — new graph node sitting between `load_opportunity` and `scrape_application_page` (jobs only; skipped for internal jobs and non-job opportunity types). Cache-hit short-circuit honored.
-
-**`nodes/scrape_application_page.py`** — rewritten. Uses pre-fetched content from `state['discovered_page_content']` when present; falls back to fresh httpx fetch for url_direct paths and cache hits without text.
-
-**`nodes/eligibility_and_readiness.py`** — refactored. Hard-blocks ONLY for deadline-passed and missing user-supplied (non-generatable) docs. Compatibility issues (location, age, degree-level, discipline, nationality) become warnings stored in `state['compatibility_warnings']`, NOT decisions that drive `'ineligible'`. Removed redundant `is_closed` re-check (already filtered at session start).
-
-**`nodes/package_and_handoff.py`** + **`nodes/submit_internal.py`** — both now include `warnings` in the `application_package`.
-
-**`graph.py`** — `discover_apply_url` wired between `load_opportunity` and `scrape_application_page` for jobs.
-
-### Backend additions
-
-- `ApplicationSession.compatibility_warnings = JSONField(default=list)` — surfaced via `ApplicationSessionSerializer`.
-- `JobApplyUrlDiscovery` model (PK=`job_id`, fields: discovered_url, discovery_method, discovery_confidence, discovered_at, last_verified_at). Cross-user cache. 14-day staleness gate.
-- Adapter: `_lookup_discovery_cache` (pre-invoke) + `_persist_discovery_to_cache` (post-invoke, upserts via `update_or_create`, skips for `failed` and `skipped_internal`).
-
-### Bugs detected during live testing (and fixed)
-
-1. **False-positive verification on title+company alone.** A linkedin_jobs row for Celonis CVP in Schwyz, Switzerland matched a Greenhouse URL for the same role in Cleveland, Ohio purely on title fuzz + same-company. Fixed by requiring corroborators beyond title+company. Live cross-check is now required before declaring any discovery test "successful."
-2. **Double httpx fetch on the same URL.** Verification fetched a candidate, then `scrape_application_page` re-fetched the same URL within a second. Wasteful and increases ban risk. Fixed by propagating verified text through state.
-3. **Thin-detector second-look conflict.** `_detect_thin` could veto a page that verification had already accepted (real Greenhouse pages contain "404"/"captcha" keywords incidentally — JS paths, hidden fields). Fixed by rejecting thin pages at the verification gate, never letting them reach a second-look during scrape.
-4. **`site:linkedin.com` careers tier waste.** `linkedin_jobs.company_url` is usually a LinkedIn company-page URL, so `_build_careers_query` was firing `site:linkedin.com` queries that found nothing useful. Fixed via `_CAREERS_DOMAIN_BLOCKLIST`.
-
-### Live verification results (cross-checked against source data)
-
-Tested against Neon dev branch with real Brave Search + real OpenAI LLM:
-
-| Job | Location | Discovery | Cross-check verdict |
-|---|---|---|---|
-| Celonis CVP (id 202599) | Schwyz, Switzerland | `failed` | ✅ Correct — Greenhouse only had Cleveland role for that title |
-| GitHub Senior Solutions Engineer (id 199838) | Germany | `failed` | ✅ Correct — GitHub uses Workday (JS-rendered, would need browser fallback) |
-| Anthropic SA Munich (id 200082) | Munich, Germany | `failed` | ✅ Correct — Greenhouse had Paris and NYC variants of the role, no Munich match. Also: confirmed by user this listing is a "tracker-only" ghost posting — no real apply destination exists. |
-
-Cache rows after 3 failed runs: 0 (correct: cache only stores successful matches).
-
-### Future work
-
-**Critical:**
-- **Browser fallback in production.** With `UPPGRAD_BROWSER_SCRAPE_ENABLED=false`, discovery's success rate against Workday-hosted careers (a meaningful share of large-company postings) is near zero. Turning on Crawl4AI/Playwright in prod requires Railway Chromium setup (1GB+ per instance, lazy-imported, env-gated). Plan covers the integration; the deployment piece is the open task.
-- **LinkedIn ghost-posting detection upstream.** A meaningful share of `linkedin_jobs` rows are "tracker-only" postings: LinkedIn's apply button doesn't go anywhere external (just bookmarks the listing to the user's tracker). Discovery correctly returns `failed` for these but burns Brave calls finding nothing real. **Real fix is in the scraper (`bitirme/linkedin_jobspy/scraper.py`)** — detect apply-flow type at ingestion and store as `apply_type` field. Then the backend filters tracker-only jobs out of the auto-apply candidate set entirely. Until then, see "negative caching" below.
-
-**Important but not blocking:**
-- **Negative caching for `failed` discoveries with short TTL** (e.g., 7 days). Saves Brave budget on repeat ghost-posting attempts. Risk: misses cases where the company posts to Greenhouse a few days later — but acceptable for the long-tail ghost cases.
-- **UI signal for ghost postings.** When `url_direct` is empty AND discovery returns `failed`, surface "We couldn't find an external apply page for this job" on the apply screen.
-- **Description-keyword extraction** is purely frequency-based after stopword filtering. A more rigorous approach (TF-IDF against a corpus of similar job descriptions, or named-entity extraction) would produce better corroborators but adds complexity. Acceptable for v1; revisit if the live false-negative rate is high.
-- **Verification still relies on raw HTML.** Greenhouse pages contain JSON-LD structured data (`<script type="application/ld+json">`) with title/location/etc. Parsing those would be more robust than regex on body text. Not urgent — fuzzy matching against body works empirically.
-
-**Carried over from earlier — still relevant:**
-- All items in the previous "Integration TODO" / "Auto-Apply" sections.
-- The eligibility-cleanup question is now resolved (compatibility checks are warnings, not blocks).
-
+### Resolved during integration
+
+The following items from earlier versions of this file have been resolved by 
+the backend integration and Discovery v2 work. Kept here only as a pointer.
+
+**Backend integration**
+- **fetch_profile_snapshot, get_opportunity_context** — Both nodes now check 
+  for pre-injected state and use it when present; fallbacks remain for CLI mode. 
+  Backend `build_profile_snapshot` / `build_opportunity_context` provide real 
+  data via the document-feedback adapter.
+- **Graph state persistence (both workflows)** — `build_graph(checkpointer=...)` 
+  accepts an injected checkpointer; backend adapters pass `PostgresSaver`. 
+  `MemorySaver` remains as the CLI default.
+- **`run.py` thread_id** — Both CLIs accept `--thread-id` and auto-generate 
+  UUIDs.
+- **load_document file ingestion** — Backend stores uploaded files via Django's 
+  `FileField` and passes the resolved storage path to the graph.
+- **OCR fallback for scanned PDFs** — Backend's 
+  `graph_adapter._extract_text_with_ocr_fallback` uses pdf2image + pytesseract 
+  when normal extraction yields too little text. Lazy-imports gracefully when 
+  OCR libs are not installed. The agentic `tools/documents.py` itself still has 
+  no OCR path.
+- **analyze_ats.py keyword list** — Now consumes `opportunity_context` keywords 
+  in both LLM and heuristic paths.
+- **HTTP API layer (both workflows)** — Backend has DRF views and URL routes 
+  for list/create/detail/cancel + per-gate resume endpoints. (Stack is Django 
+  + DRF rather than FastAPI; the API requirement is met.)
+- **Auto-apply: `_get_stub_profile()` shared by three nodes** — 
+  `eligibility_and_readiness`, `asset_mapping`, and `application_tailoring` 
+  all use `resolve_profile(state)` from `_profile.py`, which prefers 
+  `state['profile_snapshot']` and falls back to the in-repo stub.
+- **Auto-apply: `_fetch_opportunity()` stub** — `load_opportunity` 
+  short-circuits when `state['opportunity_data']` is pre-loaded by the backend 
+  adapter; the CLI fallback path emits a WARNING log to surface unexpected use 
+  in production.
+- **Auto-apply: `submit_internal._post_to_backend` stub** — Removed; 
+  `submit_internal` now records intent only, and 
+  `auto_apply_adapter.finalize_internal_submission` writes the `Application` 
+  row via Django ORM after the graph terminates with 
+  `submission_type='internal'`.
+- **Auto-apply: `human_gate_0` dead stub** — Now uses real `interrupt()` with 
+  iteration cap of 2 (`PROFILE_INCOMPLETE_AFTER_RETRIES`); graph routes back 
+  to `eligibility_and_readiness` for a re-check, and the backend rebuilds the 
+  profile snapshot before resuming so eligibility sees fresh data.
+- **Auto-apply: stub profile blocks all docs at gate 0** — Fixed via 
+  `_GENERATABLE` set consulted by `_check_profile_completeness`. Generatable 
+  documents (Cover Letter, SOP, Personal Statement, Research Proposal, Writing 
+  Sample, Motivation Letter, References) no longer trigger gate 0; user-supplied 
+  docs (Transcript, English Proficiency Test) still do.
+- **Auto-apply: hard-block ineligibility design** — Compatibility checks 
+  (location, age, degree-level, discipline, nationality) became non-blocking 
+  warnings carried via `state['compatibility_warnings']` and surfaced through 
+  `application_package.warnings`. Users can apply anyway.
+- **Auto-apply: `eligibility_and_readiness` document_texts['CV'] hardcoded 
+  stub** — Backend's profile snapshot fetches real CV text via the OCR fallback.
+
+**Discovery v2**
+- **scrape_application_page User-Agent / JS rendering** — Discovery v2 added 
+  httpx-first fetching with optional Playwright/Crawl4AI fallback, env-gated 
+  by `UPPGRAD_BROWSER_SCRAPE_ENABLED`. The dependency is lazy-imported. 
+  Production deployment of Chromium on Railway is the remaining piece (see 
+  Still open below).
+- **Stub DB calls in 4 nodes** — All four (`load_opportunity` + the three 
+  profile-using nodes) are now backend-injection aware via `resolve_profile()` 
+  / `opportunity_data` pre-load.
+
+### Still open
+
+**Agentic — analysis quality**
+- **All five `analyze_*` nodes** — `parsed_instructions` lives in `context_pack` 
+  but only `synthesize_feedback` consumes it. Analysis nodes should narrow or 
+  prioritize findings by the user's stated focus.
+- **`synthesize_feedback.py` heuristic path** — `before_text` and `after_text` 
+  are placeholder strings rather than actual spans from `doc_sections`. The 
+  LLM path uses real spans (validated against the document), so this only 
+  matters when the LLM is unavailable.
+- **`application_tailoring.py:_heuristic_tailor`** — When LLM is unavailable, 
+  the SOP/Personal Statement generator embeds 
+  `[Source material summary — real generation requires LLM]`. 
+  `application_evaluation` flags it as a placeholder and the loop retries, 
+  but the final document still contains the string after MAX_EVAL_ITERATIONS=2. 
+  Either drop the placeholder and emit minimal coherent prose, or hard-gate 
+  SOP generation on LLM availability and surface a clear message to the user.
+- **`AssetMap.requirement_type` is misnamed** — The field stores the document 
+  type ("CV", "Cover Letter") not the requirement category. Consider renaming 
+  to `document_type`. Downstream consumers (`human_gate_1.py`, 
+  `application_tailoring.py`) key `confirmed_mappings` by this field's value, 
+  so the rename must be coordinated.
+
+**Agentic — document state**
+- **`DocFeedbackState` has no `user_id` field** — Not blocking (the backend 
+  injects `profile_snapshot` which already contains `user_id`), but worth 
+  adding for explicit auth context if more user-keyed lookups are added.
+
+**Agentic — additional providers**
+- **`common/llm.py` only wires OpenAI** — Add Anthropic / Azure as needs arise.
+- **`tools/search.py` only wires Brave** — Same factory pattern would apply.
+
+**Agentic — file extraction edge cases**
+- **`tools/documents.py`** — DOCX tables and images are silently ignored. 
+  Plain PDF text-extraction yields empty for scanned docs; the backend's 
+  OCR fallback (`graph_adapter._extract_text_with_ocr_fallback`) covers this 
+  in production but the agentic tool itself has no OCR path.
+
+**Resume-value contract** (documented quirk, not a fix-it)
+- **`human_gate_1.py`, `human_gate_2.py`** — LangGraph re-interrupts when 
+  `Command(resume=<falsy value>)` is passed (empty dict, None). The backend 
+  always sends a non-empty dict: `{"confirm": True, ...}` for gate 1 and 
+  `{"approved": True, ...}` for gate 2.
+
+**Backend / production**
+- **Browser fallback in production** — With `UPPGRAD_BROWSER_SCRAPE_ENABLED=false`, 
+  discovery success rate against Workday-hosted careers (a meaningful share of 
+  large-company postings) is near zero. Turning on Crawl4AI/Playwright in prod 
+  requires Railway Chromium setup (1GB+ per instance, lazy-imported, env-gated). 
+  Plan covers the integration; the deployment piece is the open task.
+- **LinkedIn ghost-posting detection upstream** — A meaningful share of 
+  `linkedin_jobs` rows are tracker-only postings (LinkedIn's apply button 
+  doesn't go anywhere external; it just bookmarks the listing in the user's 
+  tracker). Discovery correctly returns `failed` but burns Brave calls finding 
+  nothing real. The real fix is in the scraper 
+  (`bitirme/linkedin_jobspy/scraper.py`) — detect apply-flow type at ingestion 
+  and store as an `apply_type` field; backend filters tracker-only jobs out 
+  of the auto-apply candidate set entirely. Until then, see "negative caching" 
+  below.
+- **Negative caching for `failed` discoveries** — Short TTL (e.g. 7 days) 
+  would save Brave budget on repeat ghost-posting attempts. Risk: misses cases 
+  where the company posts to Greenhouse a few days later — acceptable for the 
+  long-tail ghost cases.
+- **UI signal for ghost postings** — When `url_direct` is empty AND discovery 
+  returns `failed`, surface "We couldn't find an external apply page for this 
+  job" on the apply screen.
+- **Gate 1 `additional_uploads` plumbing on backend** — The serializer accepts 
+  `additional_uploads: List[FileField]` but the adapter doesn't yet save those 
+  files anywhere or thread the extracted text into the resume payload's 
+  `content` fields. Today users can confirm the default mapping or set 
+  `tailoring_depth='none'` for stored docs but cannot upload a fresh document 
+  at gate 1.
+- **Polymorphic `StudentDocument` store** — v1 only supports CV from 
+  `StudentCV`. Cover Letter / SOP / Personal Statement are always *generated*, 
+  never read from a stored user file. A generic `StudentDocument` table would 
+  let users save and reuse these.
+- **Gate 2 "edit and re-tailor" loop** — v1 hard-cancels on rejection at 
+  gate 2. A loop back to `application_tailoring` with per-document feedback as 
+  edit instructions would let the user iterate without starting fresh.
+- **External form auto-submission** — Browser automation / Playwright path 
+  for external jobs where discovery succeeded with high confidence. Would 
+  create real `Application` rows for external jobs too.
+- **Email handoff delivery** — Currently handoff is in-app only.
+- **Per-session LLM cost budgeting** — Worst-case ~15-20 LLM calls per session; 
+  no token cap today.
+- **GDPR / retention policy** — Tailored documents and scraped content live 
+  indefinitely in `ApplicationSession` rows + PostgresSaver checkpoints.
+- **Cooperative cancel inside nodes** — Currently the cancel marker is observed 
+  only at the next node boundary; the currently-executing node finishes 
+  (worst case ~30-60s of LLM cost wasted).
+
+**Verification quality (Discovery v2)**
+- **Description-keyword extraction is purely frequency-based after stopword 
+  filtering.** TF-IDF against a corpus of similar job descriptions, or named-
+  entity extraction, would produce better corroborators but adds complexity. 
+  Acceptable for v1; revisit if the live false-negative rate is high.
+- **Verification still relies on raw HTML.** Greenhouse pages contain JSON-LD 
+  structured data (`<script type="application/ld+json">`) with title / location 
+  / etc. Parsing those would be more robust than regex on body text. Not urgent.
