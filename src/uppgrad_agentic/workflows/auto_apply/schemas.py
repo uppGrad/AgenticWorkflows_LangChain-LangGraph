@@ -157,3 +157,71 @@ class UploadedDocLightPostAnalysis(BaseModel):
         default_factory=list,
         description="Up to 3 strengths from the user's profile that T1 failed to surface",
     )
+
+
+# ─── Auto-fill schemas (consumed by tools/playwright_filler.py) ──────────────
+#
+# These describe the value-planning + fill-result contract between the
+# adapter (which orchestrates) and the agentic-side helpers (which compute
+# values + drive Playwright). NO references to AutoApplyState or LangGraph
+# here — this layer is intentionally graph-agnostic so node ordering and
+# gate semantics can change without breaking auto-fill.
+
+FormFieldFillStatus = Literal["filled", "skipped"]
+FormFieldFillSource = Literal[
+    "user_profile",       # value pulled from the student's profile snapshot
+    "user_document",      # path to a tailored/uploaded document file
+    "user_answer",        # LLM-drafted free-text answer for the question
+    "computed",           # derived (e.g. today's date)
+    "mock",               # placeholder used in dry-run / test mode
+    "no_value",           # no value could be planned (skipped)
+]
+
+
+class FormFieldFillPlan(BaseModel):
+    """One row in the fill plan — what value to set for one FormField."""
+    field: FormField = Field(..., description="The form field this plan targets")
+    value: str = Field(default="", description="String value to set; for file fields this is a filesystem path")
+    status: FormFieldFillStatus = Field(default="filled")
+    source: FormFieldFillSource = Field(default="no_value")
+    reason: str = Field(default="", description="Short note on why this value was chosen (or why skipped)")
+
+
+FillFieldOutcome = Literal[
+    "ok",                  # filled deterministically (Tier 1-3)
+    "ok_llm",              # filled via Tier 4 LLM-picked selector
+    "plan_skip",           # planner produced status=skipped; nothing attempted
+    "no_locator",          # all tiers (incl. LLM) couldn't locate the input
+    "fill_error",          # locator found but action failed (timeout, etc.)
+    "select_error",
+    "checkbox_error",
+    "radio_error",
+    "file_error",
+    "llm_refused_submit",  # LLM picker tried to point at a submit button — refused
+    "llm_skipped",         # LLM tier skipped (budget exhausted / no LLM)
+    "llm_exec_error",
+]
+
+
+class FormFieldFillReport(BaseModel):
+    """Per-field outcome of attempting to fill the form."""
+    label: str
+    field_type: str
+    outcome: FillFieldOutcome
+    detail: str = Field(default="")
+
+
+class FormFillResult(BaseModel):
+    """Final result of a form-fill attempt."""
+    form_url: str
+    success: bool = Field(..., description="True when at least one field filled and no submit-button click occurred")
+    fields_total: int = 0
+    fields_filled_native: int = 0
+    fields_filled_llm: int = 0
+    fields_skipped: int = 0
+    fields_failed: int = 0
+    llm_picker_calls: int = 0
+    captcha_detected: bool = False
+    submit_clicked: bool = Field(default=False, description="MUST be False unless explicit submission is authorized in a future feature")
+    reports: List[FormFieldFillReport] = Field(default_factory=list)
+    error: str = Field(default="")
