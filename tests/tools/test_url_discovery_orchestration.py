@@ -276,6 +276,66 @@ def test_closed_listing_skipped_when_open_listing_available_in_later_tier(monkey
     assert "notion.com/careers" in result.url
 
 
+def test_discovery_result_includes_form_url_for_ashby(monkeypatch):
+    """Phase 1 form-URL resolution: Ashby overview URL → /application form URL
+    propagates onto DiscoveryResult.form_url."""
+    job = _job(company="Notion", title="Solutions Engineer, EMEA")
+    job["location"] = "Dublin, County Dublin, Ireland"
+    fake_search = MagicMock()
+    fake_search.search.return_value = [
+        SearchResult(url="https://jobs.ashbyhq.com/notion/abc-123",
+                     title="Solutions Engineer, EMEA @ Notion", snippet=""),
+    ]
+    fake_fetch = MagicMock(return_value=FetchResult(
+        success=True, thin=False,
+        text="Solutions Engineer, EMEA at Notion. Dublin, Ireland. " * 30,
+        http_status=200,
+    ))
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback", fake_fetch)
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method == "ats"
+    assert result.form_url == "https://jobs.ashbyhq.com/notion/abc-123/application"
+
+
+def test_discovery_result_form_url_equals_overview_for_greenhouse(monkeypatch):
+    """Greenhouse keeps form on same URL as overview — form_url == url."""
+    job = _job(company="Anthropic", title="Senior Backend Engineer")
+    fake_search = MagicMock()
+    fake_search.search.return_value = [
+        SearchResult(url="https://job-boards.greenhouse.io/anthropic/jobs/12345",
+                     title="Senior Backend Engineer", snippet=""),
+    ]
+    fake_fetch = MagicMock(return_value=FetchResult(
+        success=True, thin=False,
+        text="Senior Backend Engineer at Anthropic. London, UK. " * 30,
+        http_status=200,
+    ))
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback", fake_fetch)
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method == "ats"
+    assert result.form_url == result.url == "https://job-boards.greenhouse.io/anthropic/jobs/12345"
+
+
+def test_discovery_result_form_url_none_for_workday(monkeypatch):
+    """Workday's form is auth-walled; form_url is None even when discovery
+    succeeds at the overview level."""
+    job = _job(company="GitHub", title="Senior Solutions Engineer")
+    fake_search = MagicMock()
+    fake_search.search.return_value = [
+        SearchResult(url="https://github.wd1.myworkdayjobs.com/en-US/careers/job/Germany/SSE_R12345",
+                     title="Senior Solutions Engineer", snippet=""),
+    ]
+    fake_fetch = MagicMock(return_value=FetchResult(
+        success=True, thin=False,
+        text="Senior Solutions Engineer at GitHub. London, UK. " * 30,
+        http_status=200,
+    ))
+    monkeypatch.setattr("uppgrad_agentic.tools.url_discovery.fetch_url_with_fallback", fake_fetch)
+    result = discover_apply_url(job, search_provider=fake_search)
+    assert result.method == "ats"
+    assert result.form_url is None
+
+
 def test_strict_verification_rejects_wrong_location_match(monkeypatch):
     """Regression guard: a Greenhouse URL for the right title+company but a
     DIFFERENT location must not pass verification. Live test caught a Schwyz,
