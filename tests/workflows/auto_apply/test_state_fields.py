@@ -7,7 +7,9 @@ def test_state_declares_new_keys():
     assert "discovered_apply_url" in keys
     assert "discovery_method" in keys
     assert "discovery_confidence" in keys
-    assert "gate_0_iteration_count" in keys
+    assert "requirement_items" in keys
+    assert "tailored_answers" in keys
+    assert "auto_submit_feasible_at_gate_1" in keys
 
 
 def test_state_accepts_profile_snapshot():
@@ -26,6 +28,12 @@ def test_state_accepts_discovery_fields():
     assert s["discovery_confidence"] == 0.9
 
 
-def test_state_accepts_gate_0_iteration_count():
-    s: AutoApplyState = {"gate_0_iteration_count": 1}
-    assert s["gate_0_iteration_count"] == 1
+def test_state_accepts_new_gate1_fields():
+    s: AutoApplyState = {
+        "requirement_items": [{"id": 0, "category": "document"}],
+        "tailored_answers": {"3": {"content": "..."}},
+        "auto_submit_feasible_at_gate_1": True,
+    }
+    assert s["requirement_items"][0]["id"] == 0
+    assert s["tailored_answers"]["3"]["content"] == "..."
+    assert s["auto_submit_feasible_at_gate_1"] is True

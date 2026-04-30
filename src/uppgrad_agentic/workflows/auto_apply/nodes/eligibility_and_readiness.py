@@ -204,49 +204,6 @@ def _check_scholarship_eligibility(opportunity_data: Dict[str, Any], profile: Di
 
 
 # ---------------------------------------------------------------------------
-# Profile completeness check
-# ---------------------------------------------------------------------------
-
-def _check_profile_completeness(
-    profile: Dict[str, Any],
-    normalized_requirements: List[Dict[str, Any]],
-) -> List[str]:
-    """Return a list of missing fields/documents that BLOCK auto-apply.
-
-    A document is only "missing" in the blocking sense if the system cannot
-    write it from CV + profile data. Documents in `_GENERATABLE` (Cover Letter,
-    SOP, Personal Statement, etc.) are *not* flagged as missing here — they
-    flow through to asset_mapping which assigns tailoring_depth='generate',
-    and gate 1 lets the user override with their own upload if desired.
-    """
-    # Lazy import to avoid a circular dependency between the eligibility node
-    # (graph entry) and the asset_mapping node.
-    from uppgrad_agentic.workflows.auto_apply.nodes.asset_mapping import _GENERATABLE
-
-    missing: List[str] = []
-
-    if not profile.get("name"):
-        missing.append("name")
-    if not profile.get("email"):
-        missing.append("email")
-
-    uploaded = profile.get("uploaded_documents") or {}
-    for req in normalized_requirements:
-        doc_type = req.get("document_type", "")
-        req_type = req.get("requirement_type", "")
-        if req_type != "document":
-            continue
-        if uploaded.get(doc_type):
-            continue
-        # Skip docs the system can generate from CV + profile.
-        if doc_type in _GENERATABLE:
-            continue
-        missing.append(f"document:{doc_type}")
-
-    return missing
-
-
-# ---------------------------------------------------------------------------
 # Main node
 # ---------------------------------------------------------------------------
 
@@ -257,15 +214,11 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
 
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
-    normalized_requirements = state.get("normalized_requirements") or []
     from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
     profile = resolve_profile(state)
 
-    reasons: List[str] = []
-    missing_fields: List[str] = []
-
     # ------------------------------------------------------------------
-    # 1. Deadline check — applies to all opportunity types
+    # 1. Deadline check — applies to all opportunity types (hard-block)
     # ------------------------------------------------------------------
     deadline_passed, deadline_reason = _check_deadline(opportunity_data)
     if deadline_passed:
@@ -290,39 +243,12 @@ def eligibility_and_readiness(state: AutoApplyState) -> dict:
         warnings = []
 
     # ------------------------------------------------------------------
-    # 3. Profile completeness check (gate 0 trigger)
-    # ------------------------------------------------------------------
-    missing_fields = _check_profile_completeness(profile, normalized_requirements)
-
-    if missing_fields:
-        doc_missing = [f for f in missing_fields if f.startswith("document:")]
-        profile_missing = [f for f in missing_fields if not f.startswith("document:")]
-
-        pending_reasons: List[str] = []
-        if profile_missing:
-            pending_reasons.append(
-                f"Your profile is missing required fields: {', '.join(profile_missing)}."
-            )
-        if doc_missing:
-            doc_names = [f.removeprefix("document:") for f in doc_missing]
-            pending_reasons.append(
-                f"The following documents have not been uploaded yet: {', '.join(doc_names)}."
-            )
-
-        result = EligibilityResult(
-            decision="pending",
-            reasons=pending_reasons,
-            missing_fields=missing_fields,
-        )
-        return {**updates, "eligibility_result": result.model_dump(),
-                "compatibility_warnings": warnings}
-
-    # ------------------------------------------------------------------
-    # 4. Ready
+    # 3. Ready — gate-1 collects per-requirement choices instead of a
+    #     gate-0 profile-completeness check.
     # ------------------------------------------------------------------
     result = EligibilityResult(
         decision="ready",
-        reasons=["All hard checks passed; required documents are present or generatable."],
+        reasons=["Deadline check passed; per-requirement choices collected at gate 1."],
         missing_fields=[],
     )
     return {**updates, "eligibility_result": result.model_dump(),

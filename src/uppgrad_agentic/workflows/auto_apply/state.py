@@ -58,9 +58,6 @@ class AutoApplyState(TypedDict, total=False):
     # auto-submit step; surfaced in the handoff package today.
     form_fields: List[Dict[str, Any]]
 
-    # human_gate_0 retry counter (Spec §6.2) — caps the eligibility re-check loop
-    gate_0_iteration_count: int
-
     # compatibility warnings (Spec follow-up — deadline-passed + missing
     # user-supplied docs are the only hard-block reasons; everything else
     # like location mismatch / age cap / degree level becomes a non-blocking
@@ -73,15 +70,33 @@ class AutoApplyState(TypedDict, total=False):
     # asset mapping
     asset_mapping: List[Dict[str, Any]]       # list of AssetMap dicts, one per normalized requirement
 
+    # requirement items (Step 6 — replaces asset_mapping shape internally;
+    # the JSONB column name `asset_mapping` on ApplicationSession is reused
+    # for stability, but the dicts inside follow RequirementItem.)
+    requirement_items: List[Dict[str, Any]]
+
     # human gate 1 — user reviews document mapping
     human_review_1: Dict[str, Any]            # user selections from gate 1
+
+    # Computed at gate 1 from per-requirement choices: True when every
+    # required item has either a usable upload or a valid auto-generate
+    # selection. Recomputed at gate 2 against the actually-produced
+    # tailored_documents / tailored_answers and surfaced in the gate-2
+    # interrupt payload.
+    auto_submit_feasible_at_gate_1: bool
 
     # application tailoring
     tailored_documents: Dict[str, Any]        # document_type → tailored content
 
-    # evaluation loop
+    # Auto-generated text answers for category='text' RequirementItems
+    # (free-form questions on the application form). Keyed by
+    # form_field_index (string) so submission can map them back to the
+    # original FormField. Separate from tailored_documents because text
+    # answers do not live in the document-renderer pipeline.
+    tailored_answers: Dict[str, Dict[str, Any]]
+
+    # evaluation (informational only post-gate-1 remodel — no retry loop)
     evaluation_result: Dict[str, Any]
-    iteration_count: int
 
     # human gate 2 — user approves final package
     human_review_2: Dict[str, Any]

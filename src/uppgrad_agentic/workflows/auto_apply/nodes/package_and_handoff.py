@@ -16,6 +16,7 @@ def package_and_handoff(state: AutoApplyState) -> dict:
     opportunity_type = state.get("opportunity_type", "")
     opportunity_data = state.get("opportunity_data") or {}
     tailored_documents: Dict[str, Any] = state.get("tailored_documents") or {}
+    tailored_answers: Dict[str, Any] = state.get("tailored_answers") or {}
     scraped_requirements = state.get("scraped_requirements") or {}
 
     title = opportunity_data.get("title", "this opportunity")
@@ -51,7 +52,17 @@ def package_and_handoff(state: AutoApplyState) -> dict:
                 "char_count": len(info.get("content") or ""),
             }
             for doc_type, info in tailored_documents.items()
-            if not info.get("skip") and info.get("tailoring_depth") != "none"
+            if (info.get("content") or "")
+        },
+        "text_answers": {
+            key: {
+                "content": info.get("content", ""),
+                "question": info.get("question", ""),
+                "form_field_index": info.get("form_field_index"),
+                "char_count": len(info.get("content") or ""),
+            }
+            for key, info in tailored_answers.items()
+            if (info.get("content") or "")
         },
         "opportunity": {
             "type": opportunity_type,

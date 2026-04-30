@@ -1,27 +1,37 @@
+"""Asset mapping (Step 6 rewrite).
+
+Builds the categorised RequirementItem list that gate 1 surfaces to the user.
+Replaces the previous heuristic that mapped requirements to user-uploaded
+documents — only CVs are stored, so the `available=True` /
+`tailoring_depth='light'` paths were dead in production.
+
+Inputs (from state, in priority order):
+  - state['form_fields']             jobs with non-empty extraction
+  - state['normalized_requirements'] non-jobs and form-failed jobs
+
+Output:
+  - state['requirement_items']: List[RequirementItem dicts]
+  - state['asset_mapping']:    same list (the JSONB column on
+                               ApplicationSession is reused for stability;
+                               only the dict shape inside changes)
+"""
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from uppgrad_agentic.common.llm import get_llm
-from uppgrad_agentic.workflows.auto_apply.schemas import AssetMap, AssetMappingOutput
+from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile  # noqa: F401
+from uppgrad_agentic.workflows.auto_apply.schemas import RequirementItem
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Stub profile accessor — shared definition lives in eligibility_and_readiness.
-# Importing it directly keeps a single source of truth for the stub.
-# ---------------------------------------------------------------------------
-from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
-
-# ---------------------------------------------------------------------------
-# Document types the system can write/generate vs. ones the user must supply
+# Document types the system can write/generate vs. ones the user must supply.
+# These sets are also referenced by canonical_doc_types.classify_label and
+# determine_requirements (must stay in lockstep).
 # ---------------------------------------------------------------------------
 
-# Can be written from profile/CV data
 _GENERATABLE: set[str] = {
     "CV",
     "Cover Letter",
@@ -33,7 +43,6 @@ _GENERATABLE: set[str] = {
     "References",
 }
 
-# Must be provided by the user — cannot be authored by the system
 _USER_SUPPLIED: set[str] = {
     "Transcript",
     "English Proficiency Test",
@@ -44,190 +53,187 @@ _USER_SUPPLIED: set[str] = {
 }
 
 
-SYSTEM = """You are an application assistant mapping a job-seeker's documents to opportunity requirements.
+# ---------------------------------------------------------------------------
+# Per-opportunity-type document defaults (floor when both inputs are empty)
+# ---------------------------------------------------------------------------
 
-For each required document, decide:
-- source_document: which existing user document to use as the base (e.g. "CV", "profile", or "" if none)
-- tailoring_depth:
-    "none"     — requirement cannot be generated (e.g. transcripts, test scores, portfolios); user must supply it
-    "light"    — user already has this document; it only needs minor adjustments for this opportunity
-    "deep"     — user has a related document but it needs substantial reworking for this context
-    "generate" — no suitable source document exists; must be created from scratch using profile data
-- available: true only if the user already has the EXACT document type on file
-- notes: one sentence explaining the decision or flagging something the user should know
-
-Rules:
-- If a document type requires a test/grade/transcript that cannot be written, use "none".
-- If user has CV and needs Cover Letter, use source_document="CV" and tailoring_depth="generate".
-- If user has CV and needs SOP/Personal Statement, use source_document="CV" and tailoring_depth="generate".
-- If user has the exact document, default to "light" unless the opportunity is very specialised (then "deep").
-- For References, use source_document="profile" and tailoring_depth="generate" since they come from contacts.
-
-Return JSON only."""
+_DEFAULTS: Dict[str, List[str]] = {
+    "job": ["CV", "Cover Letter"],
+    "masters": ["CV", "SOP"],
+    "phd": ["CV", "SOP"],
+    "scholarship": ["CV", "Cover Letter"],
+}
 
 
 # ---------------------------------------------------------------------------
-# Heuristic mapping (LLM-free fallback)
+# Builders
 # ---------------------------------------------------------------------------
 
-def _heuristic_map(
-    doc_type: str,
-    req_type: str,
-    uploaded: Dict[str, bool],
-) -> AssetMap:
-    """Decide source_document, tailoring_depth, available, and notes without LLM."""
-
-    # Non-document requirements carry no writable deliverable
-    if req_type != "document":
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document="",
-            tailoring_depth="none",
-            available=False,
-            notes=f"{doc_type} is not a writable document; the user must supply it directly.",
-        )
-
-    has_doc = bool(uploaded.get(doc_type))
-    has_cv = bool(uploaded.get("CV"))
-
-    # Exact document on file
-    if has_doc:
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document=doc_type,
-            tailoring_depth="light",
-            available=True,
-            notes=f"Existing {doc_type} on file; will be lightly tailored to this opportunity.",
-        )
-
-    # User must supply — cannot generate
+def _doc_description(doc_type: str) -> str:
     if doc_type in _USER_SUPPLIED:
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document="",
-            tailoring_depth="none",
-            available=False,
-            notes=f"{doc_type} must be provided by the user; it cannot be generated by the system.",
-        )
-
-    # References — drawn from profile contacts
-    if "reference" in doc_type.lower() or "recommendation" in doc_type.lower():
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document="profile",
-            tailoring_depth="generate",
-            available=False,
-            notes="References will be compiled from contacts stored in your profile.",
-        )
-
-    # Generatable documents: Cover Letter, SOP, Personal Statement, Research Proposal, etc.
+        return f"{doc_type} must be uploaded by you — the system cannot generate it."
     if doc_type in _GENERATABLE:
-        if has_cv and doc_type != "CV":
-            return AssetMap(
-                requirement_type=doc_type,
-                source_document="CV",
-                tailoring_depth="generate",
-                available=False,
-                notes=f"No {doc_type} on file; will be generated from your CV and profile data.",
+        return f"{doc_type} can be uploaded or auto-generated from your CV and profile."
+    return f"{doc_type} requirement for this application."
+
+
+def _build_from_form_fields(
+    form_fields: List[Dict[str, Any]],
+) -> List[RequirementItem]:
+    """Group form fields into document / text / misc requirements.
+
+    Documents: file fields → one item per canonical_document_type (deduped,
+        keeping the required one when both required and optional appear).
+    Text:      textareas / long-form questions → one item each, label as
+        the question.
+    Misc:      everything else (single virtual line, profile-fillable).
+    """
+    items: List[RequirementItem] = []
+    item_id = 0
+
+    # ── Documents: dedupe on canonical_document_type ────────────────────
+    # Keyed by canonical_document_type (or label as fallback when classifier
+    # produced no canonical type).
+    doc_groups: Dict[str, Dict[str, Any]] = {}
+    for idx, field in enumerate(form_fields):
+        if field.get("field_type") != "file":
+            continue
+        canonical = (field.get("canonical_document_type") or "").strip()
+        key = canonical or (field.get("label") or "").strip().lower() or f"_unkeyed_{idx}"
+        existing = doc_groups.get(key)
+        if existing is None:
+            doc_groups[key] = {"index": idx, "field": field, "canonical": canonical}
+        else:
+            # Prefer the required version if any
+            if field.get("required") and not existing["field"].get("required"):
+                doc_groups[key] = {"index": idx, "field": field, "canonical": canonical}
+
+    for group in doc_groups.values():
+        field = group["field"]
+        canonical = group["canonical"] or ""
+        label = field.get("label") or canonical or "Document"
+        items.append(
+            RequirementItem(
+                id=item_id,
+                category="document",
+                label=label,
+                description=_doc_description(canonical) if canonical else f"{label} upload requirement.",
+                field_type="file",
+                required=bool(field.get("required")),
+                document_type=canonical or None,
+                question=None,
+                form_field_index=group["index"],
             )
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document="profile",
-            tailoring_depth="generate",
-            available=False,
-            notes=f"No {doc_type} on file; will be generated from profile data only.",
         )
+        item_id += 1
 
-    # Unknown document type — best-effort deep adaptation from CV
-    if has_cv:
-        return AssetMap(
-            requirement_type=doc_type,
-            source_document="CV",
-            tailoring_depth="deep",
-            available=False,
-            notes=f"No {doc_type} on file; CV will be deeply adapted to approximate this document.",
-        )
-    return AssetMap(
-        requirement_type=doc_type,
-        source_document="profile",
-        tailoring_depth="generate",
-        available=False,
-        notes=f"No suitable source document for {doc_type}; will generate from profile data.",
-    )
-
-
-def _heuristic_asset_mapping(
-    normalized_requirements: List[Dict[str, Any]],
-    uploaded: Dict[str, bool],
-) -> List[AssetMap]:
-    return [
-        _heuristic_map(
-            doc_type=req.get("document_type", ""),
-            req_type=req.get("requirement_type", "document"),
-            uploaded=uploaded,
-        )
-        for req in normalized_requirements
-    ]
-
-
-# ---------------------------------------------------------------------------
-# LLM mapping
-# ---------------------------------------------------------------------------
-
-def _build_llm_prompt(
-    opportunity_data: Dict[str, Any],
-    opportunity_type: str,
-    normalized_requirements: List[Dict[str, Any]],
-    profile: Dict[str, Any],
-) -> str:
-    title = opportunity_data.get("title", "Unknown")
-    company = (
-        opportunity_data.get("company")
-        or opportunity_data.get("university")
-        or opportunity_data.get("provider_name")
-        or "Unknown"
-    )
-    uploaded = profile.get("uploaded_documents") or {}
-    uploaded_list = [k for k, v in uploaded.items() if v]
-    reqs_list = [
-        f"- {r.get('document_type')} (requirement_type={r.get('requirement_type')}, assumed={r.get('is_assumed')})"
-        for r in normalized_requirements
-    ]
-
-    return (
-        f"Opportunity: {title} at {company} (type: {opportunity_type})\n\n"
-        f"User's uploaded documents: {', '.join(uploaded_list) if uploaded_list else 'none'}\n\n"
-        f"Required documents:\n" + "\n".join(reqs_list) + "\n\n"
-        "Produce one AssetMap entry per required document."
-    )
-
-
-def _llm_asset_mapping(
-    opportunity_data: Dict[str, Any],
-    opportunity_type: str,
-    normalized_requirements: List[Dict[str, Any]],
-    profile: Dict[str, Any],
-    llm,
-) -> List[AssetMap] | None:
-    structured = llm.with_structured_output(AssetMappingOutput)
-    prompt = _build_llm_prompt(opportunity_data, opportunity_type, normalized_requirements, profile)
-    try:
-        result: AssetMappingOutput = structured.invoke([
-            SystemMessage(content=SYSTEM),
-            HumanMessage(content=prompt),
-        ])
-        # Validate count matches — if mismatch, fall back to heuristic
-        if len(result.mappings) != len(normalized_requirements):
-            logger.warning(
-                "asset_mapping: LLM returned %d mappings but expected %d — falling back to heuristic",
-                len(result.mappings),
-                len(normalized_requirements),
+    # ── Text: textareas + free-form questions ───────────────────────────
+    for idx, field in enumerate(form_fields):
+        ftype = field.get("field_type")
+        source = field.get("expected_source")
+        if ftype != "textarea" and not (ftype == "text" and source == "user_answer"):
+            continue
+        label = (field.get("label") or "").strip() or "Free-form question"
+        items.append(
+            RequirementItem(
+                id=item_id,
+                category="text",
+                label=label,
+                description=f"Free-form question on the application form: {label}",
+                field_type=ftype,
+                required=bool(field.get("required")),
+                document_type=None,
+                question=label,
+                form_field_index=idx,
             )
-            return None
-        return result.mappings
-    except Exception as exc:
-        logger.warning("asset_mapping: LLM call failed — %s", exc)
-        return None
+        )
+        item_id += 1
+
+    # ── Misc: one collapsed line covering everything else ───────────────
+    misc_field_indices: List[int] = []
+    for idx, field in enumerate(form_fields):
+        ftype = field.get("field_type")
+        if ftype == "file":
+            continue
+        if ftype == "textarea":
+            continue
+        if ftype == "text" and field.get("expected_source") == "user_answer":
+            continue
+        misc_field_indices.append(idx)
+
+    if misc_field_indices:
+        items.append(
+            RequirementItem(
+                id=item_id,
+                category="misc",
+                label=f"Profile / identity fields ({len(misc_field_indices)})",
+                description=(
+                    "Other fields on the form (name, email, location, simple "
+                    "selects). These can be auto-filled from your profile."
+                ),
+                field_type=None,
+                required=any(form_fields[i].get("required") for i in misc_field_indices),
+                document_type=None,
+                question=None,
+                form_field_index=None,
+            )
+        )
+        item_id += 1
+
+    return items
+
+
+def _build_from_normalized_requirements(
+    normalized_requirements: List[Dict[str, Any]],
+) -> List[RequirementItem]:
+    """Document-only items (no text/misc groups) for non-jobs and
+    form-failed jobs.
+    """
+    items: List[RequirementItem] = []
+    seen: set[str] = set()
+    item_id = 0
+    for req in normalized_requirements:
+        if req.get("requirement_type") != "document":
+            continue
+        doc_type = (req.get("document_type") or "").strip()
+        if not doc_type or doc_type in seen:
+            continue
+        seen.add(doc_type)
+        items.append(
+            RequirementItem(
+                id=item_id,
+                category="document",
+                label=doc_type,
+                description=_doc_description(doc_type),
+                field_type=None,
+                required=not bool(req.get("is_assumed", False)),
+                document_type=doc_type,
+                question=None,
+                form_field_index=None,
+            )
+        )
+        item_id += 1
+    return items
+
+
+def _build_defaults(opportunity_type: str) -> List[RequirementItem]:
+    doc_types = _DEFAULTS.get(opportunity_type, _DEFAULTS["job"])
+    items: List[RequirementItem] = []
+    for i, doc_type in enumerate(doc_types):
+        items.append(
+            RequirementItem(
+                id=i,
+                category="document",
+                label=doc_type,
+                description=_doc_description(doc_type),
+                field_type=None,
+                required=True,
+                document_type=doc_type,
+                question=None,
+                form_field_index=None,
+            )
+        )
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -240,32 +246,42 @@ def asset_mapping(state: AutoApplyState) -> dict:
         return updates
 
     opportunity_type = state.get("opportunity_type", "")
-    opportunity_data = state.get("opportunity_data") or {}
-    normalized_requirements = state.get("normalized_requirements") or []
-    profile = resolve_profile(state)
-    uploaded: Dict[str, bool] = {
-        k: bool(v) for k, v in (profile.get("uploaded_documents") or {}).items()
-    }
+    form_fields: List[Dict[str, Any]] = list(state.get("form_fields") or [])
+    normalized_requirements: List[Dict[str, Any]] = list(state.get("normalized_requirements") or [])
 
-    if not normalized_requirements:
-        logger.warning("asset_mapping: no normalized_requirements in state — returning empty mapping")
-        return {**updates, "asset_mapping": []}
+    items: List[RequirementItem] = []
 
-    llm = get_llm()
-    mappings: List[AssetMap] | None = None
+    if opportunity_type == "job" and form_fields:
+        items = _build_from_form_fields(form_fields)
+        if not items:
+            # form_fields was non-empty but yielded nothing groupable —
+            # fall through to normalized_requirements / defaults
+            items = _build_from_normalized_requirements(normalized_requirements)
+    else:
+        items = _build_from_normalized_requirements(normalized_requirements)
 
-    if llm is not None:
-        mappings = _llm_asset_mapping(
-            opportunity_data, opportunity_type, normalized_requirements, profile, llm
+    # Floor: nothing produced from either source — emit per-type defaults
+    if not items:
+        logger.info(
+            "asset_mapping: no requirement items derived for %s — falling back to defaults",
+            opportunity_type,
         )
+        items = _build_defaults(opportunity_type)
 
-    if mappings is None:
-        mappings = _heuristic_asset_mapping(normalized_requirements, uploaded)
+    item_dicts = [item.model_dump() for item in items]
 
     logger.info(
-        "asset_mapping: produced %d mappings (llm=%s)",
-        len(mappings),
-        llm is not None and mappings is not None,
+        "asset_mapping: produced %d requirement_items (%s document, %s text, %s misc)",
+        len(item_dicts),
+        sum(1 for i in item_dicts if i["category"] == "document"),
+        sum(1 for i in item_dicts if i["category"] == "text"),
+        sum(1 for i in item_dicts if i["category"] == "misc"),
     )
 
-    return {**updates, "asset_mapping": [m.model_dump() for m in mappings]}
+    return {
+        **updates,
+        "requirement_items": item_dicts,
+        # Reuse the asset_mapping JSONB column on ApplicationSession for
+        # stability — backend stores whatever shape we put here.
+        "asset_mapping": item_dicts,
+    }

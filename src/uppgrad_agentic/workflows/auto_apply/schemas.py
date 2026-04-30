@@ -5,9 +5,10 @@ from pydantic import BaseModel, Field
 
 
 OpportunityType = Literal["job", "masters", "phd", "scholarship"]
-TailoringDepth = Literal["none", "light", "deep", "generate"]
-EligibilityDecision = Literal["ready", "pending", "ineligible", "manual_review"]
+TailoringDepth = Literal["light", "deep", "generate"]
+EligibilityDecision = Literal["ready", "ineligible"]
 ScrapeStatus = Literal["full", "partial", "failed"]
+RequirementCategory = Literal["document", "text", "misc"]
 
 
 class NormalizedRequirement(BaseModel):
@@ -25,19 +26,23 @@ class ScrapeResult(BaseModel):
 
 
 class EligibilityResult(BaseModel):
-    decision: EligibilityDecision = Field(..., description="Eligibility outcome: ready | pending | ineligible | manual_review")
+    decision: EligibilityDecision = Field(..., description="Eligibility outcome: ready | ineligible")
     reasons: List[str] = Field(default_factory=list, description="Reasons supporting the decision")
     missing_fields: List[str] = Field(default_factory=list, description="Profile fields that are missing and needed to continue")
 
 
+# DEPRECATED — replaced by RequirementItem in Step 6 of the gate-1 remodel.
+# Kept defined for one cycle to ease the deprecation cliff for any external
+# consumers; remove in a follow-up once nothing references it.
 class AssetMap(BaseModel):
     requirement_type: str = Field(..., description="Document type being mapped (e.g. 'CV', 'Cover Letter', 'SOP')")
     source_document: str = Field(..., description="Which user document is used as the base (e.g. 'CV', 'profile', or empty if none)")
-    tailoring_depth: TailoringDepth = Field(..., description="How much work is needed: none | light | deep | generate")
+    tailoring_depth: TailoringDepth = Field(..., description="How much work is needed: light | deep | generate")
     available: bool = Field(..., description="True if the user already has this exact document on file")
     notes: str = Field(default="", description="Explains the mapping decision or flags issues the user should know about")
 
 
+# DEPRECATED — superseded by RequirementItem.
 class AssetMappingOutput(BaseModel):
     """Container used for LLM structured output — wraps the full list of mappings."""
     mappings: List[AssetMap] = Field(..., description="One AssetMap entry per normalized requirement")
@@ -69,6 +74,15 @@ class FormField(BaseModel):
             "or unknown when the LLM can't classify."
         ),
     )
+    canonical_document_type: str = Field(
+        default="",
+        description=(
+            "Canonical document-type label for file inputs (e.g. 'CV', 'Cover Letter', "
+            "'Transcript', 'Portfolio'). Populated only for field_type='file' by "
+            "determine_requirements via heuristic + LLM classification. Empty for "
+            "non-file fields."
+        ),
+    )
 
 
 class FormSchema(BaseModel):
@@ -77,3 +91,69 @@ class FormSchema(BaseModel):
     fields: List[FormField] = Field(default_factory=list, description="One FormField per input on the form, in document order")
     form_action: str = Field(default="", description="The form's `action` attribute when present — useful for direct POST submission")
     form_method: str = Field(default="POST", description="The form's `method` attribute (POST/GET); defaults to POST when not specified")
+
+
+# ─── Requirement model (replaces AssetMap in Step 6) ──────────────────────────
+
+class RequirementItem(BaseModel):
+    """One actionable item the user reviews at gate 1.
+
+    Built by asset_mapping from either form_fields (jobs with extraction) or
+    normalized_requirements (everything else). Documents map to user uploads
+    or auto-generation; texts map to free-form questions; misc collapses
+    profile/identity fields into a single virtual line.
+    """
+    id: int = Field(..., description="Stable index used by the gate-1 resume payload to key per-item choices")
+    category: RequirementCategory = Field(..., description="document | text | misc")
+    label: str = Field(..., description="Human-readable label shown to the user")
+    description: str = Field(default="", description="Longer explanation of what this requirement is")
+    field_type: Optional[str] = Field(
+        default=None,
+        description="FormFieldType for items derived from form_fields; None when derived from normalized_requirements",
+    )
+    required: bool = Field(default=False, description="True when the source FormField is required or the requirement is hard-blocking")
+    document_type: Optional[str] = Field(
+        default=None,
+        description="Canonical document type when category='document' (e.g. 'CV', 'Cover Letter', 'Transcript')",
+    )
+    question: Optional[str] = Field(
+        default=None,
+        description="For category='text': the FormField label, used as the prompt for auto-generation",
+    )
+    form_field_index: Optional[int] = Field(
+        default=None,
+        description="Back-pointer into state['form_fields']; None for items derived from normalized_requirements",
+    )
+
+
+# ─── Upload analysis schemas (Step 6 two-pass tailoring inputs) ───────────────
+
+class UploadedDocPreAnalysis(BaseModel):
+    """Pre-tailoring analysis of a user-uploaded document."""
+    completeness: str = Field(..., description="Short prose: what core sections / signals are present vs missing")
+    relevance: str = Field(..., description="Short prose: how well the document matches the opportunity's requirements")
+    correctness: str = Field(..., description="Short prose: factual / structural / formatting issues, if any")
+    overall_quality: Literal["needs_major_work", "needs_revision", "ready_for_polish"] = Field(
+        ...,
+        description="Bucket verdict driving downstream tailoring effort",
+    )
+    top_priorities: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 prioritised changes the tailoring pass should address",
+    )
+
+
+class UploadedDocLightPostAnalysis(BaseModel):
+    """Post-T1 light analysis flagging remaining gaps before T2."""
+    structure_issues: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 ordering/formatting/structural problems remaining after T1",
+    )
+    content_gap_vs_opportunity: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 missing elements that the opportunity explicitly asks for",
+    )
+    content_gap_vs_profile: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 strengths from the user's profile that T1 failed to surface",
+    )

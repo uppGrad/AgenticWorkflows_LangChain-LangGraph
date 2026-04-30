@@ -1,49 +1,159 @@
+"""Gate 1 (Step 6 rewrite).
+
+Surfaces the categorised requirement_items list to the user. The user picks
+a per-item choice (upload / auto_generate / ignore_for_now / skip) plus an
+optional ≤200-char user_prompt for documents, and a misc_strategy
+(auto_fill / ignore) for the collapsed misc line.
+
+Validation:
+  - required document items reject "skip" and "ignore_for_now"
+  - required text items reject "skip"
+  - USER_SUPPLIED canonical doc types reject "auto_generate"
+On invalid resume, the node returns no state changes and re-interrupts so
+the backend can return a 400 to the frontend.
+"""
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import logging
+from typing import Any, Dict, List, Optional
 
 from langgraph.types import interrupt
 
+from uppgrad_agentic.workflows.auto_apply.nodes.asset_mapping import _USER_SUPPLIED
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Resume value contract
+# Resume-value contract
 #
-# When the graph is resumed the caller must pass Command(resume=selections)
-# where `selections` is a dict keyed by string asset indices ("0", "1", ...):
-#
-#   selections: {
-#       "0": {
-#           "source_document": "CV",       # may override the mapped source
-#           "tailoring_depth": "light",    # may override the mapped depth
-#           "skip": false,                 # true to exclude this document
-#           "content": null,               # text if user uploaded a new version
+# Command(resume={
+#   "requirements": {
+#       "<id>": {
+#           "choice": "upload" | "auto_generate" | "ignore_for_now" | "skip",
+#           "uploaded_text": "<extracted text>" | null,
+#           "user_prompt": "<≤200 chars>" | null   # documents only
 #       },
-#       "1": {
-#           "source_document": "CV",
-#           "tailoring_depth": "generate",
-#           "skip": false,
-#           "content": null,
-#       },
-#   }
+#       ...
+#   },
+#   "misc_strategy": "auto_fill" | "ignore"
+# })
 #
-# - Entries with no key in selections keep their original asset_mapping values.
-# - "skip": true removes the document from the tailoring step entirely.
-# - "content" carries user-uploaded document text that replaces the stored source.
-# - Passing selections={"confirm": True} confirms all mappings as-is (do NOT pass an
-#   empty dict — LangGraph treats falsy resume values as "no resume" and re-interrupts).
+# - Each per-id entry must reference an id that appears in requirement_items.
+# - The misc_strategy applies to category='misc' line(s); ignored otherwise.
+# - Always send a non-empty dict — LangGraph treats falsy resume values as
+#   "no resume" and re-interrupts.
 #
 # Interrupt payload (what the frontend receives):
-#
 #   {
-#       "asset_mapping": [{"id": 0, ...AssetMap fields...}, ...],
+#       "requirement_items": [...],
 #       "opportunity_type": "job",
 #       "opportunity_title": "Software Engineer at Acme Corp",
 #   }
 # ---------------------------------------------------------------------------
 
-_VALID_DEPTHS = {"none", "light", "deep", "generate"}
+_VALID_CHOICES = {"upload", "auto_generate", "ignore_for_now", "skip"}
+_VALID_MISC_STRATEGIES = {"auto_fill", "ignore"}
+_MAX_USER_PROMPT_LEN = 200
+
+
+def _validate_resume(
+    payload: Any,
+    requirement_items: List[Dict[str, Any]],
+) -> Optional[List[str]]:
+    """Return a list of validation errors. Empty list = valid; None means
+    "not even a dict — re-interrupt".
+    """
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    errors: List[str] = []
+    requirements = payload.get("requirements")
+    if not isinstance(requirements, dict):
+        errors.append("requirements must be an object keyed by requirement id")
+        return errors
+
+    misc_strategy = payload.get("misc_strategy", "ignore")
+    if misc_strategy not in _VALID_MISC_STRATEGIES:
+        errors.append(
+            f"misc_strategy must be one of {sorted(_VALID_MISC_STRATEGIES)}"
+        )
+
+    items_by_id = {str(item["id"]): item for item in requirement_items}
+
+    for raw_id, raw in requirements.items():
+        item = items_by_id.get(str(raw_id))
+        if item is None:
+            errors.append(f"unknown requirement id: {raw_id}")
+            continue
+        if not isinstance(raw, dict):
+            errors.append(f"requirements[{raw_id}] must be an object")
+            continue
+        choice = raw.get("choice")
+        if choice not in _VALID_CHOICES:
+            errors.append(
+                f"requirements[{raw_id}].choice must be one of {sorted(_VALID_CHOICES)}"
+            )
+            continue
+
+        category = item.get("category")
+        required = bool(item.get("required"))
+
+        if category == "document":
+            if required and choice in {"skip", "ignore_for_now"}:
+                errors.append(
+                    f"requirements[{raw_id}]: required document cannot be skipped or ignored"
+                )
+            doc_type = item.get("document_type")
+            if doc_type in _USER_SUPPLIED and choice == "auto_generate":
+                errors.append(
+                    f"requirements[{raw_id}]: '{doc_type}' must be uploaded — auto_generate is not allowed"
+                )
+            if choice == "upload":
+                uploaded_text = raw.get("uploaded_text")
+                if not uploaded_text or not isinstance(uploaded_text, str) or not uploaded_text.strip():
+                    errors.append(
+                        f"requirements[{raw_id}]: choice=upload requires non-empty uploaded_text"
+                    )
+            user_prompt = raw.get("user_prompt")
+            if user_prompt is not None:
+                if not isinstance(user_prompt, str):
+                    errors.append(f"requirements[{raw_id}].user_prompt must be a string")
+                elif len(user_prompt) > _MAX_USER_PROMPT_LEN:
+                    errors.append(
+                        f"requirements[{raw_id}].user_prompt exceeds {_MAX_USER_PROMPT_LEN} chars"
+                    )
+        elif category == "text":
+            if required and choice == "skip":
+                errors.append(
+                    f"requirements[{raw_id}]: required text item cannot be skipped"
+                )
+        # misc items are governed by misc_strategy; per-id entries are accepted
+        # but not validated further.
+
+    return errors
+
+
+def _compute_auto_submit_feasible(
+    requirement_items: List[Dict[str, Any]],
+    requirements: Dict[str, Dict[str, Any]],
+) -> bool:
+    """True when every required item has either a usable upload or a valid
+    auto-generate selection. Misc items don't gate feasibility — they're
+    auto-filled or skipped based on misc_strategy and never block submission
+    on their own.
+    """
+    for item in requirement_items:
+        if not item.get("required"):
+            continue
+        if item.get("category") == "misc":
+            continue
+        choice = (requirements.get(str(item["id"])) or {}).get("choice")
+        if choice in {"upload", "auto_generate"}:
+            continue
+        return False
+    return True
 
 
 def human_gate_1(state: AutoApplyState) -> dict:
@@ -51,7 +161,7 @@ def human_gate_1(state: AutoApplyState) -> dict:
     if state.get("result", {}).get("status") == "error":
         return updates
 
-    asset_mapping: List[Dict[str, Any]] = state.get("asset_mapping") or []
+    requirement_items: List[Dict[str, Any]] = list(state.get("requirement_items") or [])
     opportunity_data = state.get("opportunity_data") or {}
     opportunity_type = state.get("opportunity_type", "")
 
@@ -68,63 +178,32 @@ def human_gate_1(state: AutoApplyState) -> dict:
     )
     opportunity_title = f"{title} at {company}" if company else title
 
-    # Attach stable indices so the frontend can reference entries by position
-    indexed_mapping = [{"id": i, **m} for i, m in enumerate(asset_mapping)]
-
-    # -------------------------------------------------------------------
-    # Suspend. Resumes via Command(resume=selections).
-    # -------------------------------------------------------------------
-    selections: Dict[str, Any] = interrupt(
+    payload = interrupt(
         {
-            "asset_mapping": indexed_mapping,
+            "requirement_items": requirement_items,
             "opportunity_type": opportunity_type,
             "opportunity_title": opportunity_title,
         }
     )
 
-    # -------------------------------------------------------------------
-    # Validate and normalise the resume value
-    # -------------------------------------------------------------------
-    if not isinstance(selections, dict):
-        selections = {}
+    errors = _validate_resume(payload, requirement_items)
+    if errors is None or errors:
+        # Invalid resume — return state unchanged so the node re-interrupts.
+        # The backend serializer reads this signal and returns 400.
+        if errors:
+            logger.warning("human_gate_1: invalid resume payload — %s", errors)
+        return updates
 
-    confirmed_mappings: Dict[str, Dict[str, Any]] = {}
-    additional_uploads: Dict[str, str] = {}
+    requirements: Dict[str, Dict[str, Any]] = payload["requirements"]
+    misc_strategy: str = payload.get("misc_strategy", "ignore")
 
-    for entry in indexed_mapping:
-        idx = str(entry["id"])
-        doc_type = entry.get("requirement_type", "")
-        raw = selections.get(idx) or {}
-
-        if isinstance(raw, str):
-            # Bare string is treated as a skip flag ("skip") or confirm ("confirm")
-            raw = {"skip": raw.lower() == "skip"}
-
-        skip = bool(raw.get("skip", False))
-
-        # Allow overrides for source_document and tailoring_depth
-        source_document = raw.get("source_document") or entry.get("source_document", "")
-        tailoring_depth = raw.get("tailoring_depth") or entry.get("tailoring_depth", "light")
-        if tailoring_depth not in _VALID_DEPTHS:
-            tailoring_depth = entry.get("tailoring_depth", "light")
-
-        # User-uploaded content for this document (overrides stored source)
-        content = raw.get("content") or None
-        if content and isinstance(content, str) and content.strip():
-            additional_uploads[doc_type] = content.strip()
-
-        confirmed_mappings[doc_type] = {
-            "source_document": source_document,
-            "tailoring_depth": tailoring_depth,
-            "skip": skip,
-            "available": entry.get("available", False),
-            "notes": entry.get("notes", ""),
-        }
+    feasible = _compute_auto_submit_feasible(requirement_items, requirements)
 
     return {
         **updates,
         "human_review_1": {
-            "confirmed_mappings": confirmed_mappings,
-            "additional_uploads": additional_uploads,
+            "requirements": requirements,
+            "misc_strategy": misc_strategy,
         },
+        "auto_submit_feasible_at_gate_1": feasible,
     }

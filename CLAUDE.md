@@ -7,10 +7,259 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 UppGrad is an AI-powered platform helping students find and apply to jobs, 
 graduate programs, and scholarships. It has two core agentic workflows: 
 document feedback and auto-apply. Document feedback analyzes uploaded CVs, 
-SOPs, and cover letters and proposes structured reviewable edits. Auto-apply 
-assesses eligibility, generates tailored application materials, and attempts 
-submission. Both workflows use human-in-the-loop approval before any 
-consequential action.
+SOPs, and cover letters and proposes structured reviewable edits. Auto-apply assesses eligibility, generates tailored application materials, and attempts submission. Both workflows use human-in-the-loop approval before any consequential action.
+
+---
+
+## Priority TODO
+
+This section captures the next concrete agentic-side change to make, with 
+enough detail that the change can be implemented without re-deriving the 
+plan. Items are ordered by priority. Strike through (or delete) once shipped.
+
+### 1. Auto-apply gate-1 remodel + remove `human_gate_0` (single PR)
+
+**Goal**: replace the `asset_mapping → human_gate_1 → application_tailoring 
+→ application_evaluation → human_gate_2` chain with a form-field-driven 
+requirement model, and remove gate 0 in the same PR. Asset mapping stops 
+trying to map requirements to user-uploaded documents (only CV is ever 
+stored — `accounts_studentcv` is one row per student, no `uploaded_document` 
+table exists, the `available=True / tailoring_depth='light'` branches of 
+today's heuristic are dead in production). It instead produces a categorized 
+requirement list derived from `extract_form_fields`. Gate 1 collects 
+per-requirement choices (Upload / Auto-generate / Ignore for now / Skip) and 
+an optional 200-char user prompt per document. Tailoring becomes two-pass 
+for uploaded docs and single-pass for auto-generated. Evaluation drops the 
+retry loop and surfaces issues as warnings at gate 2.
+
+
+**Subchanges**:
+
+A. **Remove `human_gate_0`**.
+   - Delete `nodes/human_gate_0.py`.
+   - In `eligibility_and_readiness.py`: delete `_check_profile_completeness` 
+     and the lazy `_GENERATABLE` import; delete the `if missing_fields:` 
+     pending branch. Eligibility reduces to deadline check (hard-block) + 
+     compatibility warnings (non-blocking). Always pass `missing_fields=[]`.
+   - In `graph.py`: remove `human_gate_0` node + `_route_after_gate_0` + 
+     conditional edges. Simplify `_route_after_eligibility` to two 
+     destinations (`end_with_explanation`, `asset_mapping`).
+   - In `state.py`: drop `gate_0_iteration_count`.
+   - In `schemas.py`: narrow `EligibilityDecision` to 
+     `Literal["ready", "ineligible"]`.
+   - Delete `tests/workflows/auto_apply/test_human_gate_0.py` and 
+     `test_graph_gate_0_loop.py`.
+
+B. **Internal-jobs short-circuit**.
+   - In `graph.py`: new conditional after `load_opportunity` — if 
+     `opportunity_type=='job' AND opportunity_data.employer_id==1`, route 
+     straight to `determine_requirements`, skipping discover/scrape/
+     evaluate-scrape/extract-form-fields entirely.
+   - In `determine_requirements.py`: when this short-circuit fires, emit 
+     `[CV, Cover Letter]` as document requirements directly. (Match 
+     `jobs_application` non-system fields: `resume_file` + `cover_letter`.)
+
+C. **Canonical document-type tagging on FormFields**.
+   - `schemas.FormField`: add `canonical_document_type: str = ""`, 
+     populated only for `field_type='file'`.
+   - New `tools/canonical_doc_types.py`: heuristic keyword table mapping 
+     common label phrases to `_GENERATABLE ∪ _USER_SUPPLIED` canonical 
+     types ("resume"/"cv" → CV; "cover letter"/"motivation letter" → 
+     Cover Letter; "transcript" → Transcript; "portfolio" → Portfolio; 
+     etc.).
+   - In `determine_requirements.py` (jobs path only): after form_fields 
+     are present, walk each `field_type='file'` field — apply heuristic 
+     first, fall back to LLM classification for unmatched labels (LLM 
+     prompt enumerates the valid canonical-type set). Write the result 
+     back onto each FormField in `state['form_fields']`.
+
+D. **New requirement schema** — replaces `AssetMap`/`AssetMappingOutput`.
+   - In `schemas.py`:
+     ```python
+     class RequirementItem(BaseModel):
+         id: int
+         category: Literal["document", "text", "misc"]
+         label: str
+         description: str
+         field_type: Optional[str]            # FormFieldType for items derived from form_fields
+         required: bool
+         document_type: Optional[str]         # canonical doc_type when category=document
+         question: Optional[str]              # text-category items: drives generation
+         form_field_index: Optional[int]      # back-pointer into state['form_fields']
+     ```
+   - Drop `tailoring_depth='none'` everywhere it appears: 
+     `TailoringDepth` literal, `_VALID_DEPTHS` in `human_gate_1`, the 
+     `none` branch in `application_tailoring` (line 334), the 
+     `none`-skip in `application_evaluation` (line 91), the `none` filter 
+     in `package_and_handoff` (line 54). New `TailoringDepth = 
+     Literal["light", "deep", "generate"]`.
+
+E. **Asset mapping rewrite** (`nodes/asset_mapping.py`).
+   - Inputs: `state['form_fields']` (jobs with non-empty extraction) OR 
+     `state['normalized_requirements']` (non-jobs and form-failed jobs).
+   - Output: `state['requirement_items']: List[RequirementItem]`. (Keep 
+     the JSONB column name `asset_mapping` on `ApplicationSession` for 
+     stability — only the dict shape changes.)
+   - Logic:
+     - Jobs with form_fields → group by `field_type` into document/text/misc; 
+       documents get a dedupe pass on `canonical_document_type` (keep the 
+       required one if any, else first); text items take their FormField 
+       label as `question`; misc collapses to a single virtual item.
+     - All other paths → emit document-only items from 
+       `normalized_requirements` (no text/misc groups).
+     - Floor: if both lists are empty, fall back to 
+       `_DEFAULTS[opportunity_type]` (per-type default doc set).
+
+F. **Two-pass tailoring (uploaded) / single-pass (auto-generated)**.
+   - New schemas in `schemas.py`:
+     ```python
+     class UploadedDocPreAnalysis(BaseModel):
+         completeness: str
+         relevance: str
+         correctness: str
+         overall_quality: Literal["needs_major_work", "needs_revision", "ready_for_polish"]
+         top_priorities: List[str]                 # cap 3
+
+     class UploadedDocLightPostAnalysis(BaseModel):
+         structure_issues: List[str]               # cap 3
+         content_gap_vs_opportunity: List[str]     # cap 3
+         content_gap_vs_profile: List[str]         # cap 3
+     ```
+   - New `nodes/upload_pre_analysis.py` and `nodes/upload_light_post_analysis.py` 
+     (LLM calls returning the schemas above; no heuristic fallback — emit 
+     empty/safe analysis if LLM unavailable).
+   - Rewrite `nodes/application_tailoring.py`:
+     - **Upload path**: PreA → T1 (uses PreA + opportunity + profile + CV + 
+       per-doc user_prompt) → LA → T2 (uses T1 + LA + same context). 
+       Always 2-pass; do NOT short-circuit on `ready_for_polish`.
+     - **Auto-generate document**: single tailoring call (CV + profile + 
+       opportunity + user_prompt + canonical_document_type). No T2.
+     - **Auto-generate text**: single LLM call with FormField label as the 
+       question, profile + CV + opportunity as context. Output goes into 
+       new state field `tailored_answers: Dict[str, dict]` keyed by 
+       `form_field_index` (NOT `tailored_documents`).
+   - Per-doc-type caps unchanged. Add a 1500-char cap per text answer.
+
+G. **Drop the evaluation retry loop** (`nodes/application_evaluation.py`).
+   - Rewrite as informational only: length / placeholder / 
+     keyword-coverage check across `tailored_documents` and 
+     `tailored_answers`. Output: `evaluation_result.warnings: List[str]`.
+   - In `graph.py`: remove the `application_evaluation → 
+     application_tailoring` retry edge; always proceed to `human_gate_2`.
+   - In `state.py`: drop `iteration_count` (unused after loop removal).
+
+H. **Gate 1 rewrite** (`nodes/human_gate_1.py`).
+   - Interrupt payload: `{requirement_items, opportunity_title, 
+     opportunity_type}`.
+   - Resume value:
+     ```python
+     {
+       "requirements": {
+         "<id>": {
+           "choice": "upload" | "auto_generate" | "ignore_for_now" | "skip",
+           "uploaded_text": "<extracted text>" | null,
+           "user_prompt": "<≤200 chars>" | null      # documents only
+         }
+       },
+       "misc_strategy": "auto_fill" | "ignore"
+     }
+     ```
+   - Validation: required document items reject `skip` and 
+     `ignore_for_now`; required text items reject `skip`; USER_SUPPLIED 
+     canonical doc types reject `auto_generate` (only `upload` / `skip` 
+     when not required). On invalid resume, return 400 from the backend 
+     view; the graph stays paused at gate 1 until a valid payload arrives.
+   - Compute `auto_submit_feasible_at_gate_1: bool` from the choices and 
+     stash on state.
+
+I. **Gate 2 rewrite** (`nodes/human_gate_2.py`).
+   - Interrupt payload: previews of `tailored_documents` AND 
+     `tailored_answers`, `evaluation_result.warnings`, `posting_closed`, 
+     and the recomputed `auto_submit_feasible` (per P1: false when any 
+     required document's auto-generation produced no content, or any 
+     required upload is missing).
+   - Resume value: `{approved, attempt_auto_submit, feedback}`.
+   - Routing: `attempt_auto_submit=True` is recorded on 
+     `gate_2_response` regardless of feasibility (intent only — auto-submit 
+     itself isn't implemented yet). Today's branching is preserved: 
+     `employer_id==1 → submit_internal`, else `package_and_handoff`.
+
+J. **Backend integration**.
+   - `auto_apply_adapter.py`: delete `resume_session_gate_0`, the 
+     gate-0 branch in `_pending_node_after_invoke`, the 
+     `AWAITING_PROFILE_COMPLETION` mapping in `_persist_state_after_phase`, 
+     and the post-gate-0 profile-snapshot reinjection. New: persist gate 
+     1 uploaded files (Railway Volume — backend sets `cv_file` / future 
+     fields to `FileField` paths and extracts text via the 
+     document-feedback OCR fallback before passing into the resume payload 
+     as `uploaded_text` per requirement). Closes the long-standing 
+     "additional_uploads not plumbed" gap.
+   - `views.py` + `urls.py`: remove the `resume-gate-0/` view and route.
+   - `serializers.py`: rewrite `Gate1ResumeSerializer` to the new shape 
+     (per-requirement choice dict, `misc_strategy`, optional 
+     `FileField`s). Enforce `max_length=200` on each `user_prompt`. 
+     Rewrite `Gate2ResumeSerializer` to add 
+     `attempt_auto_submit: bool` and a per-doc/answer feedback dict.
+   - `models.py` + new Django migration: drop `gate_0_response`; add 
+     `tailored_answers: JSONField` and `requirement_items: JSONField`; 
+     remove `AWAITING_PROFILE_COMPLETION` from the status enum AND from 
+     the `one_active_application_session_per_student_opportunity` partial 
+     unique-index condition.
+   - `janitor.py`: drop the `AWAITING_PROFILE_COMPLETION` TTL row.
+   - Pre-deploy step: cancel all in-flight sessions in 
+     `AWAITING_PROFILE_COMPLETION` and `AWAITING_DOCUMENT_MAPPING` — old 
+     resume payload shapes are incompatible with the new serializers.
+
+**Things to preserve**:
+- Deadline check + `INELIGIBLE` termination + `end_with_explanation`.
+- `compatibility_warnings` flow (non-blocking).
+- Discovery cache + 14-day staleness gate.
+- `posting_closed` warning surface in handoff package.
+- `form_fields` in package (auto-submit foundation).
+- `_GENERATABLE` / `_USER_SUPPLIED` sets — now drive canonical-type 
+  classification + auto-generate-button visibility.
+- PostgresSaver checkpointer.
+
+**Out of scope (deferred follow-ups)**:
+- External-job auto-submit implementation (this PR records intent only).
+- Gate 2 "edit and re-tailor" loop.
+- Polymorphic `StudentDocument` table (CV is still the only stored doc).
+- ZIP download endpoint at `GET /api/ai/application-sessions/<id>/package.zip` 
+  (intent recorded; render docs to PDF via `document_renderer`, text 
+  answers as `.txt`, on-demand build, no disk persistence).
+- `expected_source` classification quality tuning.
+- `jobs_application.cover_letter` text → file-path migration.
+
+**Smoke tests**:
+- Internal job (`employer_id=1`, complete profile): 
+  load → internal-route → determine_requirements emits `[CV, Cover Letter]` 
+  → eligibility ready → asset_mapping → gate 1 with 2 document items 
+  (Upload/Auto-generate, no Skip since required) and per-doc prompt 
+  fields → user picks Auto-generate for both → tailoring single-pass 
+  each → evaluation informational → gate 2 → submit_internal writes 
+  `Application` row.
+- External Greenhouse job, full discovery success: full discover/scrape/
+  evaluate/extract → asset_mapping derives item list from form_fields, 
+  dedupes duplicate file fields, classifies canonical types → gate 1 mixes 
+  documents, texts, and one Misc line → user uploads CV (text extracted 
+  server-side), Auto-generate Cover Letter, Auto-generate "Why us?" text, 
+  Ignore "Salary expectations", Auto-fill misc → tailoring 
+  PreA→T1→LA→T2 for CV + single-pass for CL + single-pass text-answer 
+  for "Why us?" → evaluation informational → gate 2 with 
+  `auto_submit_feasible=False` (one required text ignored) → user clicks 
+  Get package only → handoff.
+- Job with empty form_fields (Workday auth wall): falls back to 
+  `_DEFAULTS["job"]` → gate 1 has CV + Cover Letter as documents only, no 
+  text/misc.
+- Masters program with Transcript required (parsed from `data.json`): 
+  determine_requirements emits CV + SOP + Transcript → gate 1 with 
+  Transcript as USER_SUPPLIED (only Upload offered) → user submits gate 
+  1 without Transcript → backend returns 400, graph stays paused → user 
+  re-submits with Transcript file → tailoring proceeds.
+- Past-deadline opportunity: eligibility ineligible → 
+  end_with_explanation with `error_code='INELIGIBLE'` (unchanged).
+
+---
 
 ## Commands
 
@@ -101,93 +350,8 @@ src/uppgrad_agentic/
   Production callers (the Django adapter) pass `PostgresSaver`. CLI defaults to 
   `MemorySaver`.
 
-### common/state.py
-Intentionally reserved as a shared base state for future workflows. Currently empty. 
-Do not delete or use for workflow-specific state.
-
-
-### Adding a new workflow
-1. Create `src/uppgrad_agentic/workflows/<name>/` mirroring the `document_feedback` layout.
-2. Define a `State` TypedDict in `state.py`.
-3. Put each node in `nodes/<node_name>.py` with signature `(state: YourState) -> dict`.
-4. Wire the graph in `graph.py` with `build_graph() -> CompiledGraph`.
-5. Add a `run.py` CLI entry point.
-
 ---
 
-
-## Document Feedback Workflow
-
-### Agent responsibilities 
-
-**Intake & Classification Agent** (load_document.py, detect_doc_type.py)
-Loads and extracts text from uploaded file, validates minimum length, 
-classifies document as CV/SOP/COVER_LETTER, routes accordingly.
-
-**Context Assembly Agent** (fetch_profile_snapshot.py, extract_doc_sections.py, 
-parse_user_instructions.py, get_opportunity_context.py, build_context_pack.py)
-Fetches user profile snapshot, extracts document sections, parses user 
-instructions, optionally retrieves opportunity context, builds unified 
-context pack for all downstream agents.
-
-**Document Analysis Agent** (analyze_structure.py, analyze_style.py, 
-analyze_content_gaps.py, analyze_ats.py, analyze_opportunity_alignment.py)
-Runs parallel analyses: structure, style/grammar, content gaps, ATS 
-compatibility (CV only), opportunity alignment (if context provided). 
-All analyses are parameterized by doc_type.
-
-**Synthesis & Planning Agent** (synthesize_feedback.py)
-Merges parallel analysis outputs, prioritizes issues, generates structured 
-ChangeProposal list with section, rationale, before/after text, confidence, 
-and confirmation flag per proposal.
-
-**Evaluation Agent** (evaluate_output.py)
-Checks proposals for groundedness, hallucinations, and format compliance. 
-Triggers refinement loop back to synthesis, capped at 2 iterations.
-
-**Human Review Coordinator** (human_gate.py)
-LangGraph interrupt point. Presents proposals to user as reviewable 
-checklist, collects accept/reject decisions and comments, holds workflow 
-until explicit approval.
-
-**Rewrite Agent** (finalize.py)
-Applies only approved edits, resolves conflicts between overlapping changes, 
-preserves rejected segments, runs coherence smoothing pass, produces final 
-rewritten document and diff.
-
-### Orchestration
-
-The full graph flow is:
-
-START
-→ load_document
-→ detect_doc_type
-→ [route by doc_type: cv / sop / cover_letter / error]
-→ fetch_profile_snapshot
-→ extract_doc_sections
-→ parse_user_instructions
-→ [conditional] get_opportunity_context (only if user provided opportunity)
-→ build_context_pack
-→ [parallel] analyze_structure, analyze_style, analyze_content_gaps
-           + analyze_ats (CV only)
-           + analyze_opportunity_alignment (only if opportunity context exists)
-→ synthesize_feedback
-→ evaluate_output
-→ [loop back to synthesize_feedback if quality check fails, max 2 iterations]
-→ human_gate (interrupt — wait for user approval)
-→ finalize
-→ END
-
-Key orchestration rules:
-- Every node checks for result.status == "error" at the top and returns {} to short-circuit
-- Parallel analysis nodes fan out from build_context_pack and merge into synthesize_feedback
-- The evaluation loop is capped at 2 retries via an iteration counter in state
-- human_gate uses LangGraph interrupt() and resumes only after user submits approved changes
-- All three doc types (CV/SOP/COVER_LETTER) share the same nodes after routing; 
-  doc_type in state parameterizes behavior inside each node
-
-
----
 
 ## Auto-Apply Workflow
 
@@ -225,21 +389,34 @@ Key columns for the workflow:
 ### Agent responsibilities
 
 **Opportunity Intelligence Agent** (load_opportunity.py, discover_apply_url.py, 
-scrape_application_page.py, evaluate_scrape.py, determine_requirements.py)
+scrape_application_page.py, evaluate_scrape.py, extract_form_fields.py, 
+determine_requirements.py)
 Loads the opportunity record from the correct DB table based on opportunity_type 
 (short-circuits when the backend adapter has pre-loaded `opportunity_data`).
 For jobs only: discovers the real apply URL via `discover_apply_url` (Brave 
 search through ATS / company-careers / generic tiers, with multi-factor 
-verification — see Discovery v2 below), then scrapes the application page 
-using the verified content from discovery (no double-fetch). Evaluates scrape 
-quality as full, partial, or failed and normalizes scraped content into a 
-structured requirements list.
-For programs and scholarships: skips scraping entirely and parses requirements 
-directly from the data json field in the DB record.
+verification — see Discovery v2 below). Discovery also resolves the 
+apply-form URL via per-ATS rules (Ashby `<overview>/application`, Lever 
+`<overview>/apply`, SmartRecruiters `<overview>/apply`, Greenhouse / Workable 
+same URL, Workday returns `None` for the auth wall) and stores it in 
+`state['discovered_form_url']`. Scrapes the application page using the 
+verified content from discovery (no double-fetch). Evaluates scrape quality 
+as full, partial, or failed and normalizes scraped content into a structured 
+requirements list. Then `extract_form_fields` parses the rendered form HTML 
+into a list of `FormField` records (label, field_type, name, required, 
+options, accepts_file, expected_source) so a future auto-submit step has a 
+complete map of every input on the form. Field extraction follows a 3-tier 
+strategy: in-state HTML from discovery → forced browser fetch via Crawl4AI 
+(for company-direct careers pages with client-side hydrated forms) → ATS 
+iframe-follow (for `mongodb.com/careers/<id>` style pages that embed a 
+third-party Greenhouse/Lever/etc. form via cross-origin iframe).
+For programs and scholarships: skips scraping AND form-field extraction 
+entirely and parses requirements directly from the data json field in the 
+DB record.
 If scraping fails or is partial, falls back to assumed default requirements based 
 on opportunity type. Never blocks on a failed scrape.
-Stores scrape_status and scrape_confidence in state so downstream agents and the 
-user are aware of whether requirements are real or assumed.
+Stores scrape_status, scrape_confidence, and form_fields in state so downstream 
+agents and the user are aware of whether requirements are real or assumed.
 
 **Applicant Eligibility and Readiness Agent** (eligibility_and_readiness.py)
 Hard-blocks ONLY for: deadline passed, missing user-supplied (non-generatable) 
@@ -307,15 +484,16 @@ START
 → load_opportunity (receive opportunity_type + id from frontend, query correct table;
                     short-circuits when backend pre-loaded opportunity_data)
 if opportunity_type == job:
-→ discover_apply_url (3-tier Brave search → verified URL + content)
+→ discover_apply_url (3-tier Brave search → verified URL + raw_html + per-ATS form_url)
 → scrape_application_page (uses pre-fetched discovery content; falls back to fresh httpx)
 → evaluate_scrape (assess quality: full | partial | failed)
+→ extract_form_fields (LLM → FormSchema; 3-tier: in-state HTML → forced browser → ATS iframe-follow)
 → determine_requirements (full → use scraped, partial → merge with defaults, failed → defaults)
 if opportunity_type == masters or phd:
-→ skip scraping
+→ skip scraping AND form-field extraction
 → determine_requirements (parse from data json; assume [CV, SOP] as baseline)
 if opportunity_type == scholarship:
-→ skip scraping
+→ skip scraping AND form-field extraction
 → determine_requirements (parse from data json; assume [CV, Cover Letter] as baseline)
 → eligibility_and_readiness
 → ineligible: end_with_explanation → END
@@ -338,16 +516,22 @@ Key orchestration rules:
 - Discovery is only attempted for job opportunities (skipped for internal jobs and 
   non-job types). Cache hits (cross-user, 14-day staleness) skip the search.
 - Verified content from discovery is propagated through state to scrape_application_page 
-  to avoid double-fetching the same URL.
-- Never block the workflow on a failed scrape, always degrade to assumed requirements
-- Store scrape_status and scrape_confidence in state throughout so the user is 
-  always informed whether requirements were scraped or assumed
+  to avoid double-fetching the same URL. `discovered_page_content` (markdown for 
+  the browser path / HTML for httpx) feeds prose extraction; 
+  `discovered_raw_html` (always actual HTML) feeds form-field extraction.
+- Form-field extraction is job-only and short-circuits internally on error / no 
+  resolved form URL — `discovered_form_url=None` (Workday auth wall, etc.) yields 
+  `form_fields=[]` and the graph proceeds normally.
+- Never block the workflow on a failed scrape or empty form_fields, always degrade 
+  to assumed requirements / empty field list
+- Store scrape_status, scrape_confidence, and form_fields in state throughout so 
+  the user is always informed whether requirements were scraped or assumed
 - Internal vs external is determined by employer_id in linkedin_jobs, not site column
 - human_gate_0 is conditional and only triggered when eligibility check finds 
   missing user-supplied documents or required profile fields
 - For now internal submission only requires CV and Cover Letter fields
 - All three opportunity types share the same pipeline after determine_requirements; 
-  only the scraping step and the final routing differ
+  only the scraping + form-field-extraction steps and the final routing differ
 
 ### Assumed default requirements by opportunity type
 
@@ -366,9 +550,23 @@ Define in workflows/auto_apply/state.py:
 - profile_snapshot: dict (injected by backend adapter; replaces _get_stub_profile lookups)
 - discovered_apply_url, discovery_method, discovery_confidence: discovery output
 - discovered_page_content, discovered_http_status: verified content propagated to scrape
+  (`discovered_page_content` = markdown for browser / HTML for httpx — feeds prose extraction)
+- discovered_raw_html: actual HTML always (httpx response body or browser-rendered DOM
+  after JS hydration); separate from discovered_page_content because the browser path's
+  text is markdown but form extraction needs real `<input>/<select>/<textarea>` tags
+- discovered_form_url: Optional[str] — apply-form URL from per-ATS rules
+  (`tools/ats_form_urls.py`). Equals discovered_apply_url for ATSes that keep the form
+  on the same URL (Greenhouse, Workable, company-direct careers); differs for split-URL
+  ATSes (Ashby `/application`, Lever `/apply`, SmartRecruiters `/apply`); None for
+  Workday auth wall and when no apply URL was found.
 - posting_closed: bool (true when discovery found a real listing that says the
   posting is closed; surfaced in handoff package)
-- scraped_requirements: dict (status, requirements list, confidence, source)
+- scraped_requirements: dict (status, requirements list, confidence, source, raw_content,
+  raw_html, http_status; `evaluate_scrape` rewrites this dict — top-level
+  `discovered_raw_html` is the durable source for form extraction)
+- form_fields: List[Dict] — one FormField dict per visible <input>/<select>/<textarea>
+  on the application form. Empty list when discovery couldn't reach the form or no LLM
+  is configured. Surfaced in `application_package.form_fields` for future auto-submit.
 - normalized_requirements: list (final requirements list after scrape or assumption)
 - gate_0_iteration_count: int (caps the eligibility re-check loop after gate 0)
 - compatibility_warnings: List[str] (non-blocking warnings)
@@ -384,6 +582,127 @@ Define in workflows/auto_apply/state.py:
 - application_record: dict (logged outcome, includes scrape_status and scrape_confidence for jobs)
 - current_step, step_history: frontend progress tracking
 - result: dict (status, error_code, user_message)
+
+### Form-field extraction (Phase 2 of auto-submit foundation)
+
+`extract_form_fields` runs after `evaluate_scrape` and before 
+`determine_requirements` for jobs only. Captures every input on the rendered 
+application form as a structured `FormField` record so a future auto-submit 
+node can fill the form without re-extracting structure. Output is surfaced 
+in the handoff package today (`application_package.form_fields`) but no 
+node consumes it yet.
+
+**Modules**:
+- `tools/ats_form_urls.py:resolve_application_form_url(overview_url)` — per-ATS 
+  rules that map an overview URL to the apply-form URL. Returns the original 
+  URL for ATSes that keep the form on the same page; appends `/application` 
+  (Ashby), `/apply` (Lever, SmartRecruiters); returns `None` for Workday 
+  (auth wall) and unknown / malformed inputs.
+- `tools/form_extractor.py`:
+  - `extract_form_html(html)` — Strategy 1: pick the `<form>` element with 
+    the most `<input>/<select>/<textarea>` descendants (Greenhouse, Lever, 
+    SmartRecruiters, anything that uses native form markup). Strategy 2 
+    fallback: when no `<form>` exists (Ashby, modern Workday, other 
+    React-driven ATSes that put inputs in plain `<div>`s and submit via 
+    fetch), return the body with `<script>/<style>/<meta>/<link>/<noscript>` 
+    and hidden inputs stripped. Empty string when neither yields inputs.
+  - `extract_ats_iframe_src(html)` — finds the src of the first iframe 
+    pointing at a known ATS host (`_ATS_IFRAME_HOSTS`: greenhouse.io, 
+    lever.co, ashbyhq.com, workable.com, smartrecruiters.com, 
+    myworkdayjobs.com, bamboohr.com, jobvite.com, recruitee.com). Used to 
+    follow company-direct careers pages that embed third-party ATS forms 
+    via cross-origin iframe (mongodb.com → boards.greenhouse.io/embed/...). 
+    Cross-origin iframes can't be parsed in-place — caller fetches the src 
+    directly.
+- `tools/web_fetcher.force_browser_fetch(url)` — bypasses the thin gate to 
+  render a URL with Crawl4AI/Playwright regardless of httpx's verdict. Used 
+  for company-direct careers pages that return non-thin server-rendered HTML 
+  but render the form area client-side (mongodb.com/careers/<id>, Anthropic 
+  careers index, any Ashby/Workday SPA). Returns `None` when 
+  `UPPGRAD_BROWSER_SCRAPE_ENABLED=false` or crawl4ai isn't installed.
+- `_build_crawler_run_config` passes `wait_for: 'js:() => document.body.innerText.length > 1000'` 
+  so Crawl4AI defers extraction until React/SPA hydration completes. Verified 
+  live on Notion's Ashby `/application` URL: text_len went from 1 char to 7021.
+
+**FormSchema** (LLM structured output target, in `workflows/auto_apply/schemas.py`):
+- `FormSchema.fields: List[FormField]` — one entry per visible input, in document order.
+- `FormSchema.form_action: str` — form's `action` attribute (useful for direct POST).
+- `FormSchema.form_method: str` — POST/GET, defaults to POST.
+
+**FormField** (one record per input):
+- `label: str` — human-readable label from `<label>`, surrounding text, 
+  `aria-label`, or `placeholder`.
+- `field_type: FormFieldType` — see flag list below.
+- `name: str` — DOM `name` attribute, used at actual submission time. Empty 
+  when not in markup.
+- `required: bool` — true when `required` attr is set OR the label/legend 
+  ends with `*` / contains "(required)".
+- `options: List[str]` — for `select` and grouped `radio`: option labels in 
+  document order. Empty for non-choice fields.
+- `accepts_file: List[str]` — for `file` inputs only: values of the `accept` 
+  attribute split on commas (`[".pdf", ".docx"]`). Empty for non-file fields.
+- `expected_source: FormFieldValueSource` — see flag list below.
+
+**FormFieldType flags** (one per input element, in 
+`schemas.FormFieldType`):
+- `file` — file upload input. The system will populate from `user_document` 
+  (CV/Cover Letter/etc.) at auto-submit time.
+- `text` — generic single-line text input.
+- `textarea` — multi-line text. Long-form textareas are typically free-form 
+  questions classified as `user_answer`.
+- `select` — `<select>` dropdown; `options` lists every visible choice.
+- `checkbox` — single checkbox or one of a multi-select group.
+- `radio` — radio button; grouped radios share the same `name` and the LLM 
+  collapses them into one FormField with `options`.
+- `number` — `<input type="number">`.
+- `email` — `<input type="email">` (typically `expected_source=user_profile`).
+- `url` — `<input type="url">` (LinkedIn / GitHub / portfolio links).
+- `date` — `<input type="date">`.
+- `tel` — `<input type="tel">` (typically `expected_source=user_profile`).
+
+**FormFieldValueSource flags** (where the value should come from when 
+auto-filling, in `schemas.FormFieldValueSource`):
+- `user_profile` — fields whose label maps to a profile attribute (name, 
+  email, phone, country, LinkedIn URL, GitHub URL, location, work auth).
+- `user_document` — file inputs whose label suggests an uploadable document 
+  (resume/CV, cover letter, portfolio, transcript). Drawn from 
+  `tailored_documents` (output of `application_tailoring`) or stored user 
+  files (`StudentCV` etc.) at auto-submit time.
+- `user_answer` — free-form questions like "Why do you want to join us?" 
+  textareas, screening multiple-choice. Will be LLM-drafted at auto-submit 
+  time from profile + opportunity + the question prompt.
+- `computed` — fields the system can derive without the user (today's 
+  date, etc.).
+- `unknown` — none of the above clearly apply; LLM couldn't classify. 
+  Auto-submit will surface these to the user for manual entry.
+
+**ScrapeStatus flag** (existing, on `scraped_requirements.status`):
+- `full` — scrape returned a structured requirements list with high confidence.
+- `partial` — scrape returned content but couldn't extract structured 
+  requirements; fall back to type-defaults merged with what we have.
+- `failed` — scrape couldn't fetch / page was thin; fall back to 
+  type-defaults entirely.
+
+**Discovery method flag** (on `discovery_method` / `DiscoveryResult.method`):
+- `url_direct` — `linkedin_jobs.url_direct` was populated; no search needed.
+- `ats` — Tier 1 search hit, verified via slug + corroborators.
+- `careers` — Tier 2 search hit (`site:<company-domain>`), verified.
+- `generic` — Tier 3 search hit (`"<title>" "<company>" apply`), verified.
+- `closed` — A page verified on title + company but contains 
+  closed-posting phrases ("no longer accepting applications" etc.). Surfaced 
+  in handoff package as a warning instead of skipped silently.
+- `failed` — No tier produced a verified hit.
+- `skipped_internal` — Internal job (employer_id == 1); no external apply URL needed.
+
+**FetchResult flags** (`tools/web_fetcher.py:FetchResult`):
+- `success: bool` — HTTP 2xx (or browser equivalent).
+- `thin: bool` — anti-bot wall, JS shell, short body, or 4xx; gates browser 
+  escalation in `fetch_url_with_fallback`.
+- `text: str` — best-effort readable content (httpx: HTML; browser: markdown).
+- `raw_html: str` — actual HTML (httpx: response body; browser: result.html 
+  raw rendered DOM after JS hydration). Used by form-field extraction.
+- `http_status: int` / `final_url: str` / `error: str` / `thin_signals: List[str]`.
+- `used_browser: bool` — true when escalated to Playwright/Crawl4AI.
 
 ### Future work — agentic-side roadmap
 
@@ -401,10 +720,13 @@ This makes asset mapping cleaner since it works with a confirmed set of assets.
 **External application form submission**
 For external job opportunities where discovery succeeded with high confidence, 
 attempt to automatically fill and submit the application form using browser 
-automation (Playwright or equivalent). This requires handling multi-step forms, 
-file upload fields, and graceful fallback when anti-bot mechanisms are 
-encountered. Scrape confidence and scraped field structure are already stored 
-in the application record to make this step easier to add later.
+automation (Playwright or equivalent). The structured `form_fields` list 
+(from `extract_form_fields`) is already captured per session and surfaced in 
+`application_package.form_fields`, so the auto-submit node can map values via 
+`expected_source` (user_profile → Student row, user_document → tailored doc, 
+user_answer → LLM-drafted, computed → derived). This step still has to handle 
+multi-step forms, file upload fields, captcha presence detection, and 
+graceful fallback to handoff when anti-bot mechanisms are encountered.
 
 ---
 
@@ -437,15 +759,19 @@ tested across CV/SOP/Cover Letter, bug audit completed.
   `current_step="parallel_analysis"` on its successful return so the frontend 
   has a meaningful indicator during the fan-out.
 
-**Auto-Apply Workflow** — all 15 nodes wired end-to-end, smoke tested across 
+**Auto-Apply Workflow** — all 16 nodes wired end-to-end, smoke tested across 
 job/masters/phd/scholarship, routing verified at every conditional edge.
 - Opportunity Intelligence: load_opportunity (short-circuits on pre-loaded 
   opportunity_data, falls back to in-repo stubs in CLI), discover_apply_url 
-  (Brave + 3-tier search + multi-factor verification), 
+  (Brave + 3-tier search + multi-factor verification + per-ATS form URL 
+  resolution + raw_html propagation), 
   scrape_application_page (consumes pre-fetched discovery content; falls back 
-  to fresh httpx fetch via the tiered fetcher), evaluate_scrape (LLM structured 
-  output + heuristic fallback), determine_requirements (scrape → parse data 
-  json → assumed defaults).
+  to fresh httpx fetch via the tiered fetcher; surfaces raw_html alongside 
+  raw_content), evaluate_scrape (LLM structured output + heuristic fallback), 
+  extract_form_fields (LLM with FormSchema structured output; 3-tier 
+  in-state-HTML → forced-browser → ATS-iframe-follow strategy; LLM-only — no 
+  useful heuristic fallback so emits empty list when LLM unavailable), 
+  determine_requirements (scrape → parse data json → assumed defaults).
 - Eligibility: eligibility_and_readiness (deadline + missing user-supplied 
   docs hard-block; compatibility issues are non-blocking warnings); 
   end_with_explanation; human_gate_0 (real `interrupt()` cycle with iteration 
@@ -462,11 +788,12 @@ job/masters/phd/scholarship, routing verified at every conditional edge.
   per-document feedback).
 - Submission: submit_internal records intent only (backend ORM writes the 
   Application row); package_and_handoff (assembles package with scrape 
-  provenance, compatibility warnings, posting_closed flag for jobs); 
-  record_application (logs outcome, timestamp, doc types, scrape metadata).
+  provenance, compatibility warnings, posting_closed flag, form_fields, and 
+  opportunity.form_url for jobs); record_application (logs outcome, 
+  timestamp, doc types, scrape metadata).
 - graph.py fully wired end-to-end; run.py CLI entry point with `--thread-id`.
 - Frontend progress tracking: `current_step` and `step_history` on 
-  AutoApplyState; all 15 nodes set both fields. Auto-apply has no parallel 
+  AutoApplyState; all 16 nodes set both fields. Auto-apply has no parallel 
   fan-out so no `parallel_analysis` sentinel is needed.
 - Cancel support: `workflows/auto_apply/control.py:cancel_session(thread_id, 
   checkpointer)` injects a CANCELLED marker into the live checkpoint via 
@@ -571,8 +898,21 @@ discovery pipeline + a tiered fetcher. Lives entirely in `tools/`.
   Playwright/Crawl4AI fallback when (a) httpx is thin AND (b) 
   `UPPGRAD_BROWSER_SCRAPE_ENABLED=true`. Crawl4AI is lazy-imported and no-ops 
   gracefully when not installed. `_detect_thin` flags 4xx, short bodies, and 
-  ≥2 anti-bot keywords.
-- `url_discovery.py` — Multi-factor verification + 3-tier orchestration.
+  ≥2 anti-bot keywords. `FetchResult.raw_html` carries actual HTML for both 
+  paths (httpx response body / browser-rendered DOM) so form extraction can 
+  read real DOM tags. `force_browser_fetch(url)` bypasses the thin gate when 
+  the caller knows it needs JS-rendered content (form area on a non-thin 
+  server-rendered page).
+- `url_discovery.py` — Multi-factor verification + 3-tier orchestration. 
+  `DiscoveryResult` now also carries `raw_html`, `form_url` (resolved by 
+  `ats_form_urls`), and `posting_closed`.
+- `ats_form_urls.py` — Per-ATS rules to map an overview URL to the apply-form 
+  URL. Ashby `/application`, Lever `/apply`, SmartRecruiters `/apply`, 
+  Greenhouse / Workable / company-direct return as-is, Workday returns 
+  `None`. Used at every `DiscoveryResult` construction site.
+- `form_extractor.py` — Pulls the form area out of rendered HTML; cleans 
+  `<script>/<style>/<meta>/<link>/<noscript>` and hidden inputs; supports 
+  cross-origin ATS-iframe follow (`extract_ats_iframe_src`).
 
 **Verification gates** (informed by live testing — see Live verification below):
 - Title fuzzy match ≥85 (hard prerequisite).
@@ -593,14 +933,18 @@ discovery pipeline + a tiered fetcher. Lives entirely in `tools/`.
   blocklist saves wasted Brave calls.
 - Tier 3 generic: `"<title>" "<company>" apply` (no `site:` constraint).
 
-**Single-fetch architecture**: `DiscoveryResult.text` carries verified content 
-forward via `state['discovered_page_content']`; `scrape_application_page` 
-consumes it instead of re-fetching the same URL. Halves the request count and 
-reduces ban risk.
+**Single-fetch architecture**: `DiscoveryResult.text` and `.raw_html` carry 
+verified content forward via `state['discovered_page_content']` and 
+`state['discovered_raw_html']`; `scrape_application_page` consumes the prose 
+content instead of re-fetching the same URL, and `extract_form_fields` 
+consumes the raw HTML for form parsing. Halves the request count and reduces 
+ban risk.
 
-**Graph wiring**: `discover_apply_url` node sits between `load_opportunity` 
-and `scrape_application_page` for jobs (skipped for internal jobs and non-job 
-opportunity types). Cache-hit short-circuit honored.
+**Graph wiring**: `discover_apply_url` → `scrape_application_page` → 
+`evaluate_scrape` → `extract_form_fields` → `determine_requirements` for jobs 
+(extract_form_fields skipped via internal short-circuit when 
+`opportunity_type != 'job'` or `discovered_form_url` is None). Cache-hit 
+short-circuit honored at the discovery node.
 
 **Live verification** (Neon dev, real Brave + OpenAI, cross-checked against source data):
 
@@ -681,6 +1025,31 @@ the backend integration and Discovery v2 work. Kept here only as a pointer.
 - **Stub DB calls in 4 nodes** — All four (`load_opportunity` + the three 
   profile-using nodes) are now backend-injection aware via `resolve_profile()` 
   / `opportunity_data` pre-load.
+
+**Form-field extraction (auto-submit Phase 2 foundation)**
+- **Apply-form URL resolution** — `tools/ats_form_urls.py` ships per-ATS 
+  rules so split-URL ATSes (Ashby `/application`, Lever `/apply`, 
+  SmartRecruiters `/apply`) are followed correctly; Workday returns None to 
+  signal the auth wall is unreachable. Wired at every `DiscoveryResult` 
+  construction site. State carries the result via `discovered_form_url`.
+- **Raw HTML propagation** — `FetchResult.raw_html` populated for httpx 
+  (response body) and browser (rendered DOM after JS hydration); 
+  `discovered_raw_html` carried at the top level of state so it survives 
+  `evaluate_scrape` rewriting `scraped_requirements`.
+- **`force_browser_fetch`** — Bypasses the thin gate for callers that know 
+  they need JS-rendered content (company-direct careers pages with 
+  client-side hydrated forms; non-thin server HTML where the form area is 
+  React-rendered).
+- **`extract_form_fields` node** — Wired between `evaluate_scrape` and 
+  `determine_requirements`. LLM with `FormSchema` structured output. Three 
+  tiers: in-state HTML → forced browser fetch → ATS iframe-follow 
+  (mongodb.com → Greenhouse pattern). Surfaces `form_fields` in 
+  `application_package.form_fields` for future auto-submit.
+- **JS hydration wait condition** — `_build_crawler_run_config` passes 
+  `wait_for: 'js:() => document.body && document.body.innerText.length > 1000'` 
+  so Crawl4AI defers extraction until React/SPA hydration completes. 
+  Verified live on Notion's Ashby `/application`: text_len went from 1 char 
+  to 7021.
 
 ### Still open
 
@@ -763,7 +1132,26 @@ the backend integration and Discovery v2 work. Kept here only as a pointer.
   edit instructions would let the user iterate without starting fresh.
 - **External form auto-submission** — Browser automation / Playwright path 
   for external jobs where discovery succeeded with high confidence. Would 
-  create real `Application` rows for external jobs too.
+  create real `Application` rows for external jobs too. Foundation is in 
+  place: `extract_form_fields` already captures the structured 
+  `form_fields` list with `expected_source` classification per input; 
+  the missing piece is a `submit_external` node that drives a Playwright 
+  page through the form and a gate-2 split between "approve and submit" 
+  vs "approve and handoff".
+- **Crawl4AI → direct Playwright consolidation** — Crawl4AI's value today 
+  is HTML→markdown + JS hydration wait; both are ~30 lines of native 
+  Playwright once auto-submit makes Playwright a committed dependency. 
+  The auto-submit work is the natural moment to migrate, and unblocks 
+  iframe-embedded ATS forms (MongoDB → Greenhouse, others) where 
+  `page.frame_locator("#grnhse_iframe")` traverses cross-origin iframes 
+  natively. Crawl4AI cannot capture late-injected iframes in its 
+  rendering window (verified live with 30s `wait_for` timeout on 
+  `#grnhse_iframe`).
+- **`expected_source` classification quality** — Live tests showed noise: 
+  Anthropic's `Country` got `unknown`, Notion's `Location` got 
+  `user_profile` despite being free-text. The 
+  `extract_form_fields._SYSTEM` prompt needs few-shot examples to tighten 
+  before auto-fill is reliable.
 - **Email handoff delivery** — Currently handoff is in-app only.
 - **Per-session LLM cost budgeting** — Worst-case ~15-20 LLM calls per session; 
   no token cap today.

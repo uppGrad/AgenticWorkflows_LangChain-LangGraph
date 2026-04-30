@@ -1,51 +1,59 @@
+"""Gate 2 (Step 7 rewrite).
+
+Surfaces previews of tailored documents AND tailored answers, evaluation
+warnings, posting_closed, and a freshly-recomputed auto_submit_feasible
+flag. Resume value adds `attempt_auto_submit` (intent only — auto-submit
+itself is not implemented yet).
+"""
 from __future__ import annotations
 
-from typing import Any, Dict
+import logging
+from typing import Any, Dict, List
 
 from langgraph.types import interrupt
 
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
-# ---------------------------------------------------------------------------
-# Resume value contract
-#
-# When the graph is resumed the caller must pass Command(resume=approval)
-# where `approval` is:
-#
-#   {
-#       "approved": true,              # required — true to proceed, false to cancel
-#       "feedback": {                  # optional per-document comments
-#           "CV": "Looks great",
-#           "Cover Letter": "Make it more formal",
-#       }
-#   }
-#
-# - IMPORTANT: always send a non-empty dict — LangGraph treats falsy resume values
-#   (None, empty dict, empty string) as "no resume" and will re-interrupt the node.
-# - approved=true proceeds to route_by_source → submission or handoff.
-# - approved=false cancels the workflow gracefully; no documents are submitted.
-# - feedback is stored in human_review_2 for audit purposes.
-#
-# Interrupt payload (what the frontend receives):
-#
-#   {
-#       "tailored_documents": {
-#           "CV": {
-#               "id": 0,
-#               "content_preview": "...(first 400 chars)...",
-#               "tailoring_depth": "light",
-#               "llm_used": false,
-#               "char_count": 838
-#           },
-#           ...
-#       },
-#       "evaluation_result": {passed, issues, iteration},
-#       "opportunity_title": "Software Engineer at Acme Corp",
-#       "opportunity_type": "job",
-#   }
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
 
 _PREVIEW_CHARS = 400
+
+
+def _compute_auto_submit_feasible(
+    requirement_items: List[Dict[str, Any]],
+    requirements: Dict[str, Dict[str, Any]],
+    tailored_documents: Dict[str, Any],
+    tailored_answers: Dict[str, Any],
+) -> bool:
+    """False when any required document's auto-generation produced no
+    content, OR any required upload is missing, OR any required text
+    answer is empty.
+    """
+    for item in requirement_items:
+        if not item.get("required"):
+            continue
+        if item.get("category") == "misc":
+            continue
+
+        idx_str = str(item["id"])
+        choice_entry = requirements.get(idx_str) or {}
+        choice = choice_entry.get("choice")
+
+        if choice not in {"upload", "auto_generate"}:
+            return False
+
+        if item.get("category") == "document":
+            doc_type = item.get("document_type") or item.get("label") or ""
+            info = tailored_documents.get(doc_type) or {}
+            if not (info.get("content") or "").strip():
+                return False
+        elif item.get("category") == "text":
+            ffi = item.get("form_field_index")
+            key = str(ffi) if ffi is not None else idx_str
+            info = tailored_answers.get(key) or {}
+            if not (info.get("content") or "").strip():
+                return False
+    return True
 
 
 def human_gate_2(state: AutoApplyState) -> dict:
@@ -54,6 +62,11 @@ def human_gate_2(state: AutoApplyState) -> dict:
         return updates
 
     tailored_documents: Dict[str, Any] = state.get("tailored_documents") or {}
+    tailored_answers: Dict[str, Any] = state.get("tailored_answers") or {}
+    requirement_items: List[Dict[str, Any]] = list(state.get("requirement_items") or [])
+    human_review_1 = state.get("human_review_1") or {}
+    requirements: Dict[str, Dict[str, Any]] = human_review_1.get("requirements") or {}
+
     opportunity_data = state.get("opportunity_data") or {}
     opportunity_type = state.get("opportunity_type", "")
     evaluation_result = state.get("evaluation_result") or {}
@@ -67,7 +80,7 @@ def human_gate_2(state: AutoApplyState) -> dict:
     )
     opportunity_title = f"{title} at {company}" if company else title
 
-    # Build previews for the frontend — expose first 400 chars of each document
+    # Document previews
     doc_previews: Dict[str, Any] = {}
     for idx, (doc_type, info) in enumerate(tailored_documents.items()):
         content = info.get("content") or ""
@@ -75,37 +88,54 @@ def human_gate_2(state: AutoApplyState) -> dict:
             "id": idx,
             "content_preview": content[:_PREVIEW_CHARS],
             "tailoring_depth": info.get("tailoring_depth", ""),
+            "source": info.get("source", ""),
             "llm_used": info.get("llm_used", False),
+            "passes": info.get("passes", 0),
             "char_count": len(content),
         }
 
-    # -----------------------------------------------------------------------
-    # Suspend. Resumes via Command(resume=approval).
-    # -----------------------------------------------------------------------
-    approval: Dict[str, Any] = interrupt(
+    # Text-answer previews
+    answer_previews: Dict[str, Any] = {}
+    for key, info in tailored_answers.items():
+        content = info.get("content") or ""
+        answer_previews[key] = {
+            "question": info.get("question", ""),
+            "form_field_index": info.get("form_field_index"),
+            "content_preview": content[:_PREVIEW_CHARS],
+            "char_count": len(content),
+            "llm_used": info.get("llm_used", False),
+        }
+
+    auto_submit_feasible = _compute_auto_submit_feasible(
+        requirement_items, requirements, tailored_documents, tailored_answers,
+    )
+
+    payload = interrupt(
         {
             "tailored_documents": doc_previews,
-            "evaluation_result": evaluation_result,
+            "tailored_answers": answer_previews,
+            "evaluation_warnings": list(evaluation_result.get("warnings") or []),
+            "posting_closed": bool(state.get("posting_closed")),
+            "auto_submit_feasible": auto_submit_feasible,
             "opportunity_title": opportunity_title,
             "opportunity_type": opportunity_type,
         }
     )
 
-    # -----------------------------------------------------------------------
-    # Validate and normalise the resume value
-    # -----------------------------------------------------------------------
-    if not isinstance(approval, dict):
-        approval = {}
+    if not isinstance(payload, dict):
+        payload = {}
 
-    approved: bool = bool(approval.get("approved", False))
-    feedback: Dict[str, str] = {
-        k: str(v) for k, v in (approval.get("feedback") or {}).items()
-    }
+    approved: bool = bool(payload.get("approved", False))
+    attempt_auto_submit: bool = bool(payload.get("attempt_auto_submit", False))
+    feedback: Dict[str, Any] = payload.get("feedback") or {}
+    if not isinstance(feedback, dict):
+        feedback = {}
 
     return {
         **updates,
         "human_review_2": {
             "approved": approved,
+            "attempt_auto_submit": attempt_auto_submit,
             "feedback": feedback,
         },
     }
