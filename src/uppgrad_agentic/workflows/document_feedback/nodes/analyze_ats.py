@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.common.prompt_context import format_profile_brief, format_user_focus
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +134,9 @@ Assess:
 Focus on machine-parseability, not subjective quality.
 When an opportunity description is provided, focus keyword analysis on keywords
 relevant to THAT SPECIFIC role/opportunity, not generic tech keywords.
+If an "Applicant profile" block is provided, treat its skills/target-role list as the
+ground truth for what the CV could legitimately be claiming — never invent skills not present.
+If a "User focus" block is provided (e.g. target role), prioritise keywords that serve it.
 """
 
 _MAX_CHARS = 6000
@@ -171,10 +175,19 @@ def analyze_ats(context_pack: dict) -> dict:
             "opportunity, not generic tech keywords."
         )
 
+    user_focus = format_user_focus(context_pack.get("parsed_instructions"))
+    profile_brief = format_profile_brief(context_pack.get("profile_snapshot"))
+
+    body = f"CV text (truncated):\n{doc_text}{opp_section}"
+    if user_focus:
+        body += f"\n\n{user_focus}"
+    if profile_brief:
+        body += f"\n\n{profile_brief}"
+
     structured = llm.with_structured_output(ATSAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(content=f"CV text (truncated):\n{doc_text}{opp_section}"),
+        HumanMessage(content=body),
     ]
 
     try:
