@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.common.prompt_context import format_profile_brief, format_user_focus
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +124,11 @@ Identify:
 - recommendations: concrete, actionable suggestions to fill each gap
 
 Be specific. Reference actual profile details (skills, roles, companies) when pointing out gaps.
+Never invent profile details not present in the "Applicant profile" block.
+If a "User focus" block is provided, prioritise gaps and recommendations that serve those goals.
 """
 
 _MAX_DOC_CHARS = 5000
-_MAX_PROFILE_CHARS = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -145,18 +147,24 @@ def analyze_content_gaps(context_pack: dict) -> dict:
         return {**updates, "analysis_results": {"content_gaps": result.model_dump()}}
 
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
-    profile_text = str(profile_snapshot)[:_MAX_PROFILE_CHARS]
+    user_focus = format_user_focus(context_pack.get("parsed_instructions"))
+    profile_brief = format_profile_brief(profile_snapshot)
+    # Fall back to a raw dump if formatting yielded nothing — content_gaps
+    # depends on profile data being visible to the LLM.
+    if not profile_brief and profile_snapshot:
+        profile_brief = "Applicant profile:\n" + str(profile_snapshot)[:1500]
+
+    body = f"Document type: {doc_type}\n\n"
+    if profile_brief:
+        body += f"{profile_brief}\n\n"
+    body += f"Document text (truncated):\n{doc_text}"
+    if user_focus:
+        body += f"\n\n{user_focus}"
 
     structured = llm.with_structured_output(ContentGapsAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(
-            content=(
-                f"Document type: {doc_type}\n\n"
-                f"User profile:\n{profile_text}\n\n"
-                f"Document text (truncated):\n{doc_text}"
-            )
-        ),
+        HumanMessage(content=body),
     ]
 
     try:

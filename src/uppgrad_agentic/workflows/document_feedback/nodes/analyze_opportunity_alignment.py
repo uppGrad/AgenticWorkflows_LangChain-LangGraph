@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.common.prompt_context import format_profile_brief, format_user_focus
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,9 @@ Assess:
 - recommendations: specific actions to improve alignment
 
 Be precise — quote requirement text and keyword text directly from the opportunity where possible.
+If an "Applicant profile" block is provided, ground recommendations in its skills/experience
+rather than inventing capabilities the applicant has not demonstrated.
+If a "User focus" block is provided, prioritise alignment moves that serve those goals.
 """
 
 _MAX_DOC_CHARS = 5000
@@ -158,16 +162,23 @@ def analyze_opportunity_alignment(context_pack: dict) -> dict:
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
     opp_text = str(opportunity_context)[:_MAX_OPP_CHARS]
 
+    user_focus = format_user_focus(context_pack.get("parsed_instructions"))
+    profile_brief = format_profile_brief(context_pack.get("profile_snapshot"))
+
+    body = (
+        f"Document type: {doc_type}\n\n"
+        f"Opportunity details:\n{opp_text}\n\n"
+        f"Document text (truncated):\n{doc_text}"
+    )
+    if profile_brief:
+        body += f"\n\n{profile_brief}"
+    if user_focus:
+        body += f"\n\n{user_focus}"
+
     structured = llm.with_structured_output(OpportunityAlignmentAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(
-            content=(
-                f"Document type: {doc_type}\n\n"
-                f"Opportunity details:\n{opp_text}\n\n"
-                f"Document text (truncated):\n{doc_text}"
-            )
-        ),
+        HumanMessage(content=body),
     ]
 
     try:
