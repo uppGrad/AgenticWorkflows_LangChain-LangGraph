@@ -377,3 +377,74 @@ def test_no_requirement_items_disables_misc_rule():
     plans = compute_form_values(fields, _PROFILE, {}, {})  # no kwargs
     assert plans[0].status == "filled"
     assert plans[0].source == "user_profile"
+
+
+# ─── Gate-2 clarifying-question per-field answers ───────────────────────────
+
+def test_gate_2_user_answer_wins_over_mock():
+    """User typed an answer at gate 2 → use it; do NOT fall through to
+    profile lookup, tailored_answers, or mock placeholder."""
+    fields = [_f(label="Visa sponsorship?", field_type="text")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        human_review_2={"field_answers": {"0": {"answer": "No"}}},
+    )
+    assert plans[0].status == "filled"
+    assert plans[0].source == "user_answer"
+    assert plans[0].value == "No"
+    assert plans[0].reason == "gate_2_user_answer"
+
+
+def test_gate_2_user_answer_wins_over_profile_lookup():
+    """If user explicitly answered, it wins even when profile_lookup would
+    have matched (e.g. user wants different value than their profile)."""
+    fields = [_f(label="Email", field_type="email")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        human_review_2={"field_answers": {"0": {"answer": "alt@example.com"}}},
+    )
+    assert plans[0].value == "alt@example.com"
+    assert plans[0].source == "user_answer"
+
+
+def test_gate_2_skip_choice_emits_user_skipped():
+    fields = [_f(label="Veteran Status", field_type="text")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        human_review_2={"field_answers": {"0": {"choice": "skip"}}},
+    )
+    assert plans[0].status == "skipped"
+    assert plans[0].source == "user_skipped"
+    assert "gate_2_choice=skip" in plans[0].reason
+
+
+def test_gate_2_ignore_for_now_choice_emits_user_skipped():
+    """Per-field ignore_for_now at gate 2 still skips the field; the
+    session-level kill-switch is the adapter's concern, not the planner's."""
+    fields = [_f(label="Visa sponsorship?", field_type="text", required=True)]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        human_review_2={"field_answers": {"0": {"choice": "ignore_for_now"}}},
+    )
+    assert plans[0].status == "skipped"
+    assert plans[0].source == "user_skipped"
+    assert "ignore_for_now" in plans[0].reason
+
+
+def test_gate_2_empty_answer_falls_through():
+    """A blank answer string shouldn't suppress downstream rules."""
+    fields = [_f(label="Email", field_type="email")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        human_review_2={"field_answers": {"0": {"answer": "   "}}},
+    )
+    # Falls through to profile_lookup
+    assert plans[0].source == "user_profile"
+    assert plans[0].value == _PROFILE["email"]
+
+
+def test_gate_2_field_answers_absent_uses_existing_rules():
+    """Backward compat: human_review_2 absent → planner unchanged."""
+    fields = [_f(label="Email", field_type="email")]
+    plans = compute_form_values(fields, _PROFILE, {}, {})
+    assert plans[0].source == "user_profile"

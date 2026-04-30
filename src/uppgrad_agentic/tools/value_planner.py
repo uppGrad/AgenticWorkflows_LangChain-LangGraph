@@ -188,6 +188,7 @@ def plan_field_value(
     field_choice: Optional[str] = None,
     is_misc: bool = False,
     misc_strategy: str = "auto_fill",
+    gate_2_field_answer: Optional[Dict[str, Any]] = None,
 ) -> FormFieldFillPlan:
     """Compute the fill plan for one FormField. Pure, no I/O."""
     # Accept dicts (DB-deserialized) and FormField pydantic models alike.
@@ -209,6 +210,27 @@ def plan_field_value(
             field=f, value="", status="skipped", source="user_skipped",
             reason=f"user_choice={field_choice}",
         )
+
+    # Rule 0a — Gate-2 clarifying-question verdict (per-form_field_index).
+    # User had a chance to provide a direct answer OR explicitly opt out
+    # for misc-bucket fields the planner couldn't safely resolve. Wins
+    # over profile lookup, tailored_answers, and option-pick rules below.
+    # The session-level kill-switch (any required+ignore_for_now → don't
+    # auto-fill at all) lives in the adapter; if we're here with such a
+    # field_answer, the per-field skip still applies.
+    if gate_2_field_answer:
+        choice = gate_2_field_answer.get("choice")
+        if choice in ("skip", "ignore_for_now"):
+            return FormFieldFillPlan(
+                field=f, value="", status="skipped", source="user_skipped",
+                reason=f"gate_2_choice={choice}",
+            )
+        answer = gate_2_field_answer.get("answer")
+        if isinstance(answer, str) and answer.strip():
+            return FormFieldFillPlan(
+                field=f, value=answer, status="filled",
+                source="user_answer", reason="gate_2_user_answer",
+            )
 
     # Rule 1 — Misc opt-out. The misc bucket collapses non-document /
     # non-text fields into one gate-1 line; `misc_strategy=ignore` means
@@ -322,17 +344,22 @@ def compute_form_values(
     tailored_answers: Optional[Dict[str, Any]] = None,
     requirement_items: Optional[List[Dict[str, Any]]] = None,
     human_review_1: Optional[Dict[str, Any]] = None,
+    human_review_2: Optional[Dict[str, Any]] = None,
 ) -> List[FormFieldFillPlan]:
     """Build the full fill plan.
 
-    Backward-compatible: if `tailored_answers`, `requirement_items`, or
-    `human_review_1` are not provided, the planner behaves as before
-    (no per-field skip / misc_strategy / tailored_answers fallback). New
-    callers (adapter `attempt_auto_fill`) should pass all three.
+    Backward-compatible: when `tailored_answers`, `requirement_items`,
+    `human_review_1`, or `human_review_2` are not provided, the planner
+    behaves as before (no per-field skip / misc_strategy / tailored_answers
+    / gate-2 user answers). New callers (adapter `attempt_auto_fill`)
+    should pass all four.
     """
     field_choice_map = _build_field_choice_map(requirement_items, human_review_1)
     non_misc_indices = _build_non_misc_index_set(requirement_items)
     misc_strategy = (human_review_1 or {}).get("misc_strategy", "auto_fill")
+    gate_2_field_answers: Dict[str, Any] = (
+        (human_review_2 or {}).get("field_answers") or {}
+    )
 
     plans: List[FormFieldFillPlan] = []
     for idx, f in enumerate(form_fields or []):
@@ -345,6 +372,7 @@ def compute_form_values(
                 field_choice=field_choice_map.get(idx),
                 is_misc=is_misc,
                 misc_strategy=misc_strategy,
+                gate_2_field_answer=gate_2_field_answers.get(str(idx)),
             )
         )
     return plans
