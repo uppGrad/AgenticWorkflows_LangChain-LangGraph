@@ -58,6 +58,28 @@ _VALID_MISC_STRATEGIES = {"auto_fill", "ignore"}
 _MAX_USER_PROMPT_LEN = 200
 
 
+# Allowed choices per (category, required) tuple. Reading the table:
+#
+#   - `skip`           = "I don't want this." Only valid for OPTIONAL fields.
+#   - `ignore_for_now` = "I'll handle this manually after handoff." Always
+#                        valid; on REQUIRED items it's the signal that the
+#                        backend's auto-fill module should NOT run for this
+#                        session — the user is in package-and-bounce mode.
+#   - `upload`         = file-side action. Not meaningful for text answers.
+#   - `auto_generate`  = LLM drafts the document/answer.
+#
+# Misc items are NOT keyed in this table — they're collapsed into a single
+# virtual line at gate 1 and routed via `misc_strategy` (auto_fill | ignore).
+# Per-id misc entries shouldn't appear in normal frontend payloads; if one
+# does, this loop's category check falls through and the entry is a no-op.
+_ALLOWED_CHOICES: Dict[tuple, set] = {
+    ("document", True):  {"upload", "auto_generate", "ignore_for_now"},
+    ("document", False): {"upload", "auto_generate", "skip", "ignore_for_now"},
+    ("text", True):      {"auto_generate", "ignore_for_now"},
+    ("text", False):     {"auto_generate", "skip", "ignore_for_now"},
+}
+
+
 def _validate_resume(
     payload: Any,
     requirement_items: List[Dict[str, Any]],
@@ -100,11 +122,19 @@ def _validate_resume(
         category = item.get("category")
         required = bool(item.get("required"))
 
+        # Semantic check: which choices are allowed for this (category, required)
+        # combination. Misc has no row here — see the table comment above.
+        allowed = _ALLOWED_CHOICES.get((category, required))
+        if allowed is not None and choice not in allowed:
+            req_label = "required" if required else "optional"
+            errors.append(
+                f"requirements[{raw_id}]: choice='{choice}' not allowed for "
+                f"{req_label} {category}"
+            )
+            continue
+
+        # Structural rules per category — separate from the choice-allowed table.
         if category == "document":
-            if required and choice in {"skip", "ignore_for_now"}:
-                errors.append(
-                    f"requirements[{raw_id}]: required document cannot be skipped or ignored"
-                )
             doc_type = item.get("document_type")
             if doc_type in _USER_SUPPLIED and choice == "auto_generate":
                 errors.append(
@@ -124,13 +154,6 @@ def _validate_resume(
                     errors.append(
                         f"requirements[{raw_id}].user_prompt exceeds {_MAX_USER_PROMPT_LEN} chars"
                     )
-        elif category == "text":
-            if required and choice == "skip":
-                errors.append(
-                    f"requirements[{raw_id}]: required text item cannot be skipped"
-                )
-        # misc items are governed by misc_strategy; per-id entries are accepted
-        # but not validated further.
 
     return errors
 
