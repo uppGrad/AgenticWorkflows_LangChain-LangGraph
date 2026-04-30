@@ -265,10 +265,17 @@ def determine_requirements(state: AutoApplyState) -> dict:
     opportunity_data = state.get("opportunity_data") or {}
 
     # ------------------------------------------------------------------
-    # Job: use scraped requirements if available, else fall back to defaults.
-    # Also tag every file-type FormField in state['form_fields'] with a
-    # canonical document type so asset_mapping / human_gate_1 can dedupe
-    # and gate auto-generate visibility.
+    # Job: form_fields (from the real DOM) is the authoritative requirement
+    # source. JD prose on the listing page is recruiter copy and is NOT
+    # used to derive requirements anymore — `evaluate_scrape` is now a
+    # status-only verifier. When form extraction yielded nothing (Workday
+    # auth wall, browser disabled, hydration timed out) we floor to
+    # _DEFAULTS["job"]; asset_mapping reads form_fields first and falls
+    # back to normalized_requirements only when form_fields is empty.
+    #
+    # Also tag every file-type FormField with a canonical document type so
+    # asset_mapping / human_gate_1 can dedupe and gate auto-generate
+    # visibility.
     # ------------------------------------------------------------------
     if opportunity_type == "job":
         # Internal-jobs short-circuit: discovery / scrape / form-fields all
@@ -279,36 +286,20 @@ def determine_requirements(state: AutoApplyState) -> dict:
             logger.info("determine_requirements: internal job — emitting [CV, Cover Letter] defaults")
             return {**updates, "normalized_requirements": [r.model_dump() for r in _DEFAULTS["job"]]}
 
-        # Canonical-type tagging on form_fields (in-place mutation captured
-        # below in the returned dict).
         form_fields = list(state.get("form_fields") or [])
         if form_fields:
             form_fields = _tag_canonical_document_types(form_fields)
             updates = {**updates, "form_fields": form_fields}
-
-        scraped = state.get("scraped_requirements") or {}
-        scraped_reqs = scraped.get("requirements") or []
-        scrape_status = scraped.get("status", "failed")
-
-        if scrape_status == "full" and scraped_reqs:
-            logger.info("determine_requirements: using fully scraped requirements (%d items)", len(scraped_reqs))
-            return {**updates, "normalized_requirements": scraped_reqs}
-
-        if scrape_status == "partial" and scraped_reqs:
-            # Merge scraped with defaults, deduplicating by document_type
-            seen_types: set[str] = {r.get("document_type", "") for r in scraped_reqs}
-            merged = list(scraped_reqs)
-            for default in _DEFAULTS["job"]:
-                if default.document_type not in seen_types:
-                    merged.append(default.model_dump())
             logger.info(
-                "determine_requirements: partial scrape — merged %d scraped + %d defaults",
-                len(scraped_reqs),
-                len(merged) - len(scraped_reqs),
+                "determine_requirements: form_fields available (%d) — they are the authoritative requirement source; "
+                "writing _DEFAULTS as fallback only",
+                len(form_fields),
             )
-            return {**updates, "normalized_requirements": merged}
+        else:
+            logger.info(
+                "determine_requirements: no form_fields — using assumed defaults for job"
+            )
 
-        logger.info("determine_requirements: scrape failed/empty — using assumed defaults for job")
         return {**updates, "normalized_requirements": [r.model_dump() for r in _DEFAULTS["job"]]}
 
     # ------------------------------------------------------------------

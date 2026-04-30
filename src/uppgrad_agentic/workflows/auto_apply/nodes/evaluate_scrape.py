@@ -1,148 +1,93 @@
+"""Evaluate the quality of the page returned by the apply-URL discovery step.
+
+This node is a STATUS-ONLY second-pass on the discovered page contents:
+confirms the page actually serves a real, open job application and not a
+broken intermediate (404, closed posting, anti-bot wall slipped past
+discovery's gates, marketing landing page, etc.).
+
+It does NOT extract requirements from the page. Form requirements come from
+`extract_form_fields` (real DOM <input>/<select>/<textarea>) — JD prose on
+a posting page is recruiter copy and is not authoritative for what the
+application form actually collects.
+"""
 from __future__ import annotations
 
 import logging
-import re
-from typing import List
 
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
-from uppgrad_agentic.workflows.auto_apply.schemas import NormalizedRequirement, ScrapeResult
+from uppgrad_agentic.workflows.auto_apply.schemas import ScrapeStatus
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
 logger = logging.getLogger(__name__)
 
 _MAX_CONTENT_FOR_LLM = 8_000
 
-# Signals that suggest the page has real application content
 _RICH_SIGNALS = [
     "apply now", "apply online", "submit application", "upload", "cv", "resume",
     "cover letter", "requirements", "qualifications", "responsibilities",
     "how to apply", "application form", "attach", "attach your",
 ]
 
-# Signals that suggest the page is mostly navigation/marketing, not an application page
 _THIN_SIGNALS = [
     "404", "page not found", "access denied", "javascript required",
     "enable javascript", "cloudflare", "robot", "captcha",
 ]
 
-_DEFAULT_JOB_REQUIREMENTS = [
-    NormalizedRequirement(
-        requirement_type="document",
-        document_type="CV",
-        is_assumed=True,
-        confidence=0.9,
-    ),
-    NormalizedRequirement(
-        requirement_type="document",
-        document_type="Cover Letter",
-        is_assumed=True,
-        confidence=0.8,
-    ),
-]
+
+class _ScrapeStatusOnly(BaseModel):
+    """Status-only LLM structured output. Requirement extraction was removed
+    on purpose — see module docstring."""
+    status: ScrapeStatus = Field(..., description="full | partial | failed")
+    confidence: float = Field(..., ge=0.0, le=1.0)
 
 
-SYSTEM = """You are assessing the quality of a scraped job application page.
+SYSTEM = """You are verifying the quality of a discovered job application page.
 
-Given the raw page text, return a JSON object with:
+Given the raw page text, classify whether the page is a real, fetchable
+application/listing page or a broken intermediate.
+
+Return a JSON object with:
 - status: "full" | "partial" | "failed"
-  - full: the page clearly shows the application form or explicit required documents list
-  - partial: some application info present but incomplete or behind a login wall
-  - failed: no useful application content (404, Cloudflare block, login-only wall, marketing page)
-- confidence: 0.0–1.0 (how confident you are in the status assessment)
-- requirements: list of objects, each with:
-    - requirement_type: "document" | "eligibility" | "language" | "other"
-    - document_type: e.g. "CV", "Cover Letter", "Portfolio", "References"
-    - is_assumed: false (these are scraped, not assumed)
-    - confidence: 0.0–1.0
+  - full:    page clearly shows a real job listing with apply affordances
+  - partial: real job content present but limited (login wall, partial render)
+  - failed:  no useful content (404, anti-bot block, marketing landing,
+             closed posting page)
+- confidence: 0.0–1.0
 
-Only include requirements you can clearly identify. If status is failed, return an empty list.
+DO NOT enumerate or extract document requirements from the page text. Form
+requirements are read from the DOM, not the marketing copy.
+
 Return raw JSON only, no markdown fences."""
 
 
-def _heuristic_evaluate(raw_content: str) -> ScrapeResult:
-    """Assess scrape quality without LLM."""
+def _heuristic_status(raw_content: str) -> _ScrapeStatusOnly:
+    """Status-only fallback when no LLM is configured."""
     text_lower = raw_content.lower()
-
     thin_hits = sum(1 for s in _THIN_SIGNALS if s in text_lower)
     rich_hits = sum(1 for s in _RICH_SIGNALS if s in text_lower)
 
     if thin_hits >= 2 or len(raw_content.strip()) < 500:
-        return ScrapeResult(
-            status="failed",
-            requirements=[],
-            confidence=0.85,
-            source="",
-        )
-
-    requirements: List[NormalizedRequirement] = []
-
-    cv_patterns = [r"\bcv\b", r"\bresume\b", r"\bcurriculum vitae\b"]
-    if any(re.search(p, text_lower) for p in cv_patterns):
-        requirements.append(
-            NormalizedRequirement(
-                requirement_type="document",
-                document_type="CV",
-                is_assumed=False,
-                confidence=0.8,
-            )
-        )
-
-    cover_patterns = [r"\bcover letter\b", r"\bcovering letter\b", r"\bmotivation letter\b"]
-    if any(re.search(p, text_lower) for p in cover_patterns):
-        requirements.append(
-            NormalizedRequirement(
-                requirement_type="document",
-                document_type="Cover Letter",
-                is_assumed=False,
-                confidence=0.8,
-            )
-        )
-
-    portfolio_patterns = [r"\bportfolio\b", r"\bwork samples?\b"]
-    if any(re.search(p, text_lower) for p in portfolio_patterns):
-        requirements.append(
-            NormalizedRequirement(
-                requirement_type="document",
-                document_type="Portfolio",
-                is_assumed=False,
-                confidence=0.7,
-            )
-        )
-
-    if rich_hits >= 3 and requirements:
-        status = "full"
-        confidence = min(0.65 + 0.05 * rich_hits, 0.85)
-    elif rich_hits >= 1 or requirements:
-        status = "partial"
-        confidence = min(0.45 + 0.05 * rich_hits, 0.70)
-    else:
-        status = "failed"
-        confidence = 0.60
-
-    return ScrapeResult(
-        status=status,
-        requirements=requirements,
-        confidence=confidence,
-        source="",
-    )
+        return _ScrapeStatusOnly(status="failed", confidence=0.85)
+    if rich_hits >= 3:
+        return _ScrapeStatusOnly(status="full", confidence=min(0.65 + 0.05 * rich_hits, 0.85))
+    if rich_hits >= 1:
+        return _ScrapeStatusOnly(status="partial", confidence=min(0.45 + 0.05 * rich_hits, 0.70))
+    return _ScrapeStatusOnly(status="failed", confidence=0.60)
 
 
-def _llm_evaluate(raw_content: str, llm) -> ScrapeResult | None:
-    """Use LLM to assess scrape quality and extract requirements."""
-    import json
-
+def _llm_status(raw_content: str, llm) -> _ScrapeStatusOnly | None:
     snippet = raw_content[:_MAX_CONTENT_FOR_LLM]
-    structured = llm.with_structured_output(ScrapeResult)
+    structured = llm.with_structured_output(_ScrapeStatusOnly)
     try:
-        result: ScrapeResult = structured.invoke([
+        return structured.invoke([
             SystemMessage(content=SYSTEM),
             HumanMessage(content=f"Page content:\n\n{snippet}"),
         ])
-        return result
     except Exception as exc:
-        logger.warning("evaluate_scrape: LLM evaluation failed — %s", exc)
+        logger.warning("evaluate_scrape: LLM status check failed — %s", exc)
         return None
 
 
@@ -151,48 +96,36 @@ def evaluate_scrape(state: AutoApplyState) -> dict:
     if state.get("result", {}).get("status") == "error":
         return updates
 
-    # Only runs for job opportunities
     if state.get("opportunity_type") != "job":
         return updates
 
-    scraped = state.get("scraped_requirements") or {}
+    scraped = dict(state.get("scraped_requirements") or {})
     source = scraped.get("source", "")
-
-    # If scraping itself already failed (no raw content), surface that result directly
-    if scraped.get("status") == "failed" and not scraped.get("raw_content"):
-        return {
-            **updates,
-            "scraped_requirements": {
-                **scraped,
-                "requirements": [r.model_dump() for r in _DEFAULT_JOB_REQUIREMENTS],
-            },
-        }
-
     raw_content = scraped.get("raw_content", "")
+
+    # Already failed upstream — don't burn an LLM call to confirm.
+    if scraped.get("status") == "failed" and not raw_content:
+        return {**updates, "scraped_requirements": scraped}
 
     llm = get_llm()
     if llm is not None:
-        result = _llm_evaluate(raw_content, llm)
-        if result is None:
-            result = _heuristic_evaluate(raw_content)
+        result = _llm_status(raw_content, llm) or _heuristic_status(raw_content)
     else:
-        result = _heuristic_evaluate(raw_content)
+        result = _heuristic_status(raw_content)
 
-    # If we got nothing useful, fall back to assumed defaults
-    if result.status == "failed" or not result.requirements:
-        requirements = _DEFAULT_JOB_REQUIREMENTS
-        logger.info(
-            "evaluate_scrape: status=%s — falling back to assumed default requirements",
-            result.status,
-        )
-    else:
-        requirements = result.requirements
+    logger.info(
+        "evaluate_scrape: source=%s status=%s confidence=%.2f",
+        source, result.status, result.confidence,
+    )
 
+    # Preserve raw_content / raw_html / http_status / source on the dict so
+    # downstream nodes (extract_form_fields fallback path, telemetry) can
+    # still see them. Only the status verdict is replaced.
     return {
         **updates,
         "scraped_requirements": {
+            **scraped,
             "status": result.status,
-            "requirements": [r.model_dump() for r in requirements],
             "confidence": result.confidence,
             "source": source,
         },

@@ -261,6 +261,29 @@ J. **Backend integration**.
 
 ---
 
+## Status — gate-1 remodel rollout
+
+- **Steps 1–7 (agentic)**: shipped on `main` (commit `e16ef9f`). All 180
+  tests green.
+- **Step 1.5 — `evaluate_scrape` prose-bug fix (agentic, this branch)**:
+  `evaluate_scrape` was extracting "requirements" from JD prose and
+  letting them flow into `asset_mapping` as a fallback when `form_fields`
+  was empty. Reduced to status-only (`status` + `confidence`); JD
+  recruiter copy can no longer surface as form requirements. Jobs path
+  in `determine_requirements` now uses `_DEFAULTS["job"]` directly when
+  `form_fields` is empty. Open questions (incl. custom-React-control
+  extraction gap) tracked in `open_questions_remodel.md`.
+- **Steps 8–9 (backend, separate PR)**: ApplicationSession schema
+  changes, gate-1 contract rewrite, gate-1 file persistence with OCR +
+  Cover Letter file convention, optional Cover Letter PDF on internal
+  submit. Tests 68/69 (1 unrelated pre-existing failure).
+- **Pre-deploy ops step (deferred)**: cancel in-flight sessions in
+  `AWAITING_PROFILE_COMPLETION` / `AWAITING_DOCUMENT_MAPPING` before
+  deploying the migration — incompatible payload shapes. No real users
+  yet so a silent management-command sweep is sufficient.
+
+---
+
 ## Commands
 
 This project uses [uv](https://github.com/astral-sh/uv) for environment and dependency management.
