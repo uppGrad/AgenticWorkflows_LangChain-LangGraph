@@ -174,6 +174,7 @@ FormFieldFillSource = Literal[
     "user_answer",        # LLM-drafted free-text answer for the question
     "computed",           # derived (e.g. today's date)
     "mock",               # placeholder used in dry-run / test mode
+    "user_skipped",       # user explicitly opted out of this field at gate 1
     "no_value",           # no value could be planned (skipped)
 ]
 
