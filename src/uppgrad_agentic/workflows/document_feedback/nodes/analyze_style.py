@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.common.prompt_context import format_profile_brief, format_user_focus
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +121,10 @@ Assess:
 - suggestions: actionable rewrites or improvements
 
 Focus on patterns, not one-off typos. Be specific about section or phrase location where helpful.
+If a "User focus" block is provided (especially tone preferences or constraints), align tone
+assessment and suggestions with it rather than applying a generic standard.
+If an "Applicant profile" block is provided, calibrate expectations to the applicant's stage
+and target — never invent details not present in it.
 """
 
 _MAX_CHARS = 6000
@@ -140,15 +145,22 @@ def analyze_style(context_pack: dict) -> dict:
         result = _heuristic(doc_type, doc_sections)
         return {**updates, "analysis_results": {"style": result.model_dump()}}
 
+    user_focus = format_user_focus(context_pack.get("parsed_instructions"))
+    profile_brief = format_profile_brief(context_pack.get("profile_snapshot"))
+
+    body = (
+        f"Document type: {doc_type}\n\n"
+        f"Document text (truncated to {_MAX_CHARS} chars):\n{full_text}"
+    )
+    if user_focus:
+        body += f"\n\n{user_focus}"
+    if profile_brief:
+        body += f"\n\n{profile_brief}"
+
     structured = llm.with_structured_output(StyleAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(
-            content=(
-                f"Document type: {doc_type}\n\n"
-                f"Document text (truncated to {_MAX_CHARS} chars):\n{full_text}"
-            )
-        ),
+        HumanMessage(content=body),
     ]
 
     try:

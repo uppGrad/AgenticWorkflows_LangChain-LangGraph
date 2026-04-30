@@ -7,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.common.prompt_context import format_profile_brief, format_user_focus
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,9 @@ Assess:
 - summary: one sentence overall assessment
 
 Be specific and actionable. Only flag real problems, not stylistic preferences.
+If a "User focus" block is provided, prioritise structural findings that serve those goals.
+If an "Applicant profile" block is provided (e.g. target roles, education stage), let it inform
+expectations about what sections matter most — never invent details not present in it.
 """
 
 
@@ -157,15 +161,22 @@ def analyze_structure(context_pack: dict) -> dict:
         result = _heuristic(doc_type, doc_sections)
         return {**updates, "analysis_results": {"structure": result.model_dump()}}
 
+    user_focus = format_user_focus(context_pack.get("parsed_instructions"))
+    profile_brief = format_profile_brief(context_pack.get("profile_snapshot"))
+
+    body = (
+        f"Document type: {doc_type}\n\n"
+        f"Sections present (name + first 300 chars):\n{sections_summary or '(none detected)'}"
+    )
+    if user_focus:
+        body += f"\n\n{user_focus}"
+    if profile_brief:
+        body += f"\n\n{profile_brief}"
+
     structured = llm.with_structured_output(StructureAnalysis)
     msgs = [
         SystemMessage(content=SYSTEM),
-        HumanMessage(
-            content=(
-                f"Document type: {doc_type}\n\n"
-                f"Sections present (name + first 300 chars):\n{sections_summary or '(none detected)'}"
-            )
-        ),
+        HumanMessage(content=body),
     ]
 
     try:
