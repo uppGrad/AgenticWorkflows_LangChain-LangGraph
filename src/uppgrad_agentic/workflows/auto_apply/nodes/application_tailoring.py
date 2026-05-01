@@ -108,6 +108,11 @@ employers, qualifications, or achievements. Structure the document
 appropriately for its type. Mirror the opportunity's language where
 truthful.
 
+Do NOT include unfilled placeholders such as [Date], [Address],
+[Hiring Manager Name], [Today's Date], or any other bracketed/parenthesised
+fill-in markers. If you don't have a specific value, omit that line entirely
+rather than emitting a placeholder.
+
 Return ONLY the document text — no explanations or markdown fences."""
 
 
@@ -121,8 +126,16 @@ You will be given:
 
 Write a single concise answer (1-2 short paragraphs, target 800-1200
 characters) that directly addresses the question using truthful details
-from the user's profile and CV. Do not invent facts. Return ONLY the
-answer text — no labels, no quotes, no markdown fences."""
+from the user's profile and CV. Do not invent facts.
+
+If the question asks for compensation expectations (salary, base pay,
+hourly rate, day rate, bonus, equity), DO NOT fabricate a specific number.
+Write a brief answer indicating the user is open to discussing
+compensation aligned with the role's responsibilities and the local
+market, and would welcome a conversation once the team shares their
+range. Do not produce a concrete figure or currency amount.
+
+Return ONLY the answer text — no labels, no quotes, no markdown fences."""
 
 
 def _opp_context(opportunity_data: Dict[str, Any], opportunity_type: str) -> str:

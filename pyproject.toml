@@ -30,6 +30,8 @@ package = true
 
 [dependency-groups]
 dev = [
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "psycopg[binary]>=3.3.3",
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "respx>=0.21.0",
