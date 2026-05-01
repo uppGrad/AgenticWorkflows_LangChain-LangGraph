@@ -183,6 +183,52 @@ def _build_from_form_fields(
     return items
 
 
+def _build_from_internal_application_form_spec(
+    spec: List[Dict[str, Any]],
+) -> List[RequirementItem]:
+    """Build RequirementItems from a backend-supplied internal-application
+    form spec.
+
+    For internal jobs (employer_id == 1), the backend's opportunity-snapshot
+    builder introspects the Django `jobs.Application` model and emits one
+    spec entry per fillable field. This function turns those into
+    RequirementItems the user reviews at gate 1.
+
+    Spec entry shape (each entry, in order):
+      {
+        "key":           str,      # Application model column name
+        "label":         str,      # human-readable
+        "category":      "document" | "text" | "misc",
+        "document_type": str,      # for category='document'
+        "required":      bool,
+        "field_type":    str,      # optional, hints the UI
+        "description":   str,      # optional
+      }
+
+    The list order is significant — `RequirementItem.id` is assigned
+    sequentially, which `finalize_internal_submission` later uses to map
+    a RequirementItem back to its Application column via
+    `opportunity_snapshot["application_form_spec"][item.id]["key"]`.
+    """
+    items: List[RequirementItem] = []
+    for idx, entry in enumerate(spec or []):
+        category = entry.get("category", "document")
+        items.append(
+            RequirementItem(
+                id=idx,
+                category=category,
+                label=entry.get("label", f"Field {idx}"),
+                description=entry.get("description", ""),
+                field_type=entry.get("field_type"),
+                required=bool(entry.get("required", False)),
+                document_type=entry.get("document_type") if category == "document" else None,
+                question=entry.get("label") if category == "text" else None,
+                form_field_index=None,
+            )
+        )
+    return items
+
+
 def _build_from_normalized_requirements(
     normalized_requirements: List[Dict[str, Any]],
 ) -> List[RequirementItem]:
@@ -246,12 +292,32 @@ def asset_mapping(state: AutoApplyState) -> dict:
         return updates
 
     opportunity_type = state.get("opportunity_type", "")
+    opportunity_data = state.get("opportunity_data") or {}
     form_fields: List[Dict[str, Any]] = list(state.get("form_fields") or [])
     normalized_requirements: List[Dict[str, Any]] = list(state.get("normalized_requirements") or [])
 
+    # Internal jobs (employer_id == 1) receive an `application_form_spec`
+    # in their opportunity_data describing the Django Application model's
+    # fillable columns (and, in the future, employer-defined custom
+    # fields per posting). When present, we honour it instead of falling
+    # back to the static [CV, Cover Letter] defaults — so any new field
+    # an employer adds just gets surfaced at gate 1 automatically.
+    internal_spec: List[Dict[str, Any]] = list(
+        opportunity_data.get("application_form_spec") or []
+    )
+    is_internal_job = (
+        opportunity_type == "job" and opportunity_data.get("employer_id") == 1
+    )
+
     items: List[RequirementItem] = []
 
-    if opportunity_type == "job" and form_fields:
+    if is_internal_job and internal_spec:
+        items = _build_from_internal_application_form_spec(internal_spec)
+        logger.info(
+            "asset_mapping: internal job — built %d items from application_form_spec",
+            len(items),
+        )
+    elif opportunity_type == "job" and form_fields:
         items = _build_from_form_fields(form_fields)
         if not items:
             # form_fields was non-empty but yielded nothing groupable —
