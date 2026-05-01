@@ -104,6 +104,25 @@ def extract_form_fields(state: AutoApplyState) -> dict:
             forced_html = forced.raw_html
             form_html = extract_form_html(forced_html)
 
+    # Tier 2b: still no form? Retry with the apply-CTA click pass. Some
+    # ATSes (Workable's `/j/<slug>/` listing, SmartRecruiters listings, some
+    # company-direct careers pages) show metadata + an "Apply for this job"
+    # button on the listing URL, and only render the actual form fields after
+    # the button is clicked. The click-through pass dispatches a click on the
+    # first visible apply-style CTA after hydration and waits for a form/input
+    # to appear before returning. Domain-agnostic — matches any text in the
+    # patterns list in `_build_crawler_run_config`.
+    if not form_html:
+        logger.info(
+            "extract_form_fields: no form after first browser pass for %s "
+            "— retrying with apply-CTA click",
+            form_url,
+        )
+        forced_click = force_browser_fetch(form_url, click_apply_cta=True)
+        if forced_click and forced_click.success and forced_click.raw_html:
+            forced_html = forced_click.raw_html
+            form_html = extract_form_html(forced_html)
+
     # Tier 3: follow ATS iframe. Some company-direct careers pages
     # (mongodb.com/careers/<id>, similar) embed the apply form inside a
     # cross-origin iframe served by Greenhouse / Lever / etc. Our normal

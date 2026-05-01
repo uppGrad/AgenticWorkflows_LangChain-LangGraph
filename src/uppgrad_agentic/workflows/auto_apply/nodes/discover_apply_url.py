@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from uppgrad_agentic.common.llm import get_search_provider
+from uppgrad_agentic.tools.ats_form_urls import resolve_application_form_url
 from uppgrad_agentic.tools.url_discovery import discover_apply_url
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
@@ -32,11 +33,18 @@ def discover_apply_url_node(state: AutoApplyState) -> dict:
     cached_url = state.get("discovered_apply_url")
     cached_method = state.get("discovery_method")
     if cached_url and cached_method and cached_method != "failed":
+        # The cache only stores the apply URL + method + confidence. The
+        # per-ATS form URL has to be re-resolved on every run; if we leave
+        # `discovered_form_url` unset, `extract_form_fields` silently
+        # short-circuits at `if not form_url`. (Caching it would mean
+        # invalidating the cache whenever `ats_form_urls` rules change —
+        # not worth it: resolution is a synchronous urlparse + lookup.)
         return {
             **updates,
             "discovered_apply_url": cached_url,
             "discovery_method": cached_method,
             "discovery_confidence": state.get("discovery_confidence") or 0.0,
+            "discovered_form_url": resolve_application_form_url(cached_url),
         }
 
     search_provider = get_search_provider()

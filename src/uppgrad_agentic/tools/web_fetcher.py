@@ -119,28 +119,96 @@ def _build_async_crawler():
     return AsyncWebCrawler(verbose=False)
 
 
-def _build_crawler_run_config(timeout_seconds: float):
+def _build_crawler_run_config(
+    timeout_seconds: float,
+    click_apply_cta: bool = False,
+):
     """Construct a CrawlerRunConfig that defers extraction until the React/SPA
     tree has hydrated. The JS wait expression checks for substantial visible
     text on the page — domain-agnostic, matches Ashby/Workday/etc. that render
     everything client-side after initial HTML.
 
+    When `click_apply_cta=True`, the post-load JS hook also tries to click the
+    first apply-style CTA visible on the page (used for ATSes like Workable
+    where the listing URL renders metadata + an "Apply for this job" button
+    that opens the actual form on click — the form fields aren't in the DOM
+    until the click fires). The wait predicate switches to "form/input
+    visible" so we don't return before the form has rendered.
+
     Lazy-imported so importing `web_fetcher` doesn't pull in crawl4ai when the
     browser fallback isn't enabled. Patched in tests."""
     from crawl4ai import CrawlerRunConfig  # noqa: lazy import — heavy
+    if not click_apply_cta:
+        return CrawlerRunConfig(
+            page_timeout=int(timeout_seconds * 1000),
+            wait_for="js:() => document.body && document.body.innerText.length > 1000",
+        )
+
+    # Generic apply-CTA click. Matches the common phrasing ATSes use:
+    # "Apply for this job", "Apply now", "I'm interested", "Start application",
+    # "Continue to apply", or just plain "Apply"/"Continue" when nothing more
+    # specific is present. Anchored on element role so we don't accidentally
+    # click a paragraph that happens to contain the word.
+    js_code = [r"""
+        (async () => {
+            // Wait briefly for hydration so React-bound buttons accept clicks.
+            await new Promise(r => setTimeout(r, 800));
+            const all = Array.from(document.querySelectorAll(
+                'button, a, [role="button"]'
+            ));
+            const patterns = [
+                /^apply for this job$/i,
+                /^i['’]?m interested$/i,
+                /^apply now$/i,
+                /^start application$/i,
+                /^continue to apply$/i,
+                /^continue$/i,
+                /^apply$/i,
+            ];
+            const visible = el => {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return false;
+                const cs = getComputedStyle(el);
+                return cs.visibility !== 'hidden' && cs.display !== 'none';
+            };
+            const target = all.find(el => {
+                if (!visible(el)) return false;
+                const t = (el.innerText || el.textContent || '').trim();
+                return patterns.some(p => p.test(t));
+            });
+            if (target) target.click();
+        })();
+    """]
     return CrawlerRunConfig(
         page_timeout=int(timeout_seconds * 1000),
-        wait_for="js:() => document.body && document.body.innerText.length > 1000",
+        js_code=js_code,
+        # Form-visible predicate. We accept any input/textarea/select on the
+        # page (not just inside a <form>) since some ATSes render bare
+        # custom-element pickers without wrapping them.
+        wait_for=(
+            "js:() => !!document.querySelector("
+            "'form, input:not([type=hidden]), textarea, select')"
+        ),
     )
 
 
-async def _crawl_with_browser(url: str, timeout_seconds: float = 25.0) -> FetchResult:
+async def _crawl_with_browser(
+    url: str,
+    timeout_seconds: float = 25.0,
+    *,
+    click_apply_cta: bool = False,
+) -> FetchResult:
     """Use Crawl4AI / Playwright to fetch a URL when httpx returned thin content.
 
     httpx already resolved any redirect chain; `url` is the final destination.
+
+    `click_apply_cta=True` enables an extra in-page click pass for ATSes that
+    gate the form behind a CTA button (Workable's `/j/<slug>/` listing,
+    SmartRecruiters listings, some company-direct careers pages). See
+    `_build_crawler_run_config` for the CTA matcher and wait predicate.
     """
     crawler = _build_async_crawler()  # may raise ImportError; caller handles
-    config = _build_crawler_run_config(timeout_seconds)
+    config = _build_crawler_run_config(timeout_seconds, click_apply_cta=click_apply_cta)
 
     async with crawler:
         try:
@@ -198,19 +266,31 @@ def fetch_url_with_fallback(url: str) -> FetchResult:
         return httpx_result
 
 
-def force_browser_fetch(url: str) -> Optional[FetchResult]:
+def force_browser_fetch(
+    url: str,
+    *,
+    click_apply_cta: bool = False,
+) -> Optional[FetchResult]:
     """Render a URL with the browser regardless of httpx's thin verdict. Use
     when the caller knows it needs JS-rendered content (e.g. form-field
     extraction on a page that httpx returned as non-thin but where the form
     area itself is rendered client-side, like mongodb.com/careers/<id> or any
     Ashby/Workday SPA).
 
+    `click_apply_cta=True` adds an in-page click on the first apply-style
+    CTA visible after hydration, for ATSes that show a button on the listing
+    URL and only render the actual form fields after it's clicked (Workable
+    `/j/<slug>/`, SmartRecruiters listings, some careers sites). The wait
+    predicate flips to "form/input visible" so we don't return early. Use
+    only as a follow-up to the no-click attempt — it adds latency and is
+    only useful when the no-click pass produced no form HTML.
+
     Returns None when browser fallback is disabled or crawl4ai isn't
     installed; caller should treat that as "browser unavailable, give up"."""
     if not _browser_fallback_enabled():
         return None
     try:
-        return asyncio.run(_crawl_with_browser(url))
+        return asyncio.run(_crawl_with_browser(url, click_apply_cta=click_apply_cta))
     except ImportError:
         logger.warning("force_browser_fetch: crawl4ai not installed")
         return None
