@@ -243,6 +243,47 @@ def test_resolves_hidden_file_input_via_labelled_container(fake_resume):
     assert all(r.outcome == "ok" for r in result.reports)
 
 
+# Recruitee-style markup. The form has bracket-named inputs
+# (`candidate[first_name]`, `candidate[phone]`) — the same shape that
+# tripped the live jobs.fromjimmy.com run. We don't simulate the React
+# actionability problem here (Playwright's local chromium hits these
+# inputs cleanly anyway); the test instead pins the locator path: with
+# square brackets in the name, the CSS selector `[name="candidate[X]"]`
+# must still resolve and `.fill()` must succeed.
+_RECRUITEE_BRACKET_NAME_HTML = """\
+<!doctype html>
+<html><body>
+  <h1>Apply</h1>
+  <form id="apply" onsubmit="return false">
+    <label for="candidate_first_name">First name</label>
+    <input type="text" name="candidate[first_name]" id="candidate_first_name" />
+
+    <label for="candidate_phone">Phone</label>
+    <input type="text" name="candidate[phone]" id="candidate_phone" />
+  </form>
+</body></html>
+"""
+
+
+def test_text_fill_handles_bracket_named_inputs():
+    """Recruitee/Rails-style inputs use names like `candidate[first_name]`.
+    The CSS attribute selector must round-trip those brackets correctly,
+    and the longer 5s timeout (post-fix) gives React-wrapped inputs room
+    to hydrate without false failures."""
+    plan = [
+        _plan(field=_f(label="First name", field_type="text",
+                       name="candidate[first_name]"),
+              value="Koray"),
+        _plan(field=_f(label="Phone", field_type="text",
+                       name="candidate[phone]"),
+              value="+90 533 386 5486"),
+    ]
+    with serve_form(_RECRUITEE_BRACKET_NAME_HTML) as url:
+        result = asyncio.run(fill_form_async(url, plan, llm=None, headless=True))
+    assert result.fields_failed == 0, [r.detail for r in result.reports]
+    assert result.fields_filled_native == 2
+
+
 def test_no_locator_when_field_missing_on_page():
     """Field references a name not present on the form. Without LLM, the
     deterministic tiers exhaust and the field is marked failed (not ok)."""
