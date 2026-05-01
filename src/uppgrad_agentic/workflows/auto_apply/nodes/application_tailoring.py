@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from uppgrad_agentic.common.llm import get_llm
+from uppgrad_agentic.tools.latex_templates import template_for
 from uppgrad_agentic.workflows.auto_apply._profile import resolve_profile
 from uppgrad_agentic.workflows.auto_apply.nodes.upload_pre_analysis import analyze_upload_pre
 from uppgrad_agentic.workflows.auto_apply.nodes.upload_light_post_analysis import (
@@ -61,8 +62,125 @@ def _strip_fences(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LaTeX helpers (Sub-PR A — tailored documents now carry both plain text
+# `content` and `latex_source` for the backend's LaTeX renderer)
+# ---------------------------------------------------------------------------
+
+# Patterns kept conservative so plain-text extraction stays robust to
+# LLM-introduced quirks like newlines inside arguments. We strip the most
+# common scaffolding (`\\section{x}` → `x`, `\\textbf{x}` → `x`, hyperref
+# `\\href{url}{label}` → `label`, the `% --- BEGIN/END BODY ---` markers,
+# the preamble/postamble) without trying to be a real TeX parser.
+_LATEX_PREAMBLE_RE = re.compile(r"\\documentclass.*?\\begin\{document\}", re.DOTALL)
+_LATEX_POSTAMBLE_RE = re.compile(r"\\end\{document\}.*", re.DOTALL)
+_LATEX_BODY_MARKERS_RE = re.compile(
+    r"%\s*---\s*(BEGIN|END)\s+BODY\s*---[^\n]*\n?", re.IGNORECASE
+)
+_LATEX_COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*\n?")
+_LATEX_HREF_RE = re.compile(r"\\href\{[^}]*\}\{([^}]*)\}")
+_LATEX_SIMPLE_CMD_WITH_ARG_RE = re.compile(r"\\[a-zA-Z]+\*?\{([^{}]*)\}")
+_LATEX_SIMPLE_CMD_NO_ARG_RE = re.compile(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])?")
+_LATEX_ENV_RE = re.compile(r"\\(begin|end)\{[^}]*\}")
+_LATEX_ITEM_RE = re.compile(r"^\s*\\item\s*", re.MULTILINE)
+
+
+def _latex_to_plain(latex_source: str) -> str:
+    """Strip LaTeX scaffolding to a plain-text approximation of the document.
+
+    Used to populate the legacy `content` field on `tailored_documents`
+    entries — `application_evaluation` reads it for length / placeholder /
+    keyword checks, and the dashboard surfaces it as a quick preview.
+    The PDF the user actually downloads is rendered from `latex_source`,
+    not from this string.
+
+    Best-effort, not a real TeX parser. Robust enough to handle the
+    skeletons in `tools/latex_templates` plus typical LLM output shape.
+    """
+    if not latex_source:
+        return ""
+    text = latex_source
+    # Drop preamble + postamble first, otherwise their commands leak into
+    # the simple-command pass below.
+    text = _LATEX_PREAMBLE_RE.sub("", text)
+    text = _LATEX_POSTAMBLE_RE.sub("", text)
+    text = _LATEX_BODY_MARKERS_RE.sub("", text)
+    text = _LATEX_COMMENT_RE.sub("", text)
+    # Hyperlinks: `\href{url}{label}` → `label`.
+    text = _LATEX_HREF_RE.sub(lambda m: m.group(1), text)
+    # Drop `\begin{X}` / `\end{X}` BEFORE the generic command-with-arg
+    # pass below, otherwise that pass turns `\begin{itemize}` into
+    # `itemize` and we leak the env name into the plain text.
+    text = _LATEX_ENV_RE.sub("", text)
+    # `\item` keeps the bullet semantics with a leading dash.
+    text = _LATEX_ITEM_RE.sub("- ", text)
+    # `\section{X}` / `\textbf{X}` / `\emph{X}` etc. → `X`. Run twice to
+    # peel one layer of nested commands (e.g. `\textbf{\large{X}}`).
+    for _ in range(2):
+        text = _LATEX_SIMPLE_CMD_WITH_ARG_RE.sub(lambda m: m.group(1), text)
+    # Lone commands like `\noindent`, `\\`, `\hfill` → drop.
+    text = _LATEX_SIMPLE_CMD_NO_ARG_RE.sub("", text)
+    # Tidy whitespace: collapse 3+ blank lines to 2.
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_latex_source(raw: str) -> str:
+    """Pull the LaTeX source out of an LLM response.
+
+    Accepts either a plain `\\documentclass...\\end{document}` or a fenced
+    block (```latex / ```tex / ```). Returns "" when no document marker is
+    present — caller should treat that as "LaTeX generation failed".
+    """
+    if not raw:
+        return ""
+    # First strip a top-level code fence if present.
+    candidate = _strip_fences(raw)
+    if r"\documentclass" not in candidate or r"\end{document}" not in candidate:
+        return ""
+    # Trim any prose that leaked before \documentclass or after \end{document}.
+    start = candidate.find(r"\documentclass")
+    end_marker = candidate.find(r"\end{document}")
+    if start < 0 or end_marker < 0:
+        return ""
+    end = end_marker + len(r"\end{document}")
+    return candidate[start:end].strip()
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+
+# ─── Output format note ──────────────────────────────────────────────────────
+#
+# Every document-tailoring prompt below ends with a LaTeX skeleton (the
+# "TEMPLATE" block). The LLM is told to emit a complete, compilable LaTeX
+# source: the preamble must stay byte-for-byte identical to the template,
+# only the body between the BEGIN/END BODY markers gets filled. We extract
+# `latex_source` from the response and derive a plain-text `content` from
+# it via `_latex_to_plain` for legacy consumers (evaluation node, dashboard
+# preview).
+
+_LATEX_OUTPUT_RULES = """
+Return ONLY a complete LaTeX document. No prose around it, no markdown fences,
+no "Here is your..." preamble.
+
+Strict rules for the LaTeX you emit:
+  * Keep the preamble (everything from \\documentclass through \\begin{document})
+    EXACTLY as given in the TEMPLATE block — do not change packages, fonts,
+    margins, or commands. The renderer only ships those packages.
+  * Keep the BEGIN BODY / END BODY marker comments. Replace ONLY the
+    placeholder comment between them with the actual document content.
+  * Use ONLY commands defined in the preamble. Do not add \\usepackage{...}
+    lines, do not call \\input or \\include, do not use shell-escape commands.
+  * Escape LaTeX-special characters in user content:
+      &  →  \\&     %  →  \\%     $  →  \\$     #  →  \\#
+      _  →  \\_     {  →  \\{     }  →  \\}     ~  →  \\textasciitilde{}
+      ^  →  \\textasciicircum{}
+  * For URLs use \\href{https://...}{label}. Plain URLs without \\href will
+    misformat.
+  * End with \\end{document}.
+"""
+
 
 _SYSTEM_T1 = """You are a professional application document writer running a FIRST tailoring pass.
 
@@ -74,34 +192,35 @@ You will be given:
   - an UPLOADED version of the document the user wants tailored
   - a pre-tailoring analysis with top priorities
   - an optional user-provided guidance prompt for this document
+  - a LaTeX TEMPLATE skeleton you must use for the output
 
 Produce a tailored revision that addresses the top_priorities and aligns the
 content with the opportunity. Preserve all factual details from the source —
 do NOT fabricate roles, dates, qualifications, or achievements. Mirror the
 opportunity's language where truthful.
-
-Return ONLY the document text — no explanations, no markdown fences, no
-"Here is your..." preambles."""
+""" + _LATEX_OUTPUT_RULES
 
 
 _SYSTEM_T2 = """You are polishing a tailored application document on a SECOND, final pass.
 
 You will receive:
-  - the T1 output (already tailored once)
+  - the T1 LaTeX output (already tailored once)
   - a post-T1 analysis listing remaining structure issues, content gaps vs
     the opportunity, and content gaps vs the user's profile
   - the same opportunity / profile / CV / user_prompt context
+  - the original LaTeX TEMPLATE skeleton
 
 Address the analysis findings in place. Do not rewrite the whole document.
-Preserve facts. Mirror opportunity language. Return ONLY the document text."""
+Preserve facts. Mirror opportunity language.
+""" + _LATEX_OUTPUT_RULES
 
 
 _SYSTEM_GENERATE_DOC = """You are generating a job application document from scratch.
 
 You will be given the document type, the opportunity (title, organisation,
 description), the user's profile summary, the user's CV as the source of
-factual details, an optional user prompt, and the canonical document type
-(if known).
+factual details, an optional user prompt, the canonical document type
+(if known), and a LaTeX TEMPLATE skeleton you must use for the output.
 
 Use ONLY facts present in the source material — do not invent dates,
 employers, qualifications, or achievements. Structure the document
@@ -112,8 +231,7 @@ Do NOT include unfilled placeholders such as [Date], [Address],
 [Hiring Manager Name], [Today's Date], or any other bracketed/parenthesised
 fill-in markers. If you don't have a specific value, omit that line entirely
 rather than emitting a placeholder.
-
-Return ONLY the document text — no explanations or markdown fences."""
+""" + _LATEX_OUTPUT_RULES
 
 
 _SYSTEM_GENERATE_TEXT = """You are answering a free-form question on a job application form.
@@ -242,6 +360,8 @@ def _t1_prompt(
         + f"Overall quality: {pre_analysis.overall_quality}\n"
         + "Top priorities:\n"
         + ("\n".join(f"- {p}" for p in pre_analysis.top_priorities) or "- (none flagged)")
+        + "\n\n=== TEMPLATE (return a filled-in copy of this) ===\n"
+        + template_for(doc_type)
         + "\n\nProduce the T1 tailored document now."
     )
 
@@ -263,7 +383,7 @@ def _t2_prompt(
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV ===\n{_cv_text(profile)}\n\n"
         + f"=== USER GUIDANCE ===\n{user_prompt or '(none)'}\n\n"
-        + f"=== T1 OUTPUT ({doc_type}) ===\n{t1_output[:_MAX_SOURCE_CHARS]}\n\n"
+        + f"=== T1 OUTPUT (LaTeX, {doc_type}) ===\n{t1_output[:_MAX_SOURCE_CHARS]}\n\n"
         + "=== POST-T1 ANALYSIS ===\n"
         + "Structure issues:\n"
         + ("\n".join(f"- {s}" for s in post_analysis.structure_issues) or "- (none)")
@@ -271,7 +391,9 @@ def _t2_prompt(
         + ("\n".join(f"- {s}" for s in post_analysis.content_gap_vs_opportunity) or "- (none)")
         + "\nContent gaps vs profile:\n"
         + ("\n".join(f"- {s}" for s in post_analysis.content_gap_vs_profile) or "- (none)")
-        + "\n\nPolish T1 in place to address the analysis. Return only the document text."
+        + "\n\n=== TEMPLATE (preamble must remain identical to this) ===\n"
+        + template_for(doc_type)
+        + "\n\nPolish the T1 document in place to address the analysis. Return the final LaTeX source."
     )
 
 
@@ -293,7 +415,9 @@ def _generate_doc_prompt(
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV (source of facts) ===\n{_cv_text(profile)}\n\n"
         + f"=== USER GUIDANCE ===\n{user_prompt or '(none)'}\n\n"
-        + f"Generate the {doc_type} now."
+        + "=== TEMPLATE (return a filled-in copy of this) ===\n"
+        + template_for(canonical_type or doc_type)
+        + f"\n\nGenerate the {doc_type} now."
     )
 
 
@@ -317,6 +441,25 @@ def _generate_text_prompt(
 # ---------------------------------------------------------------------------
 # Per-requirement processing
 # ---------------------------------------------------------------------------
+
+def _split_latex_and_plain(raw: str, doc_type: str) -> tuple[str, str]:
+    """Return `(content, latex_source)` from an LLM response.
+
+    The system prompts ask for a complete LaTeX document. We pull the
+    `\\documentclass...\\end{document}` span out (tolerant of stray prose
+    or fenced wrappers) and derive a plain-text approximation for the
+    legacy `content` field used by `application_evaluation` and dashboard
+    previews. When the LLM returns no LaTeX (older model, structured-output
+    miss, etc.), `latex_source` is "" and `content` falls back to the raw
+    truncated string so we degrade rather than lose the work.
+    """
+    latex_source = _extract_latex_source(raw)
+    if latex_source:
+        plain = _latex_to_plain(latex_source)
+    else:
+        plain = _strip_fences(raw)
+    return _truncate_to_cap(plain, doc_type), latex_source
+
 
 def _process_document(
     item: Dict[str, Any],
@@ -342,6 +485,7 @@ def _process_document(
             )
             return {
                 "content": _truncate_to_cap(uploaded_text, doc_type),
+                "latex_source": "",
                 "tailoring_depth": "light",
                 "source": "upload",
                 "llm_used": False,
@@ -359,6 +503,7 @@ def _process_document(
         if not t1:
             return {
                 "content": _truncate_to_cap(uploaded_text, doc_type),
+                "latex_source": "",
                 "tailoring_depth": "light",
                 "source": "upload",
                 "llm_used": False,
@@ -376,8 +521,10 @@ def _process_document(
         )
         final = t2 or t1
 
+        content, latex_source = _split_latex_and_plain(final, doc_type)
         return {
-            "content": _truncate_to_cap(final, doc_type),
+            "content": content,
+            "latex_source": latex_source,
             "tailoring_depth": "deep" if t2 else "light",
             "source": "upload",
             "llm_used": True,
@@ -393,6 +540,7 @@ def _process_document(
             )
             return {
                 "content": "",
+                "latex_source": "",
                 "tailoring_depth": "generate",
                 "source": "auto_generate",
                 "llm_used": False,
@@ -408,14 +556,17 @@ def _process_document(
         if not text:
             return {
                 "content": "",
+                "latex_source": "",
                 "tailoring_depth": "generate",
                 "source": "auto_generate",
                 "llm_used": False,
                 "passes": 0,
                 "note": "Auto-generate LLM call failed.",
             }
+        content, latex_source = _split_latex_and_plain(text, doc_type)
         return {
-            "content": _truncate_to_cap(text, doc_type),
+            "content": content,
+            "latex_source": latex_source,
             "tailoring_depth": "generate",
             "source": "auto_generate",
             "llm_used": True,
