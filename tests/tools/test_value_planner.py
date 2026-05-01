@@ -185,3 +185,195 @@ def test_first_real_option_filters_placeholders():
     assert _first_real_option(["", None, "United States"]) == "United States"
     assert _first_real_option([]) is None
     assert _first_real_option(["Select an option"]) is None
+
+
+# ─── Gate-1 integration: per-field skip via human_review_1 ──────────────────
+
+_DOC_REQUIREMENT_ITEMS = [
+    {
+        "id": 0, "category": "document", "label": "CV", "required": True,
+        "document_type": "CV", "form_field_index": 0,
+    },
+    {
+        "id": 1, "category": "text", "label": "Why us?", "required": True,
+        "form_field_index": 1,
+    },
+]
+
+
+def test_skip_choice_short_circuits_field():
+    """Optional document chosen as `skip` at gate 1 → planner emits
+    user_skipped regardless of profile match."""
+    fields = [_f(label="Portfolio", field_type="file")]
+    items = [{
+        "id": 0, "category": "document", "label": "Portfolio", "required": False,
+        "document_type": "Portfolio", "form_field_index": 0,
+    }]
+    review = {"requirements": {"0": {"choice": "skip"}}, "misc_strategy": "auto_fill"}
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        requirement_items=items, human_review_1=review,
+    )
+    assert plans[0].status == "skipped"
+    assert plans[0].source == "user_skipped"
+    assert "skip" in plans[0].reason
+
+
+def test_ignore_for_now_optional_treated_as_skip():
+    """Optional + ignore_for_now is functionally identical to skip at fill time."""
+    fields = [_f(label="Portfolio", field_type="file")]
+    items = [{
+        "id": 0, "category": "document", "label": "Portfolio", "required": False,
+        "document_type": "Portfolio", "form_field_index": 0,
+    }]
+    review = {"requirements": {"0": {"choice": "ignore_for_now"}}, "misc_strategy": "auto_fill"}
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        requirement_items=items, human_review_1=review,
+    )
+    assert plans[0].status == "skipped"
+    assert plans[0].source == "user_skipped"
+
+
+def test_required_ignore_for_now_field_skipped_at_per_field_layer():
+    """The session-level kill-switch lives in the adapter; if the adapter
+    still hands us a payload with required+ignore_for_now (e.g. partial
+    rollout, or non-required items already filtered), the per-field rule
+    still applies — emit user_skipped."""
+    fields = [_f(label="Resume", field_type="file"), _f(label="Why us?", field_type="textarea")]
+    review = {
+        "requirements": {
+            "0": {"choice": "auto_generate"},
+            "1": {"choice": "ignore_for_now"},
+        },
+        "misc_strategy": "auto_fill",
+    }
+    plans = compute_form_values(
+        fields, _PROFILE, {"CV": {"file_path": "/tmp/cv.pdf"}}, {},
+        requirement_items=_DOC_REQUIREMENT_ITEMS, human_review_1=review,
+    )
+    assert plans[0].status == "filled"   # CV auto_generate → resolves
+    assert plans[1].status == "skipped"
+    assert plans[1].source == "user_skipped"
+
+
+# ─── Gate-1 integration: tailored_answers replaces mock placeholder ─────────
+
+def test_tailored_answer_used_when_present():
+    """Textarea question with a real tailored answer in state → use the
+    real answer; do NOT fall back to mock."""
+    fields = [_f(label="Why us?", field_type="textarea", required=True)]
+    items = [{
+        "id": 0, "category": "text", "label": "Why us?", "required": True,
+        "form_field_index": 0,
+    }]
+    review = {"requirements": {"0": {"choice": "auto_generate"}}, "misc_strategy": "auto_fill"}
+    tailored_answers = {"0": {"content": "I love your mission and culture."}}
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        tailored_answers=tailored_answers,
+        requirement_items=items, human_review_1=review,
+    )
+    assert plans[0].status == "filled"
+    assert plans[0].source == "user_answer"
+    assert plans[0].value == "I love your mission and culture."
+    assert "tailored_answers[0]" in plans[0].reason
+
+
+def test_tailored_answer_string_value_also_supported():
+    """Backend may stash the answer as a flat string instead of a dict."""
+    fields = [_f(label="Why us?", field_type="textarea")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        tailored_answers={"0": "Direct string answer."},
+    )
+    assert plans[0].value == "Direct string answer."
+    assert plans[0].source == "user_answer"
+
+
+def test_mock_fallback_when_tailored_answer_missing():
+    fields = [_f(label="Why us?", field_type="textarea")]
+    plans = compute_form_values(fields, _PROFILE, {}, {}, tailored_answers={})
+    assert plans[0].status == "filled"
+    assert plans[0].source == "mock"
+    assert "Mock answer" in plans[0].value
+
+
+def test_empty_tailored_answer_falls_through_to_mock():
+    """An entry that exists but has empty content shouldn't suppress mock."""
+    fields = [_f(label="Why us?", field_type="textarea")]
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        tailored_answers={"0": {"content": "   "}},
+    )
+    assert plans[0].source == "mock"
+
+
+# ─── Gate-1 integration: misc strategy ──────────────────────────────────────
+
+def test_misc_ignore_skips_unowned_fields():
+    """Misc fields (form fields with no owning RequirementItem) are skipped
+    when misc_strategy=ignore. The user's "package and bounce" path can
+    still be partially auto-filled by leaving misc on auto_fill while
+    ignore-ing the document/text items individually."""
+    # form_fields: [Resume (doc), Why us? (text), Email (misc), Country (misc)]
+    fields = [
+        _f(label="Resume", field_type="file"),
+        _f(label="Why us?", field_type="textarea"),
+        _f(label="Email", field_type="email"),
+        _f(label="Country", field_type="select", options=["Choose...", "Turkey"]),
+    ]
+    items = [
+        {"id": 0, "category": "document", "label": "Resume", "required": True,
+         "document_type": "CV", "form_field_index": 0},
+        {"id": 1, "category": "text", "label": "Why us?", "required": True,
+         "form_field_index": 1},
+        # No RequirementItem points to indices 2, 3 → they're misc.
+        {"id": 2, "category": "misc", "label": "Profile / identity (2)",
+         "required": False, "form_field_index": None},
+    ]
+    review = {
+        "requirements": {
+            "0": {"choice": "auto_generate"},
+            "1": {"choice": "auto_generate"},
+        },
+        "misc_strategy": "ignore",
+    }
+    plans = compute_form_values(
+        fields, _PROFILE, {"CV": {"file_path": "/tmp/cv.pdf"}}, {},
+        tailored_answers={"1": "answer"},
+        requirement_items=items, human_review_1=review,
+    )
+    # Resume and Why-us auto-filled.
+    assert plans[0].status == "filled"
+    assert plans[1].status == "filled"
+    # Email and Country (misc) — skipped due to misc_strategy=ignore even
+    # though profile lookup would have filled Email.
+    assert plans[2].status == "skipped"
+    assert plans[2].source == "user_skipped"
+    assert "misc_strategy=ignore" in plans[2].reason
+    assert plans[3].status == "skipped"
+
+
+def test_misc_auto_fill_runs_normal_rules():
+    fields = [_f(label="Email", field_type="email")]
+    items = [{"id": 0, "category": "misc", "label": "Profile (1)",
+              "required": False, "form_field_index": None}]
+    review = {"requirements": {}, "misc_strategy": "auto_fill"}
+    plans = compute_form_values(
+        fields, _PROFILE, {}, {},
+        requirement_items=items, human_review_1=review,
+    )
+    # Profile lookup wins for Email even when its owner is the misc bucket.
+    assert plans[0].status == "filled"
+    assert plans[0].source == "user_profile"
+    assert plans[0].value == _PROFILE["email"]
+
+
+def test_no_requirement_items_disables_misc_rule():
+    """Backward compat: when caller doesn't pass requirement_items, the
+    is_misc check defaults to False — every field runs the normal rules."""
+    fields = [_f(label="Email", field_type="email")]
+    plans = compute_form_values(fields, _PROFILE, {}, {})  # no kwargs
+    assert plans[0].status == "filled"
+    assert plans[0].source == "user_profile"

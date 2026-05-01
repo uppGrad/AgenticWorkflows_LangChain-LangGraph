@@ -1,43 +1,86 @@
 """Compute fill values for the application form's fields.
 
-Pure function over (form_fields, profile, tailored_documents, opportunity).
-No LangGraph imports, no global state. Returns a list of FormFieldFillPlan
-records, one per FormField, that the playwright_filler can execute.
+Pure function over (form_fields, profile, tailored_documents, opportunity)
+plus optional gate-1 outputs (tailored_answers, requirement_items,
+human_review_1). No LangGraph imports, no global state. Returns a list of
+FormFieldFillPlan records, one per FormField, that the playwright_filler
+can execute.
 
 Decision rules (per field, in priority order):
 
-1. file → use a path from `tailored_documents` matching the field's
-          document type (Resume → CV; Cover Letter → "Cover Letter";
-          Portfolio → "Portfolio"; etc.). When no path is available,
-          skip with reason="no_document_available".
+0. Per-field skip/ignore (user gate-1 verdict) — short-circuit:
+   When `human_review_1.requirements[<owning_id>].choice ∈ {skip, ignore_for_now}`,
+   emit `status=skipped, source=user_skipped` regardless of what the field
+   would otherwise resolve to. The session-level kill-switch (any
+   `required+ignore_for_now` → don't run auto-fill at all) lives in the
+   adapter, not here — by the time we're called, that decision has been
+   made and we're proceeding with whatever subset of fields the user
+   wants filled.
 
-2. date → today's date (computed).
+1. Misc + `misc_strategy=ignore`:
+   Form fields not pointed to by any RequirementItem (i.e. the misc-bucket
+   members) are skipped wholesale when the user picks `misc_strategy=ignore`
+   at gate 1.
 
-3. profile-mappable label → look up in the profile snapshot via
+2. file → use a path from `tailored_documents` matching the field's
+          document type. When no path is available, skip with
+          reason="no_document_available".
+
+3. date → today's date (computed).
+
+4. profile-mappable label → look up in the profile snapshot via
    `tools.profile_lookup`. Works for First/Last Name, Email, Phone,
    Country, City, Location, LinkedIn, GitHub, Website.
 
-4. select / radio with options → pick the first non-placeholder option.
-   When a field has expected_source=user_profile, we still try the
-   profile lookup first (e.g. Country dropdown can take "Turkey" from
-   profile.country and the click-pick-option layer will match the option).
+5. select / radio with options → pick the first non-placeholder option
+   when no profile match.
 
-5. checkbox → check it when required, leave optional ones unchecked.
+6. checkbox → check it when required, leave optional ones unchecked.
 
-6. textarea / user_answer free-text → "[Mock answer — <label>]" placeholder
-   in dry-run mode (the only mode this PoC supports for now).
+7. textarea / user_answer free-text:
+   a. Prefer `tailored_answers[str(field_index)]` (LLM-drafted real answer
+      from gate-1 auto_generate flow).
+   b. Fall back to `[Mock answer — <label>]` placeholder when no tailored
+      answer exists.
 
-7. Anything else → skip with reason describing what was unhandled.
+8. Anything else → skip with reason describing what was unhandled.
 
-The "mock_answer" placeholder behavior is intentional for the dry-run path.
-A future iteration will replace it with an LLM draft using the profile +
-opportunity context as input.
+────────────────────────────────────────────────────────────────────────
+Misc handling — option B (current implementation)
+────────────────────────────────────────────────────────────────────────
+
+`misc_strategy=auto_fill` runs the per-field rules above (profile lookup,
+sensible-default option, required-checkbox, etc.). Fields the planner
+can't resolve via any rule become `status=skipped, source=no_value` and
+appear in `FormFillResult.reports`. The adapter / frontend surface those
+unfilled fields to the user post-fill ("we filled X/Y; please review the
+rest"). No pre-fill classification needed.
+
+Other options considered (for future iteration):
+
+  Option A — Pre-classify each misc field at gate 1 and PROMOTE
+  non-generatable ones to category=text RequirementItems with their own
+  per-id choice. Misc would only contain generatable fields. Pro: cleaner
+  UX, explicit user control over each unknown. Con: adds a generatability
+  classifier (profile-lookup pre-pass + LLM fallback) before gate 1, slowing
+  gate-1 latency and burning tokens before the user has even seen the page.
+
+  Option C — Add a finer `misc_strategy` value:
+    `auto_fill_generatable_only` (default) — fill profile-mappable + sensible-default;
+    skip unknowns; surface skipped count at gate 2.
+    `auto_fill_all` — try everything (mock answers for unknowns).
+    `ignore` — current ignore behavior.
+  Pro: session-level toggle. Con: user can't single-out individual unknowns.
+
+Migration to A or C is straightforward if real-data shows users want
+finer control — both can layer on top of Option B's plumbing without
+changes to the FormFieldFillPlan / FormFillResult contracts.
 """
 
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from uppgrad_agentic.tools.profile_lookup import lookup as profile_lookup
 from uppgrad_agentic.workflows.auto_apply.schemas import (
@@ -47,14 +90,12 @@ from uppgrad_agentic.workflows.auto_apply.schemas import (
 
 
 # Map FormField.document_type-ish labels → keys in tailored_documents dict.
-# tailored_documents shape from the existing application_tailoring node:
+# tailored_documents shape from application_tailoring:
 #   { "CV": {"content": "...", "tailoring_depth": "..."},
 #     "Cover Letter": {"content": "..."},
 #     ... }
 # The `content` is text. The fill plan needs a FILE PATH, so the caller is
-# responsible for materializing tailored content to disk first; here we just
-# emit a placeholder path that points at the per-doc-type entry. The
-# playwright_filler / adapter will resolve it to a real path before fill.
+# responsible for materializing tailored content to disk first.
 _DOC_LABEL_HINTS = (
     ("resume", "CV"),
     ("cv", "CV"),
@@ -91,11 +132,62 @@ def _mock_answer(label: str) -> str:
     return f"[Mock answer — {short}]"
 
 
+def _build_field_choice_map(
+    requirement_items: Optional[List[Dict[str, Any]]],
+    human_review_1: Optional[Dict[str, Any]],
+) -> Dict[int, str]:
+    """form_field_index → user's gate-1 choice string.
+
+    Only includes fields whose owning RequirementItem has a non-None
+    `form_field_index` (i.e. document/text categories — misc items have
+    `form_field_index=None` because they collapse multiple form fields
+    into one virtual line).
+    """
+    if not requirement_items or not human_review_1:
+        return {}
+    requirements = (human_review_1 or {}).get("requirements") or {}
+    out: Dict[int, str] = {}
+    for item in requirement_items:
+        ffi = item.get("form_field_index")
+        if ffi is None:
+            continue
+        choice = (requirements.get(str(item.get("id"))) or {}).get("choice")
+        if choice:
+            out[ffi] = choice
+    return out
+
+
+def _build_non_misc_index_set(
+    requirement_items: Optional[List[Dict[str, Any]]],
+) -> Set[int]:
+    """Set of form_field indices that DO have an owning non-misc RequirementItem.
+
+    Used to derive which form fields are in the misc bucket: any field whose
+    index is NOT in this set was collapsed into the misc virtual item by
+    asset_mapping._build_from_form_fields.
+    """
+    if not requirement_items:
+        return set()
+    out: Set[int] = set()
+    for item in requirement_items:
+        ffi = item.get("form_field_index")
+        if ffi is None:
+            continue
+        out.add(ffi)
+    return out
+
+
 def plan_field_value(
     field: FormField | Dict[str, Any],
     profile: Dict[str, str],
     tailored_documents: Dict[str, Any],
     opportunity_data: Dict[str, Any],
+    *,
+    tailored_answers: Optional[Dict[str, Any]] = None,
+    field_index: Optional[int] = None,
+    field_choice: Optional[str] = None,
+    is_misc: bool = False,
+    misc_strategy: str = "auto_fill",
 ) -> FormFieldFillPlan:
     """Compute the fill plan for one FormField. Pure, no I/O."""
     # Accept dicts (DB-deserialized) and FormField pydantic models alike.
@@ -107,6 +199,25 @@ def plan_field_value(
     field_type = f.field_type
     label = f.label
     options = f.options or []
+
+    # Rule 0 — User per-field opt-out from gate 1. Documents and texts
+    # carry an explicit choice; both `skip` and `ignore_for_now` mean
+    # "don't fill this." Optional+ignore_for_now is treated identically
+    # to optional+skip per the validator's allowed-choices table.
+    if field_choice in ("skip", "ignore_for_now"):
+        return FormFieldFillPlan(
+            field=f, value="", status="skipped", source="user_skipped",
+            reason=f"user_choice={field_choice}",
+        )
+
+    # Rule 1 — Misc opt-out. The misc bucket collapses non-document /
+    # non-text fields into one gate-1 line; `misc_strategy=ignore` means
+    # don't auto-fill any of them.
+    if is_misc and misc_strategy == "ignore":
+        return FormFieldFillPlan(
+            field=f, value="", status="skipped", source="user_skipped",
+            reason="misc_strategy=ignore",
+        )
 
     # File uploads — caller (adapter) supplies a path via tailored_documents
     # if available. We emit a sentinel path that the adapter swaps out OR
@@ -173,8 +284,23 @@ def plan_field_value(
             reason="optional_checkbox",
         )
 
-    # Textarea / free-text user_answer → mock placeholder
+    # Textarea / free-text user_answer:
+    #   a. Prefer the LLM-drafted real answer from gate-1 auto_generate.
+    #   b. Fall back to mock placeholder when no tailored answer is present.
     if field_type == "textarea" or f.expected_source == "user_answer":
+        if tailored_answers and field_index is not None:
+            entry = tailored_answers.get(str(field_index))
+            content: Optional[str] = None
+            if isinstance(entry, dict):
+                content = entry.get("content")
+            elif isinstance(entry, str):
+                content = entry
+            if content and str(content).strip():
+                return FormFieldFillPlan(
+                    field=f, value=str(content), status="filled",
+                    source="user_answer",
+                    reason=f"tailored_answers[{field_index}]",
+                )
         return FormFieldFillPlan(
             field=f, value=_mock_answer(label), status="filled",
             source="mock", reason="mock_answer",
@@ -192,10 +318,33 @@ def compute_form_values(
     profile: Dict[str, str],
     tailored_documents: Dict[str, Any],
     opportunity_data: Dict[str, Any],
+    *,
+    tailored_answers: Optional[Dict[str, Any]] = None,
+    requirement_items: Optional[List[Dict[str, Any]]] = None,
+    human_review_1: Optional[Dict[str, Any]] = None,
 ) -> List[FormFieldFillPlan]:
-    """Build the full fill plan. Caller passes raw DB-shape dicts or pydantic
-    models; we accept either."""
-    return [
-        plan_field_value(f, profile or {}, tailored_documents or {}, opportunity_data or {})
-        for f in (form_fields or [])
-    ]
+    """Build the full fill plan.
+
+    Backward-compatible: if `tailored_answers`, `requirement_items`, or
+    `human_review_1` are not provided, the planner behaves as before
+    (no per-field skip / misc_strategy / tailored_answers fallback). New
+    callers (adapter `attempt_auto_fill`) should pass all three.
+    """
+    field_choice_map = _build_field_choice_map(requirement_items, human_review_1)
+    non_misc_indices = _build_non_misc_index_set(requirement_items)
+    misc_strategy = (human_review_1 or {}).get("misc_strategy", "auto_fill")
+
+    plans: List[FormFieldFillPlan] = []
+    for idx, f in enumerate(form_fields or []):
+        is_misc = bool(requirement_items) and (idx not in non_misc_indices)
+        plans.append(
+            plan_field_value(
+                f, profile or {}, tailored_documents or {}, opportunity_data or {},
+                tailored_answers=tailored_answers,
+                field_index=idx,
+                field_choice=field_choice_map.get(idx),
+                is_misc=is_misc,
+                misc_strategy=misc_strategy,
+            )
+        )
+    return plans
