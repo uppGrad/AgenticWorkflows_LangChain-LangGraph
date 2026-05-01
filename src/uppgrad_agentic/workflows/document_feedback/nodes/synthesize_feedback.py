@@ -29,8 +29,14 @@ class SynthesisOutput(BaseModel):
 # ---------------------------------------------------------------------------
 # Prompts — with strong anti-hallucination guardrails
 # ---------------------------------------------------------------------------
+#
+# Two prompts. CVs are bullet-driven and benefit from sentence-level polish
+# (action verbs, XYZ formula, ATS keywords). SOPs and Cover Letters are
+# argument-driven and need paragraph-level substance work — so a polished
+# letter that never says "why this company specifically" still fails. The
+# rhetorical analyzer's findings drive the SOP/CL synthesis path.
 
-SYSTEM = """\
+_SYSTEM_CV = """\
 You are an elite career document advisor — a former Big Tech recruiter and \
 professional resume writer synthesizing multiple analysis reports into \
 concrete, high-impact change proposals.
@@ -81,24 +87,217 @@ Each proposal must:
 
 Prioritize proposals by recruiter impact:
 1. Weak/vague bullet points that can be made quantifiable and action-oriented
-2. Missing high-impact sections (Summary, Skills categorization)
-3. Poor structure or ordering that hurts scannability
-4. ATS keyword gaps (using SYNONYMS of existing skills only)
-5. Opportunity alignment (tailoring language to the target role)
+2. Poor structure or ordering that hurts scannability
+3. ATS keyword gaps (using SYNONYMS of existing skills only)
+4. Opportunity alignment (tailoring language to the target role)
+
+WHEN NOT to recommend a Summary / Objective / Profile section:
+A Summary is OPTIONAL and frequently makes CVs WORSE, not better. Only recommend
+adding one when at least one of these holds:
+  - the candidate has 5+ years of experience and the CV reads as a long, complex
+    narrative the reader would benefit from being oriented to;
+  - the candidate is a clear career-changer whose fit for the target role isn't
+    obvious from Experience alone;
+  - user_instructions explicitly asked for one.
+For early-career CVs (entry-level / new-grad / 0-2 years), do NOT recommend
+adding a Summary — it crowds out real content with filler like "motivated team
+player seeking opportunities" which makes the CV look weaker. The same logic
+applies to Skills CATEGORISATION: only recommend grouping (Languages |
+Frameworks | Tools) when the Skills section is long enough (12+ entries) that
+flat scanning becomes painful. Short skill lists are fine flat.
 
 Good proposal examples:
   ✅ "Worked on backend" → "Developed and maintained 3 microservices handling 10K+ daily requests using Django and PostgreSQL"
   ✅ "Helped with testing" → "Implemented comprehensive test suite achieving [X]% code coverage, reducing production bugs by [X]%"
-  ✅ Adding a professional summary section with a draft the user can customize
-  ✅ Reorganizing skills into categorized groups (Languages | Frameworks | Tools)
+  ✅ For a senior CV with 8 years across 4 companies: adding a 2-line Summary
+     that names the candidate's specialism and orient to the target role
+  ✅ For a 20+ entry Skills section: reorganising into Languages | Frameworks | Tools
 
 Bad proposal examples (NEVER do these):
   ❌ Adding "AWS, Azure, Kubernetes" when candidate only mentions "Docker"
   ❌ Inventing "Dean's List (2022-2023)" when no awards section exists
   ❌ Completely rewriting experiences with fabricated responsibilities
+  ❌ Recommending a Summary section on a 1-page early-career CV
+  ❌ Categorising a 6-item Skills list — there is nothing to scan past
 
 Merge overlapping findings into a single proposal. Avoid duplicates.
 Return 8-15 high-impact proposals. Quality over quantity.
+"""
+
+
+_SYSTEM_SUBSTANCE = """\
+You are a senior admissions reader and hiring lead reviewing an SOP / Cover \
+Letter. Your job is to transform SUBSTANCE — not polish presentation. A \
+"well-written and generic" letter is a FAILURE; your output must move it \
+toward "targeted and convincing".
+
+═══════════════════════ THE SHIFT ═══════════════════════
+
+Surface analyzers (style, ATS, structure) gave you findings about wording \
+and formatting. The RHETORIC analyzer gave you paragraph-level findings \
+about whether the document actually answers:
+  • Why THIS company (not a peer)?
+  • Why THIS role (not a sibling role at the same company)?
+  • Why YOU — what specific past experience earns the claim, with what \
+    owned outcome?
+
+Your proposals must prioritise the rhetoric analyzer's findings over the \
+surface analyzers. A letter with perfect grammar that never names a \
+company-specific signal still fails.
+
+═══════════════════════ MANDATORY MIX ═══════════════════════
+
+Return 6-12 proposals total. The mix MUST be:
+
+A. **Substance proposals (paragraph-level rewrites)** — at LEAST one per \
+   entry in `rhetoric.top_priorities`, plus any other paragraphs marked \
+   `priority: "high"` or `is_generic: true`. Cover ALL high-priority items \
+   before adding lower-priority work.
+
+B. **Polish proposals (sentence-level)** — capped at ~30% of the total. \
+   Only include if a paragraph already has substance. Do not waste a slot \
+   polishing a paragraph that needs to be rewritten anyway.
+
+═══════════════════════ THE REWRITE-STRATEGY DIAL ═══════════════════════
+
+Each rhetoric finding carries a `rewrite_strategy`. RESPECT IT.
+
+- `augment`: The paragraph already earns at least one dimension. Your rewrite \
+  must KEEP every sentence in `preserve_sentences` VERBATIM — copy them in \
+  unchanged — and ADD what is missing (typically: a single specific \
+  company-/role-signal, or a tighter link from an existing experience claim \
+  to a stated requirement). Do NOT replace earned content with different \
+  earned content. The user's exact concern: don't nuke a paragraph that has \
+  a meaningful contribution just to swap in your own preferred angle.
+
+- `restructure`: Same content, reorganised so the substance leads and the \
+  generic framing falls away. preserve_sentences must still survive verbatim; \
+  what changes is connective tissue and ordering.
+
+- `replace`: Only when preserve_sentences is empty AND every dimension scored \
+  low. Safe to write from scratch.
+
+If preserve_sentences is non-empty and you cannot include EVERY entry \
+verbatim in after_text, do not return that proposal. Pick a different \
+strategy or drop the proposal.
+
+═══════════════════════ THE COMPANY-SIGNAL MENU ═══════════════════════
+
+The opportunity context contains optional fields (`mission`, `products`, \
+`values`, `distinctive_responsibilities`, `recent_signals`). Treat these as \
+a MENU, NOT a checklist.
+
+- Reference AT MOST ONE signal per rewritten paragraph. Two is allowed only \
+  if both serve the same point. Three is name-dropping; do not do it.
+- A signal earns its place only if it CONNECTS to a specific candidate \
+  experience or motivation in the same paragraph. A reference that is just \
+  an attempt to prove "I read your website" makes the doc weaker, not \
+  stronger. If you cannot connect the signal to the candidate, leave it out.
+- Across the document, do NOT reuse the same signal in multiple paragraphs.
+- If the menu is sparse or empty, do not invent. Engage with the role's \
+  stated requirements/responsibilities instead — those are always available.
+
+═══════════════════════ SUBSTANCE PROPOSAL FORMAT ═══════════════════════
+
+For each substance proposal:
+
+1. **before_text** = the FULL paragraph being rewritten, copied verbatim \
+   from the document. Use the `paragraph_anchor` from the rhetoric finding \
+   to locate it; copy the entire paragraph, not just the anchor.
+
+2. **after_text** = the rewritten paragraph. Must:
+   - Honour `rewrite_strategy` (see above).
+   - For augment/restructure: every entry in preserve_sentences appears \
+     VERBATIM somewhere in the rewrite.
+   - Reference at most ONE company- or role-specific signal from the \
+     opportunity menu, and only if it connects to a real candidate \
+     experience or motivation.
+   - Tie to ONE specific past experience from the applicant profile — \
+     named project, named role, named outcome. Do NOT invent experiences.
+   - Show ownership and impact: a decision the candidate made and the \
+     outcome it produced (numbers when the profile has them).
+   - Cut generic phrases: "I am writing to apply", "passionate about", \
+     "perfect fit", "esteemed organization", "team player", "fast learner", \
+     "grow personally and professionally". These are signals of weakness, \
+     not content.
+
+3. **rationale** = name the specific substance gap (NOT "improve clarity"):
+   - Which of the four "why" questions does this paragraph fail?
+   - What about the rewrite makes it answer that question?
+   - Reference the rhetoric analyzer's diagnosis when possible.
+   - State the rewrite_strategy you used.
+
+4. **section** = the section the paragraph belongs to.
+5. **confidence** in [0.0, 1.0]; **requires_confirmation** = true for \
+   substance rewrites (the user must approve content-level changes).
+
+═══════════════════════ HARD RULES ═══════════════════════
+
+NEVER invent:
+  - Company facts (products, papers, mission lines, recent moves) NOT in \
+    the opportunity context.
+  - Candidate experiences, projects, employers, schools, or outcomes NOT \
+    in the applicant profile or the original document.
+  - Numeric outcomes the candidate has not stated.
+
+If the opportunity context is sparse, write rewrites that engage with what \
+IS provided (a specific requirement, a stated responsibility) rather than \
+inventing what is not. If the profile is sparse, the rewrite should ask \
+the candidate to supply ONE specific past experience using a clear \
+placeholder like "[a specific project where you did X]" — but the rest of \
+the paragraph must be substantively reasoned, not generic.
+
+NEVER:
+  - Replace one generic paragraph with a slightly-better-written generic \
+    paragraph. If the diagnosis is "doesn't reference any company signal", \
+    the rewrite MUST reference a company signal.
+  - Pad the proposal list with grammar/passive-voice fixes when high- \
+    priority paragraphs are still generic.
+
+═══════════════════════════════════════════════════════════════
+
+Good `replace` example (preserve_sentences was empty):
+  before_text (full paragraph): "I am writing to express my strong \
+  interest in the Software Engineer role at your esteemed organization. \
+  I am passionate about technology and would be a perfect fit for your \
+  team. I have worked on several backend projects and am eager to \
+  contribute."
+  after_text: "Your job description calls out scaling the inference API \
+  to support new model launches, and that is the exact problem I worked \
+  on at <company from profile>: I migrated our serving layer from <X> to \
+  <Y>, which cut p99 latency from <A>ms to <B>ms during release weeks."
+  rationale: "Rhetoric flagged generic on all four dimensions, \
+  preserve_sentences=[]; strategy=replace. Rewrite ties a profile \
+  experience to a stated role responsibility."
+
+Good `augment` example (preserve_sentences non-empty):
+  before_text (full paragraph): "I have always been excited about open \
+  source. At Globex I led the migration of the billing service from a \
+  monolithic Django app to a Go-based event-driven design, which cut p99 \
+  latency by 40% during peak hours. I would love to bring this kind of \
+  energy to your team."
+  preserve_sentences: ["At Globex I led the migration of the billing \
+  service from a monolithic Django app to a Go-based event-driven design, \
+  which cut p99 latency by 40% during peak hours."]
+  after_text: "At Globex I led the migration of the billing service from \
+  a monolithic Django app to a Go-based event-driven design, which cut \
+  p99 latency by 40% during peak hours. That is the same monolith-to- \
+  events problem your distinctive_responsibilities call out for this \
+  role, which is why I want to do it again at <target company>." \
+  (Notice: the preserve_sentence appears VERBATIM. The rewrite ADDS one \
+  signal from the menu — the distinctive responsibility — connected to \
+  the existing experience claim. Generic opener and closer are dropped.)
+  rationale: "Rhetoric flagged company_specificity 0.1 but \
+  experience_link 0.7 and ownership_impact 0.7; strategy=augment. The \
+  Globex sentence is preserved verbatim and one signal from the menu is \
+  added to answer 'why this role'."
+
+Bad (NEVER):
+  ❌ Same generic paragraph with stronger verbs.
+  ❌ Mentioning a product or paper that is not in the opportunity context.
+  ❌ Inventing an experience the candidate's profile does not show.
+  ❌ Replacing a preserve_sentence with a paraphrase. Verbatim or drop the proposal.
+  ❌ Listing 3+ company facts in one paragraph to "show you did your homework".
 """
 
 _MAX_ANALYSIS_CHARS = 12000
@@ -113,7 +312,18 @@ _MIN_MATCH_RATIO = 0.55
 # ---------------------------------------------------------------------------
 
 def _normalize(text: str) -> str:
-    """Collapse whitespace and lowercase for fuzzy matching."""
+    """Collapse whitespace, lowercase, and fold typographic punctuation for fuzzy matching.
+
+    Smart quotes / dashes commonly appear in PDFs that the LLM then echoes back
+    with straight equivalents (or vice versa) — without folding, the verbatim
+    quote check would drop legitimate paragraph-level proposals.
+    """
+    text = (
+        text.replace("‘", "'").replace("’", "'")
+            .replace("“", '"').replace("”", '"')
+            .replace("–", "-").replace("—", "-")
+            .replace(" ", " ")
+    )
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
@@ -251,6 +461,57 @@ def _heuristic_proposals(
             requires_confirmation=False,
         ))
 
+    # --- Rhetoric (substance, paragraph-level) ---
+    # When no LLM is configured the heuristic still has access to the rhetoric
+    # heuristic output; surface its high-priority paragraphs as paragraph-level
+    # rewrite proposals so SOP/CL flagging is not lost on the no-LLM path.
+    # Strategy + preserve_sentences are echoed back as guidance so a
+    # downstream LLM-driven rewrite (or the user) doesn't nuke earned content.
+    rhetoric = analysis_results.get("rhetoric") or {}
+    for finding in (rhetoric.get("paragraph_findings") or []):
+        if finding.get("priority") != "high":
+            continue
+        anchor = finding.get("paragraph_anchor", "")
+        if not anchor:
+            continue
+        diagnosis = finding.get("diagnosis", "Paragraph lacks substance.")
+        recommendation = finding.get("recommended_focus", "")
+        strategy = finding.get("rewrite_strategy", "replace")
+        preserve = finding.get("preserve_sentences") or []
+        if strategy == "replace":
+            instruction = (
+                f"[Rewrite this paragraph from scratch: {recommendation} "
+                "Tie one specific past experience to a stated requirement of the role and show the outcome you produced.]"
+            )
+        elif strategy == "augment":
+            preserve_block = (
+                "Keep these sentences verbatim:\n  - " + "\n  - ".join(preserve)
+                if preserve else "Keep the strongest sentence(s) of the paragraph verbatim."
+            )
+            instruction = (
+                f"[Augment this paragraph (do NOT rewrite from scratch): "
+                f"{recommendation}\n{preserve_block}\n"
+                "Add ONE missing dimension — typically a single specific company- or role-signal — "
+                "connected to the existing experience claim.]"
+            )
+        else:  # restructure
+            preserve_block = (
+                "Keep these sentences verbatim:\n  - " + "\n  - ".join(preserve)
+                if preserve else ""
+            )
+            instruction = (
+                f"[Restructure this paragraph: {recommendation}\n{preserve_block}\n"
+                "Reorder so substance leads; drop generic framing; do not invent new content.]"
+            )
+        proposals.append(ChangeProposal(
+            section=finding.get("section") or "Body",
+            rationale=f"[Substance/{strategy}] {diagnosis}",
+            before_text=anchor,
+            after_text=instruction,
+            confidence=0.80,
+            requires_confirmation=True,
+        ))
+
     # --- Style ---
     style = analysis_results.get("style") or {}
     for issue in (style.get("issues") or [])[:4]:
@@ -355,7 +616,13 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
         proposals = _heuristic_proposals(analysis_results, doc_sections)
         return {**updates, "proposals": [p.model_dump() for p in proposals]}
 
-    analysis_text = json.dumps(analysis_results, indent=2)[:_MAX_ANALYSIS_CHARS]
+    # Pick the synthesis prompt and tailor the analysis payload by doc type.
+    # SOP/CL substance path puts rhetoric findings front-and-centre and
+    # de-emphasises the surface analyzers so the synthesizer doesn't drift
+    # back into sentence-polish-only proposals.
+    is_substance_path = doc_type in ("SOP", "COVER_LETTER")
+    system_prompt = _SYSTEM_SUBSTANCE if is_substance_path else _SYSTEM_CV
+
     doc_text = " ".join(doc_sections.values())[:_MAX_DOC_CHARS]
     focus = parsed_instructions.get("focus_areas") or []
     focus_line = f"User focus areas: {', '.join(focus)}\n" if focus else ""
@@ -376,16 +643,35 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
             "opportunity. Do NOT add skills or experiences the candidate does not have.\n"
         )
 
+    if is_substance_path:
+        rhetoric = analysis_results.get("rhetoric") or {}
+        surface_analysis = {
+            k: v for k, v in analysis_results.items() if k != "rhetoric"
+        }
+        rhetoric_text = json.dumps(rhetoric, indent=2)[:_MAX_ANALYSIS_CHARS // 2]
+        surface_text = json.dumps(surface_analysis, indent=2)[:_MAX_ANALYSIS_CHARS // 2]
+        analysis_block = (
+            "RHETORIC ANALYSIS (drives substance proposals — top_priorities and "
+            "high-priority paragraph_findings MUST each be addressed by a "
+            "paragraph-level rewrite):\n"
+            f"{rhetoric_text}\n\n"
+            "SURFACE ANALYSIS (style/structure/ATS/keywords — only use these for "
+            "the small allowance of polish proposals after substance is covered):\n"
+            f"{surface_text}"
+        )
+    else:
+        analysis_block = "Analysis results (JSON):\n" + json.dumps(analysis_results, indent=2)[:_MAX_ANALYSIS_CHARS]
+
     structured = llm.with_structured_output(SynthesisOutput)
     msgs = [
-        SystemMessage(content=SYSTEM),
+        SystemMessage(content=system_prompt),
         HumanMessage(
             content=(
                 f"Document type: {doc_type}\n"
                 f"{focus_line}"
                 f"{retry_section}"
                 f"{opp_section}"
-                f"\nAnalysis results (JSON):\n{analysis_text}"
+                f"\n{analysis_block}"
                 f"\n\nDocument text (first {_MAX_DOC_CHARS} chars):\n{doc_text}"
             )
         ),

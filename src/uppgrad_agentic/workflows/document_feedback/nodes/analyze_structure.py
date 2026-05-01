@@ -90,6 +90,23 @@ Be specific and actionable. Only flag real problems, not stylistic preferences.
 If a "User focus" block is provided, prioritise structural findings that serve those goals.
 If an "Applicant profile" block is provided (e.g. target roles, education stage), let it inform
 expectations about what sections matter most — never invent details not present in it.
+
+CV-specific rules — read carefully, these correct common LLM defaults:
+- A "Summary" / "Objective" / "Profile" section is OPTIONAL, not required. Only flag
+  its absence as a missing_section when one of these is true:
+  (a) the applicant has 5+ years of experience and the CV reads as a long, complex
+      narrative the reader would benefit from being oriented to;
+  (b) the applicant is a clear career-changer and the CV's fit for the target role
+      isn't obvious from the Experience section;
+  (c) the user's instructions explicitly asked for one.
+  For early-career CVs, a generic summary is filler that displaces real content
+  ("motivated team player seeking opportunities" makes the CV WORSE). Default to
+  NOT recommending a Summary section.
+- Required CV sections are: Experience (or equivalent), Education, Skills.
+  Everything else is contextual.
+- Skills CATEGORISATION (Languages | Frameworks | Tools) is also contextual.
+  Recommend it only when the existing Skills section is long enough (12+ entries)
+  that grouping aids scanning. A short skills list is fine flat.
 """
 
 
