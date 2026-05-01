@@ -144,6 +144,75 @@ async def _detect_captcha(page) -> bool:
     return False
 
 
+async def _locate_file_input(page, field) -> tuple[Any, str]:
+    """File-input-specific lookup that survives Greenhouse/Workable-style
+    custom uploaders (visible `<button>Attach</button>` + hidden
+    `<input type="file">`).
+
+    Walks four tiers, in order:
+      1. `input[type="file"]` matched by `name` / `id` — the obvious case
+         when the LLM extracted the actual input's attrs.
+      2. Inputs scoped under the section labelled with `field.label`. We
+         locate the label (heading / strong / `<label>`) by text, walk up
+         to the nearest reasonable container (the closest `<fieldset>`,
+         `<section>`, or 5 ancestor levels), and look for a file input
+         inside. This is what disambiguates "Resume/CV" from "Cover Letter"
+         on Greenhouse (each block has its own hidden file input).
+      3. First `input[type="file"]` on the page — fine when there's only
+         one.
+      4. None — caller falls back to LLM picker (Tier 4).
+    """
+    name = (field.name or "").strip()
+    label = (field.label or "").strip()
+
+    if name:
+        for sel in (
+            f'input[type="file"][name="{name}"]',
+            f'input[type="file"][id="{name}"]',
+        ):
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                return loc.first, "file_name_or_id"
+
+    if label:
+        # Use Playwright's text matcher to find the label heading. This is
+        # broader than `get_by_label` (which would return the FIRST control
+        # the label is associated with — typically the button). We want the
+        # text node itself, then walk to its parent section.
+        for sel in (
+            f'label:has-text("{label}")',
+            f'div:has-text("{label}")',
+            f'h2:has-text("{label}")', f'h3:has-text("{label}")',
+            f'h4:has-text("{label}")', f'strong:has-text("{label}")',
+        ):
+            try:
+                heading = page.locator(sel).first
+                if await heading.count() == 0:
+                    continue
+            except Exception:
+                continue
+            # Walk up via closest() until we hit a meaningful container,
+            # then look inside it.
+            for ancestor_sel in (
+                "xpath=ancestor::fieldset[1]",
+                "xpath=ancestor::section[1]",
+                "xpath=ancestor::div[descendant::input[@type='file']][1]",
+                "xpath=ancestor::*[5]",
+            ):
+                try:
+                    container = heading.locator(ancestor_sel)
+                    file_in = container.locator('input[type="file"]').first
+                    if await file_in.count() > 0:
+                        return file_in, "file_in_labelled_container"
+                except Exception:
+                    continue
+
+    loc = page.locator('input[type="file"]')
+    if await loc.count() > 0:
+        return loc.first, "first_file_input"
+    return None, "none"
+
+
 async def _locate(page, field) -> tuple[Any, str]:
     """Tier 1 + 2. Returns (locator, method) or (None, "none")."""
     name = (field.name or "").strip()
@@ -156,6 +225,9 @@ async def _locate(page, field) -> tuple[Any, str]:
         if tag:
             return [f'{tag}[name="{name}"]', f'{tag}[id="{name}"]']
         return [f'[name="{name}"]', f'[id="{name}"]']
+
+    if field_type == "file":
+        return await _locate_file_input(page, field)
 
     if name:
         if field_type == "select":
@@ -173,14 +245,6 @@ async def _locate(page, field) -> tuple[Any, str]:
                 loc = page.locator(sel)
                 if await loc.count() > 0:
                     return loc.first, "name_or_id"
-        elif field_type == "file":
-            for sel in (f'input[type="file"][name="{name}"]', f'input[type="file"][id="{name}"]'):
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    return loc.first, "name_or_id_file"
-            loc = page.locator('input[type="file"]')
-            if await loc.count() > 0:
-                return loc.first, "first_file_input"
         else:
             for sel in _selectors_for(None):
                 loc = page.locator(sel)
@@ -250,7 +314,23 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
             await locator.set_input_files(value, timeout=3000)
             return ("ok", "set_input_files")
         except Exception as exc:
-            return ("file_error", str(exc)[:90])
+            err = str(exc)
+            # Greenhouse-style "Attach" buttons: the resolved locator is
+            # a `<button>`, not the hidden `<input type="file">`. Retry
+            # by walking from the locator to its nearest sibling/
+            # descendant file input within a small ancestor window.
+            if "HTMLInputElement" in err or "set_input_files" in err:
+                try:
+                    sibling = locator.locator(
+                        "xpath=ancestor-or-self::*"
+                        "[descendant-or-self::input[@type='file']][1]"
+                    ).locator('input[type="file"]').first
+                    if await sibling.count() > 0:
+                        await sibling.set_input_files(value, timeout=3000)
+                        return ("ok", "set_input_files:sibling_recovery")
+                except Exception:
+                    pass
+            return ("file_error", err[:90])
 
     if field_type == "select":
         if method == "name_or_id_native_select":

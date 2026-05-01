@@ -189,6 +189,60 @@ def test_fills_file_upload(fake_resume):
     assert result.fields_failed == 0
 
 
+# Greenhouse-style markup — `<button>Attach</button>` stack visible, real
+# `<input type="file">` hidden. Two upload sections (Resume/CV + Cover
+# Letter) each with their own hidden input, scoped under a labelled
+# container. `_locate_file_input` must pick the matching one for each.
+_GREENHOUSE_FORM_HTML = """\
+<!doctype html>
+<html><body>
+  <h1>Apply</h1>
+  <form id="apply" action="/never" method="post" onsubmit="return false">
+    <fieldset id="resume-block">
+      <legend>Resume/CV</legend>
+      <button type="button">Attach</button>
+      <button type="button">Dropbox</button>
+      <button type="button">Google Drive</button>
+      <button type="button">Enter manually</button>
+      <input type="file" id="s3_upload_for_resume"
+             style="position:absolute;left:-9999px" />
+    </fieldset>
+
+    <fieldset id="cl-block">
+      <legend>Cover Letter</legend>
+      <button type="button">Attach</button>
+      <button type="button">Dropbox</button>
+      <button type="button">Google Drive</button>
+      <button type="button">Enter manually</button>
+      <input type="file" id="s3_upload_for_cover_letter"
+             style="position:absolute;left:-9999px" />
+    </fieldset>
+  </form>
+</body></html>
+"""
+
+
+def test_resolves_hidden_file_input_via_labelled_container(fake_resume):
+    """Greenhouse-style: the FormField the LLM extracted has label='Resume/CV'
+    but no matching `name` (the visible Attach button is not the input).
+    The deterministic resolver must walk from the heading text into the
+    fieldset and find the hidden file input inside, NOT default to the
+    first input on the page (which would also work here but doesn't
+    disambiguate Resume from Cover Letter)."""
+    plan = [
+        _plan(field=_f(label="Resume/CV", field_type="file", name=""),
+              value=fake_resume, source="user_document"),
+        _plan(field=_f(label="Cover Letter", field_type="file", name=""),
+              value=fake_resume, source="user_document"),
+    ]
+    with serve_form(_GREENHOUSE_FORM_HTML) as url:
+        result = asyncio.run(fill_form_async(url, plan, llm=None, headless=True))
+    assert result.fields_failed == 0, [r.detail for r in result.reports]
+    assert result.fields_filled_native == 2
+    # Both got `set_input_files` deterministically (no LLM picker needed).
+    assert all(r.outcome == "ok" for r in result.reports)
+
+
 def test_no_locator_when_field_missing_on_page():
     """Field references a name not present on the form. Without LLM, the
     deterministic tiers exhaust and the field is marked failed (not ok)."""
