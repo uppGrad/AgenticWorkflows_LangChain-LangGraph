@@ -137,8 +137,14 @@ _RESUME_TEMPLATE = r"""%-------------------------
 """
 
 # ---------------------------------------------------------------------------
-# LaTeX generation prompt
+# LaTeX generation prompts — branched by doc type
 # ---------------------------------------------------------------------------
+#
+# CV → resume template + bullet-list helpers (`\resumeItemPlain`, etc.).
+# SOP / COVER_LETTER → article template, plain paragraphs, NO bullet helpers
+# at all. The previous version applied the resume prompt to every doc type,
+# which made the LLM wrap each SOP/CL paragraph in `\resumeItemPlain` —
+# producing a rendered PDF where every paragraph showed as a bullet point.
 
 _LATEX_SYSTEM = r"""You are a professional resume/CV typesetter.
 You receive:
@@ -160,6 +166,88 @@ CRITICAL RULES:
   - Do NOT invent, fabricate, or add ANY facts, dates, skills, experiences, or achievements not present in the original document or the accepted proposals.
   - Do NOT remove any original content unless explicitly instructed by an accepted proposal.
   - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
+
+Return ONLY the complete LaTeX source code. No explanations, no markdown fences.
+Start with \documentclass and end with \end{document}.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Prose LaTeX template — for SOP / COVER_LETTER
+# ---------------------------------------------------------------------------
+# Plain article class. No resume bullet helpers. Paragraphs are typeset as
+# flowing paragraphs separated by blank lines (parskip), the way an SOP or
+# cover letter actually reads on paper.
+
+_PROSE_TEMPLATE = r"""%-------------------------
+% Prose document template (SOP / Cover Letter)
+% Tectonic-compatible.
+%-------------------------
+
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}      % blank-line paragraph breaks, no first-line indent
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+
+\begin{document}
+
+% Body goes here as flowing paragraphs separated by blank lines.
+% For Cover Letters, optionally start with a date and salutation, then
+% paragraphs, then a closing.
+% For SOPs, use \section*{...} headings ONLY when the original document
+% had clear section breaks; otherwise plain paragraphs.
+
+\end{document}
+"""
+
+
+_LATEX_SYSTEM_PROSE = r"""You are a professional typesetter rendering a \
+Statement of Purpose or Cover Letter into LaTeX.
+
+You receive:
+  1. The full plain-text of the document (extracted from a PDF).
+  2. A list of ACCEPTED change proposals (each with before_text, after_text, rationale).
+  3. A minimal LaTeX TEMPLATE (article class, parskip-based prose).
+
+YOUR TASK:
+  - Produce a COMPLETE, COMPILABLE LaTeX document using EXACTLY the template's preamble.
+  - Render the document as FLOWING PROSE PARAGRAPHS separated by blank lines.
+  - Incorporate every accepted change proposal (replace before_text with after_text).
+
+ABSOLUTE FORMATTING RULES — these are the most important rules:
+  - DO NOT use \begin{itemize} or \begin{enumerate} or any list environment.
+  - DO NOT use \item.
+  - DO NOT use \resumeItem, \resumeItemPlain, \resumeSubItem, \resumeSubheading, \
+\resumeSubHeadingListStart, \resumeItemListStart, or any resume-template commands. \
+These commands DO NOT EXIST in this template and will fail to compile.
+  - Each paragraph of the original document must render AS A PARAGRAPH — \
+plain text, separated from the next paragraph by ONE BLANK LINE. Nothing more.
+  - Cover letters: if the original has a date / address / salutation / closing, \
+keep them as plain paragraphs at top and bottom. No tables, no fancy headers.
+  - SOPs: use \section*{Heading Name} ONLY when the original document clearly \
+labelled a section. Otherwise just plain paragraphs in document order. Most \
+SOPs have no section headings — that is fine. Do NOT invent headings.
+
+OTHER CRITICAL RULES:
+  - Use EXACTLY the \documentclass and \usepackage lines from the template. \
+Do NOT add, remove, or change any packages.
+  - Do NOT use \input{glyphtounicode} or \pdfgentounicode.
+  - Do NOT use fontspec, moderncv, awesome-cv, or any custom .cls files.
+  - Do NOT invent, fabricate, or add ANY facts, claims, names, dates, or \
+experiences not present in the original document or the accepted proposals.
+  - Do NOT remove any original content unless an accepted proposal replaces it.
+  - When an accepted proposal has a non-empty before_text that matches a \
+paragraph in the original, REPLACE that paragraph with after_text. Apply \
+proposals once each. Do NOT duplicate paragraphs.
+  - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
+  - Curly/smart quotes are fine — they render correctly under utf8.
 
 Return ONLY the complete LaTeX source code. No explanations, no markdown fences.
 Start with \documentclass and end with \end{document}.
@@ -199,10 +287,18 @@ def _generate_latex(
             f"After: {p.get('after_text', '(empty)')}\n"
         )
 
+    # CV → resume template + bullet-list helpers.
+    # SOP / COVER_LETTER → prose template, no list helpers (avoids the
+    # bug where every paragraph rendered as a bullet point because the
+    # resume prompt instructed the LLM to wrap content in \resumeItemPlain).
+    is_prose = doc_type in ("SOP", "COVER_LETTER")
+    template = _PROSE_TEMPLATE if is_prose else _RESUME_TEMPLATE
+    system_prompt = _LATEX_SYSTEM_PROSE if is_prose else _LATEX_SYSTEM
+
     human_content = (
         f"Document type: {doc_type}\n\n"
-        f"=== LATEX TEMPLATE (use this preamble and commands EXACTLY) ===\n"
-        f"{_RESUME_TEMPLATE}\n\n"
+        f"=== LATEX TEMPLATE (use this preamble EXACTLY) ===\n"
+        f"{template}\n\n"
         f"=== ORIGINAL DOCUMENT TEXT ===\n"
         f"{raw_text[:_MAX_DOC_CHARS]}\n\n"
         f"=== ACCEPTED CHANGE PROPOSALS ({len(approved_proposals)} total) ===\n"
@@ -211,7 +307,7 @@ def _generate_latex(
     )
 
     msgs = [
-        SystemMessage(content=_LATEX_SYSTEM),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=human_content),
     ]
 
@@ -261,6 +357,33 @@ def _sanitize_latex(latex: str) -> str:
     return latex
 
 
+def _strip_resume_commands_for_prose(latex: str) -> str:
+    """Defense in depth for SOP/COVER_LETTER output.
+
+    The prose prompt forbids resume helpers and list environments, but if the
+    LLM regresses to its training-data prior and emits `\\resumeItemPlain` or
+    wraps paragraphs in itemize anyway, the prose template doesn't define
+    those commands — compilation would fail (or worse, succeed via the
+    fallback and still bullet everything). Unwrap them to plain paragraphs
+    so the rendered PDF is prose, not a bulleted list.
+    """
+    # Drop list-environment delimiters; keep the content between them.
+    latex = re.sub(r"\\begin\{(itemize|enumerate)\}\s*\n?", "", latex)
+    latex = re.sub(r"\\end\{(itemize|enumerate)\}\s*\n?", "", latex)
+    # Resume "list start/end" wrappers — same treatment.
+    latex = re.sub(r"\\resume(?:Item|SubHeading)?ListStart\s*\n?", "", latex)
+    latex = re.sub(r"\\resume(?:Item|SubHeading)?ListEnd\s*\n?", "", latex)
+    # \resumeItemPlain{X} → X (one paragraph). Same for \item{X} variants.
+    latex = re.sub(r"\\resumeItemPlain\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", r"\1\n", latex)
+    latex = re.sub(r"\\resumeSubItem\s*\{([^{}]*)\}\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", r"\1: \2\n", latex)
+    latex = re.sub(r"\\resumeItem\s*\{([^{}]*)\}\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}", r"\1: \2\n", latex)
+    # Bare \item — turn each into a paragraph break.
+    latex = re.sub(r"^\s*\\item\s+", "\n", latex, flags=re.MULTILINE)
+    # \resumeSubheading is too specific to safely unwrap; just drop the call.
+    latex = re.sub(r"\\resumeSubheading\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{[^{}]*\}", "", latex)
+    return latex
+
+
 def _aggressive_cleanup(latex: str) -> str:
     """More aggressive cleanup — strips anything non-essential."""
     latex = _sanitize_latex(latex)
@@ -270,6 +393,8 @@ def _aggressive_cleanup(latex: str) -> str:
         "fancyhdr", "babel", "tabularx", "geometry", "inputenc",
         "fontenc", "xcolor", "array", "multicol", "multirow",
         "textcomp", "latexsym", "marvosym", "amssymb",
+        # Prose-template packages
+        "parskip", "microtype",
     }
     lines = latex.split("\n")
     cleaned = []
@@ -424,6 +549,11 @@ def finalize(state: DocFeedbackState) -> dict:
     if llm_succeeded:
         # Sanitize common LLM mistakes that break tectonic
         latex_source = _sanitize_latex(latex_source)
+        # For SOP / COVER_LETTER, the prose template defines no resume / list
+        # commands. If the LLM regressed and emitted them anyway, unwrap to
+        # plain paragraphs so the PDF doesn't bullet-point every paragraph.
+        if doc_type in ("SOP", "COVER_LETTER"):
+            latex_source = _strip_resume_commands_for_prose(latex_source)
 
         pdf_bytes = compile_latex(latex_source)
         if pdf_bytes is None:
