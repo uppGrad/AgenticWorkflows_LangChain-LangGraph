@@ -202,6 +202,21 @@ def _llm_call(llm, system: str, user: str) -> Optional[str]:
         return None
 
 
+def _session_instructions_block(user_instructions: Optional[str]) -> str:
+    """Format the session-wide custom instructions for prompt injection.
+
+    Returns "" when blank so the prompt stays clean. The block is
+    deliberately separate from `=== USER GUIDANCE ===` (per-document
+    user_prompt) so the LLM can weight them independently — the
+    session-level instructions are global directives that apply to
+    every artifact in the session.
+    """
+    text = (user_instructions or "").strip()
+    if not text:
+        return ""
+    return f"=== SESSION-WIDE CUSTOM INSTRUCTIONS (apply across all artifacts) ===\n{text}\n\n"
+
+
 def _t1_prompt(
     doc_type: str,
     opportunity_data: Dict[str, Any],
@@ -210,9 +225,11 @@ def _t1_prompt(
     uploaded_text: str,
     pre_analysis,
     user_prompt: Optional[str],
+    user_instructions: Optional[str],
 ) -> str:
     return (
         f"Document type: {doc_type}\n\n"
+        + _session_instructions_block(user_instructions)
         + _opp_context(opportunity_data, opportunity_type) + "\n"
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV ===\n{_cv_text(profile)}\n\n"
@@ -237,9 +254,11 @@ def _t2_prompt(
     t1_output: str,
     post_analysis,
     user_prompt: Optional[str],
+    user_instructions: Optional[str],
 ) -> str:
     return (
         f"Document type: {doc_type}\n\n"
+        + _session_instructions_block(user_instructions)
         + _opp_context(opportunity_data, opportunity_type) + "\n"
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV ===\n{_cv_text(profile)}\n\n"
@@ -263,11 +282,13 @@ def _generate_doc_prompt(
     opportunity_type: str,
     profile: Dict[str, Any],
     user_prompt: Optional[str],
+    user_instructions: Optional[str],
 ) -> str:
     return (
         f"Document type: {doc_type}\n"
         + (f"Canonical type: {canonical_type}\n" if canonical_type else "")
         + "\n"
+        + _session_instructions_block(user_instructions)
         + _opp_context(opportunity_data, opportunity_type) + "\n"
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV (source of facts) ===\n{_cv_text(profile)}\n\n"
@@ -281,9 +302,11 @@ def _generate_text_prompt(
     opportunity_data: Dict[str, Any],
     opportunity_type: str,
     profile: Dict[str, Any],
+    user_instructions: Optional[str],
 ) -> str:
     return (
         f"Question: {question}\n\n"
+        + _session_instructions_block(user_instructions)
         + _opp_context(opportunity_data, opportunity_type) + "\n"
         + f"=== USER PROFILE ===\n{_profile_summary(profile)}\n\n"
         + f"=== USER CV ===\n{_cv_text(profile)}\n\n"
@@ -304,6 +327,7 @@ def _process_document(
     opportunity_type: str,
     profile: Dict[str, Any],
     llm,
+    user_instructions: Optional[str] = "",
 ) -> Optional[Dict[str, Any]]:
     """Return a tailored_documents entry, or None if nothing to produce."""
     doc_type = item.get("document_type") or item.get("label") or "Document"
@@ -330,7 +354,7 @@ def _process_document(
         # T1
         t1 = _llm_call(
             llm, _SYSTEM_T1,
-            _t1_prompt(doc_type, opportunity_data, opportunity_type, profile, uploaded_text, pre, user_prompt),
+            _t1_prompt(doc_type, opportunity_data, opportunity_type, profile, uploaded_text, pre, user_prompt, user_instructions),
         )
         if not t1:
             return {
@@ -348,7 +372,7 @@ def _process_document(
         # T2
         t2 = _llm_call(
             llm, _SYSTEM_T2,
-            _t2_prompt(doc_type, opportunity_data, opportunity_type, profile, t1, post, user_prompt),
+            _t2_prompt(doc_type, opportunity_data, opportunity_type, profile, t1, post, user_prompt, user_instructions),
         )
         final = t2 or t1
 
@@ -379,7 +403,7 @@ def _process_document(
         canonical_type = item.get("document_type")
         text = _llm_call(
             llm, _SYSTEM_GENERATE_DOC,
-            _generate_doc_prompt(doc_type, canonical_type, opportunity_data, opportunity_type, profile, user_prompt),
+            _generate_doc_prompt(doc_type, canonical_type, opportunity_data, opportunity_type, profile, user_prompt, user_instructions),
         )
         if not text:
             return {
@@ -410,6 +434,7 @@ def _process_text(
     opportunity_type: str,
     profile: Dict[str, Any],
     llm,
+    user_instructions: Optional[str] = "",
 ) -> Optional[Dict[str, Any]]:
     if choice != "auto_generate":
         return None
@@ -429,7 +454,7 @@ def _process_text(
 
     text = _llm_call(
         llm, _SYSTEM_GENERATE_TEXT,
-        _generate_text_prompt(question, opportunity_data, opportunity_type, profile),
+        _generate_text_prompt(question, opportunity_data, opportunity_type, profile, user_instructions),
     )
     if not text:
         return {
@@ -465,6 +490,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
     requirement_items: List[Dict[str, Any]] = list(state.get("requirement_items") or [])
     human_review_1 = state.get("human_review_1") or {}
     requirements: Dict[str, Dict[str, Any]] = human_review_1.get("requirements") or {}
+    user_instructions: str = (state.get("user_instructions") or "").strip()
 
     if not requirement_items or not requirements:
         logger.warning("application_tailoring: missing requirement_items or gate-1 requirements")
@@ -491,6 +517,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
             result = _process_document(
                 item, choice, uploaded_text, user_prompt,
                 opportunity_data, opportunity_type, profile, llm,
+                user_instructions=user_instructions,
             )
             if result is not None:
                 doc_type = item.get("document_type") or item.get("label") or "Document"
@@ -499,6 +526,7 @@ def application_tailoring(state: AutoApplyState) -> dict:
             result = _process_text(
                 item, choice, user_prompt,
                 opportunity_data, opportunity_type, profile, llm,
+                user_instructions=user_instructions,
             )
             if result is not None:
                 ffi = item.get("form_field_index")

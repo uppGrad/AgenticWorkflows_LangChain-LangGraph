@@ -41,3 +41,4 @@ htmlcov/
 
 # Claude Code
 .claude/
+imported_plan.md
