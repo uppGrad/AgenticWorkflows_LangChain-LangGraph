@@ -19,6 +19,16 @@ class AutoApplyState(TypedDict, total=False):
     opportunity_type: OpportunityType
     opportunity_id: str
 
+    # Optional session-wide free-text guidance the user enters in the
+    # "Custom instructions" box on the start-session form (e.g. "Emphasise
+    # my Python and ML coursework. Keep cover letter under 300 words.").
+    # Distinct from the per-document `user_prompt` collected at gate 1:
+    # this string applies across every tailored document and every
+    # auto-generated text answer in the session. Threaded into the
+    # tailoring prompts as a top-level guidance block. Empty string when
+    # the user left it blank.
+    user_instructions: str
+
     # opportunity intelligence
     opportunity_data: Dict[str, Any]          # raw DB record
     scraped_requirements: Dict[str, Any]      # ScrapeResult dict: status, requirements, confidence, source
