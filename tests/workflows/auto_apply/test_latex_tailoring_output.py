@@ -34,16 +34,31 @@ from uppgrad_agentic.workflows.auto_apply.nodes.application_tailoring import (
 # ─── template_for ────────────────────────────────────────────────────────────
 
 def test_template_for_cv_returns_resume_layout():
+    """CV uses the sb2nov resume template (sourced from doc-feedback's
+    finalize node). Spot-check the custom commands the LLM is told to
+    use are defined in the preamble."""
     t = template_for("CV")
     assert t is CV_TEMPLATE
-    assert r"\section" in t  # resume-style sections
+    assert r"\resumeItem" in t
+    assert r"\resumeSubheading" in t
+    assert r"\resumeItemListStart" in t
 
 
-def test_template_for_cover_letter_returns_letter_layout():
+def test_template_for_cover_letter_returns_prose_layout():
+    """Cover letters use the doc-feedback prose template — parskip-based
+    article, no resume-helper definitions (which would fail to compile
+    in this preamble) and no list environments. The placeholder comment
+    inside the body markers DOES reference the resume commands as a
+    "do NOT use these" warning to the LLM, which is fine; we just
+    check that the resume helpers are not DEFINED here."""
     t = template_for("Cover Letter")
     assert t is COVER_LETTER_TEMPLATE
-    # Cover letters intentionally have NO \section — they read as paragraphs
-    assert r"\titleformat" not in t
+    # No `\newcommand` defining the resume helpers — the prose preamble
+    # would reject the `\resumeItem*` calls at compile time, which is
+    # the whole point of the doc-type split.
+    assert r"\newcommand{\resumeItem" not in t
+    assert r"\newcommand{\resumeSubheading" not in t
+    assert r"parskip" in t
 
 
 def test_template_for_motivation_letter_routes_to_cover_letter():
@@ -55,6 +70,21 @@ def test_template_for_unknown_falls_back_to_generic():
     assert template_for("Some Random Doc") is GENERIC_TEMPLATE
     assert template_for(None) is GENERIC_TEMPLATE
     assert template_for("") is GENERIC_TEMPLATE
+
+
+def test_cv_and_prose_templates_share_doc_feedback_lineage():
+    """Sanity check that the templates we copy from doc-feedback's
+    finalize node still match the contract (preamble fixed, body
+    placeholder marked). If finalize.py drifts, this test will need
+    re-syncing — leave a clear path for the maintainer."""
+    cv = template_for("CV")
+    prose = template_for("SOP")
+    for tpl in (cv, prose):
+        assert r"\documentclass" in tpl
+        assert r"\begin{document}" in tpl
+        assert r"\end{document}" in tpl
+        assert "% --- BEGIN BODY ---" in tpl
+        assert "% --- END BODY ---" in tpl
 
 
 # ─── _extract_latex_source ───────────────────────────────────────────────────

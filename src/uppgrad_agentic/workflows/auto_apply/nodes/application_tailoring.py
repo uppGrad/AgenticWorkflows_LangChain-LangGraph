@@ -172,12 +172,29 @@ Strict rules for the LaTeX you emit:
     placeholder comment between them with the actual document content.
   * Use ONLY commands defined in the preamble. Do not add \\usepackage{...}
     lines, do not call \\input or \\include, do not use shell-escape commands.
-  * Escape LaTeX-special characters in user content:
+  * For CV documents, use the resume helpers defined in the preamble:
+      \\section{Section Name}
+      \\resumeSubHeadingListStart / \\resumeSubHeadingListEnd
+      \\resumeSubheading{ORG}{LOCATION}{TITLE/DEGREE}{DATES}
+      \\resumeItemListStart / \\resumeItemListEnd
+      \\resumeItemPlain{Bullet text}        % unlabelled bullet
+      \\resumeItem{Label}{Bullet text}      % labelled (e.g. category headers)
+      \\resumeSubItem{Label}{Description}   % nested sub-bullet
+    Do NOT invent additional commands.
+  * For COVER LETTER / SOP / Personal Statement / Motivation Letter
+    documents, the prose template has NO list helpers. NEVER use
+    \\begin{itemize}, \\begin{enumerate}, \\item, or any \\resume*
+    command — they don't exist in this preamble and will fail to compile.
+    Render every paragraph as flowing prose, separated by ONE blank line.
+  * Escape LaTeX-special characters in user content (this includes the
+    URL portion of \\href{URL}{LABEL} — underscores in email addresses
+    must be \\_ even inside the URL argument):
       &  →  \\&     %  →  \\%     $  →  \\$     #  →  \\#
       _  →  \\_     {  →  \\{     }  →  \\}     ~  →  \\textasciitilde{}
       ^  →  \\textasciicircum{}
   * For URLs use \\href{https://...}{label}. Plain URLs without \\href will
-    misformat.
+    misformat. For mailto links: \\href{mailto:user\\_name@example.com}{user\\_name@example.com}
+    — note both arguments need _ escaped.
   * End with \\end{document}.
 """
 

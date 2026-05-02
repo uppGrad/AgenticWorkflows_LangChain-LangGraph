@@ -58,11 +58,23 @@ def resolve_application_form_url(overview_url: str) -> Optional[str]:
     if host.endswith(".smartrecruiters.com") or host == "smartrecruiters.com":
         return _ensure_suffix(overview_url, "/apply")
 
+    # Workable: `<listing>/apply/`. The listing URL renders metadata + an
+    # "Apply for this job" button that NAVIGATES to the apply form (a
+    # different route, NOT a same-page progressive disclosure). For
+    # single-page Workable apply forms, every input lives on `/apply/`
+    # server-rendered after hydration. Pre-resolving here lets the
+    # standard fetch flow grab the form HTML directly without clicking
+    # any button — passive extraction only, no submission risk. Multi-
+    # step Workable variants (page-2 file upload + Q&A behind a
+    # "Continue" button) are still out of scope; see ats_coverage.md.
+    if host == "apply.workable.com":
+        return _ensure_suffix(overview_url, "/apply") + "/"
+
     # Workday: auth wall. No deterministic public form URL.
     if host.endswith(".myworkdayjobs.com"):
         return None
 
-    # Greenhouse, Workable, and unknown hosts (e.g. company-direct careers
-    # pages like mongodb.com/careers/jobs/...): form is on the same URL as
+    # Greenhouse and unknown hosts (e.g. company-direct careers pages
+    # like mongodb.com/careers/jobs/...): form is on the same URL as
     # the overview, possibly rendered below the description.
     return overview_url
