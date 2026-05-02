@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 from typing import List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
+from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
+from uppgrad_agentic.common.llm import get_llm
 from uppgrad_agentic.tools.ats_form_urls import resolve_application_form_url
 from uppgrad_agentic.tools.search import SearchProvider, SearchResult
 from uppgrad_agentic.tools.web_fetcher import FetchResult, fetch_url_with_fallback
@@ -167,31 +169,195 @@ def _location_is_agnostic(location: str) -> bool:
     return any(tok in lowered for tok in _LOCATION_AGNOSTIC_TOKENS)
 
 
-def _location_mismatch(source_location: str, candidate_text: str) -> Optional[str]:
-    """Detect when the candidate page is for a different country than the
-    source posting. Returns a human-readable reason string when a
-    mismatch is detected; None when no constraint applies or both sides
-    agree on at least one country.
+def _location_verdict_deterministic(
+    source_location: str, candidate_text: str,
+) -> Tuple[str, Optional[str], set, set]:
+    """Cheap, deterministic, microsecond-fast country-set check. Returns
+    `(verdict, reason, src_countries, cand_countries)`:
 
-    The candidate text is searched in its first 4000 chars only —
-    location signals are typically near the top of an apply page (header,
-    "Location:" line, hero section) and scanning the full page lets
-    incidental mentions in long descriptions create false rejections.
+      * `"skip"`       — no constraint applies (agnostic source, missing
+                         country signal on either side).
+      * `"pass_clear"` — overlap exists and the candidate page mentions
+                         only ≤2 countries → no further check needed.
+      * `"pass_ambiguous"` — overlap exists BUT the candidate mentions
+                              ≥3 countries; the source country may be
+                              an incidental "we serve X, Y, Z" mention
+                              rather than the actual hiring location.
+                              Caller should ask the LLM to disambiguate.
+      * `"reject"`     — disjoint country sets; the candidate page
+                         cleanly mentions different countries from the
+                         source. Caller may invoke an LLM rescue for
+                         edge cases (e.g. variant spellings missing
+                         from `_COUNTRY_VARIANTS`) before final reject.
+
+    Candidate text is searched in its first 4000 chars only — location
+    signals concentrate near the page top.
     """
     if _location_is_agnostic(source_location):
-        return None
+        return ("skip", None, set(), set())
     src_countries = _detect_countries(source_location)
     if not src_countries:
-        return None
+        return ("skip", None, set(), set())
     cand_countries = _detect_countries(candidate_text[:4000] if candidate_text else "")
     if not cand_countries:
+        return ("skip", None, src_countries, cand_countries)
+    if not (src_countries & cand_countries):
+        reason = (
+            f"source country={sorted(src_countries)} "
+            f"candidate country={sorted(cand_countries)}"
+        )
+        return ("reject", reason, src_countries, cand_countries)
+    if len(cand_countries) >= 3:
+        # Overlap exists but the candidate page lists many countries —
+        # could be a multi-region hiring page (legitimate match) OR the
+        # source country might just be an incidental "we serve X, Y, Z"
+        # mention while the actual role is for a different country.
+        reason = (
+            f"candidate mentions {len(cand_countries)} countries "
+            f"({sorted(cand_countries)}); source={sorted(src_countries)}"
+        )
+        return ("pass_ambiguous", reason, src_countries, cand_countries)
+    return ("pass_clear", None, src_countries, cand_countries)
+
+
+# ─── LLM rescue / disambiguation ────────────────────────────────────────────
+#
+# Layered design: the deterministic country-set check above handles the
+# common case (multi-region ATS listing where the wrong country
+# dominates with no source-country mention) at zero cost. For two narrow
+# cases where deterministic verdict is uncertain, we ask the LLM:
+#
+#   * `"reject"` verdict — the cheap check found disjoint country sets,
+#      but the source country might be in an alternative spelling we
+#      don't have in `_COUNTRY_VARIANTS` (Vietnamese / Greek / etc.) or
+#      the candidate page legitimately uses unusual location phrasing.
+#      LLM gets a rescue veto.
+#   * `"pass_ambiguous"` verdict — multiple countries detected; source
+#      country mention might be incidental rather than the actual
+#      hiring location. LLM gets a tightening veto.
+#
+# Skipped for the unambiguous cases (`"skip"`, `"pass_clear"`) so most
+# discoveries still run at deterministic speed. With ~10-30% of
+# candidates landing in the LLM-rescue path, gate-1 latency stays bounded.
+
+_LOCATION_LLM_SYSTEM = """\
+You are verifying whether a candidate job-posting page is for THE SAME
+LOCATION as a source posting the user actually wants to apply to.
+
+You receive:
+  - The source posting's location string (e.g. "Istanbul, Türkiye").
+  - The first ~3000 chars of the candidate page text.
+
+Your job: decide whether the candidate page is for the SAME LOCATION as
+the source posting.
+
+Rules:
+  1. "Same location" means same country at minimum. Same city is better
+     but not required (Istanbul and Ankara are both Türkiye, both pass).
+  2. Some pages list multiple regions because the company hires
+     worldwide. If the candidate page makes clear that it ALSO covers
+     the source location (e.g. "Apply for any of: Türkiye, Czech, ..."),
+     return is_same_location=True.
+  3. Some pages mention many countries only as company-product context
+     ("our customers span 30 countries: Türkiye, ...") while the
+     ACTUAL hiring location is a single different country. Look at the
+     "Location: ...", "Office: ...", "Based in: ...", or page headers
+     to decide the actual hiring location. Return False when the actual
+     hiring country differs from the source.
+  4. When the candidate is "Remote / Worldwide / Anywhere / Global"
+     return is_same_location=True.
+  5. When unsure or the candidate page has NO clear hiring-location
+     statement, return is_same_location=True (false negatives over
+     false positives — the user can spot a wrong listing on review,
+     but we shouldn't reject correct candidates because the page is
+     terse).
+
+Return a structured `LocationVerdict(is_same_location: bool, reason: str)`.
+The reason field is one short sentence — used for audit logs.
+"""
+
+
+class _LocationVerdict(BaseModel):
+    is_same_location: bool = Field(...)
+    reason: str = Field(default="")
+
+
+def _ask_llm_location_match(
+    source_location: str, candidate_text: str, llm,
+) -> Optional[Tuple[bool, str]]:
+    """One bounded LLM call. Returns `(is_same_location, reason)` on
+    success; `None` when llm is missing OR the call fails. Caller MUST
+    handle None as "no LLM signal" — the deterministic verdict stands."""
+    if llm is None:
         return None
-    if src_countries & cand_countries:
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        structured = llm.with_structured_output(_LocationVerdict)
+        verdict: _LocationVerdict = structured.invoke([
+            SystemMessage(content=_LOCATION_LLM_SYSTEM),
+            HumanMessage(content=(
+                f"Source posting location: {source_location!r}\n\n"
+                f"Candidate page (first ~3000 chars):\n"
+                f"{(candidate_text or '')[:3000]}"
+            )),
+        ])
+        return (bool(verdict.is_same_location), verdict.reason or "")
+    except Exception as exc:
+        logger.warning("location LLM verify failed: %s", exc)
         return None
-    return (
-        f"location mismatch: source country={sorted(src_countries)} "
-        f"candidate country={sorted(cand_countries)}"
+
+
+def _location_passes(
+    source_location: str, candidate_text: str, *, llm=None,
+) -> Tuple[bool, str]:
+    """Public entrypoint used by score_candidate. Returns
+    `(passes, reason)` where `passes=False` means reject the candidate
+    on location grounds.
+
+    Layered logic:
+      * deterministic verdict drives the common case (most candidates
+        land in `pass_clear` / `skip` / unambiguous `reject`).
+      * `reject` and `pass_ambiguous` verdicts get one LLM call each
+        (when llm is available) for disambiguation. The LLM can rescue
+        a deterministic reject when the source-country variant is
+        missing from our list, OR can tighten a deterministic pass when
+        a multi-region page actually hires elsewhere.
+    """
+    verdict, reason, _src, _cand = _location_verdict_deterministic(
+        source_location, candidate_text,
     )
+    if verdict in ("skip", "pass_clear"):
+        return True, reason or ""
+
+    llm_result = _ask_llm_location_match(source_location, candidate_text, llm) if llm else None
+
+    if verdict == "reject":
+        if llm_result is None:
+            # LLM unavailable / errored — trust the deterministic reject.
+            return False, f"location mismatch: {reason}"
+        is_same, llm_reason = llm_result
+        if is_same:
+            # LLM rescued — the source country was likely in an alt
+            # spelling our `_COUNTRY_VARIANTS` map missed.
+            return True, f"location mismatch lifted by LLM: {llm_reason}"
+        return False, f"location mismatch confirmed by LLM: {llm_reason}"
+
+    # pass_ambiguous
+    if llm_result is None:
+        # LLM unavailable — fall back to deterministic pass (the source
+        # country IS mentioned, just with multiple others).
+        return True, ""
+    is_same, llm_reason = llm_result
+    if is_same:
+        return True, f"location verified by LLM: {llm_reason}"
+    return False, f"location mismatch tightened by LLM: {llm_reason}"
+
+
+# Backwards-compat shim used by tests / earlier call sites that don't
+# pass an LLM. Returns a reason string when mismatched, None when ok.
+def _location_mismatch(source_location: str, candidate_text: str) -> Optional[str]:
+    passes, reason = _location_passes(source_location, candidate_text, llm=None)
+    return None if passes else reason
 
 # Minimum fuzzy-match score for company-vs-slug normalization. Below this we
 # treat the slug as a different company and reject the candidate outright.
@@ -407,17 +573,27 @@ def score_candidate(inputs: VerifyInputs) -> VerificationScore:
     # Multi-region postings list the same role under multiple country
     # listings — title-fuzz + company-in-text trivially match the wrong
     # one. Block here so the downstream auto-fill never targets a form
-    # for the wrong country. Permissive on missing data: if either side
-    # has no recognised country, this falls through.
-    mismatch_reason = _location_mismatch(
+    # for the wrong country.
+    #
+    # Layered design: cheap deterministic country-set check covers the
+    # obvious cases (no source country mentioned in candidate page).
+    # For the AMBIGUOUS deterministic verdicts ("reject" with possibly
+    # missing variant, "pass_ambiguous" when many countries are listed),
+    # one LLM call disambiguates. See `_location_passes` for details.
+    # Permissive on missing data: if either side has no recognised
+    # country, the check returns "skip" and we fall through.
+    location_passes, location_reason = _location_passes(
         job.get("location") or "",
         f"{inputs.candidate_title}\n{inputs.candidate_text}",
+        llm=get_llm(),
     )
-    if mismatch_reason:
+    if not location_passes:
         return VerificationScore(
             passed=False, confidence=0.0,
-            reasons=[*reasons, mismatch_reason],
+            reasons=[*reasons, location_reason],
         )
+    if location_reason:
+        reasons.append(location_reason)
 
     text_lower = inputs.candidate_text.lower()
     candidate_url_lower = inputs.candidate_url.lower()

@@ -423,6 +423,217 @@ def test_location_check_skips_when_source_country_unknown():
     assert not any("location mismatch" in r for r in score.reasons)
 
 
+# ─── Location LLM rescue / disambiguation ──────────────────────────────────
+
+def _fake_llm_returning(verdict_dict):
+    """Minimal fake LLM whose `with_structured_output(...).invoke(...)`
+    returns a `_LocationVerdict` instance built from the dict."""
+    from unittest.mock import MagicMock
+    from uppgrad_agentic.tools.url_discovery import _LocationVerdict
+    structured = MagicMock()
+    structured.invoke.return_value = _LocationVerdict(**verdict_dict)
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    return llm
+
+
+def test_location_passes_skip_returns_no_constraint():
+    """Agnostic source ('Remote') → skip verdict, no LLM call."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    llm = _fake_llm_returning({"is_same_location": False, "reason": "ignored"})
+    passes, reason = _location_passes(
+        "Remote", "We're hiring in Berlin, Germany.", llm=llm,
+    )
+    assert passes is True
+    # LLM should NOT have been consulted for "skip"
+    llm.with_structured_output.assert_not_called()
+
+
+def test_location_passes_pass_clear_skips_llm():
+    """Single-country overlap → pass_clear, no LLM call."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    llm = _fake_llm_returning({"is_same_location": False, "reason": "ignored"})
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        "Senior Engineer in Türkiye. Apply now.",
+        llm=llm,
+    )
+    assert passes is True
+    llm.with_structured_output.assert_not_called()
+
+
+def test_location_passes_reject_lifted_by_llm():
+    """Deterministic reject (no source country in cand) gets rescued
+    when the LLM says it's actually the same location — covers
+    alternative spellings / variants missing from `_COUNTRY_VARIANTS`."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    # Source mentions a country we DO have, candidate uses a variant
+    # we don't (mock the LLM saying "same location" anyway).
+    llm = _fake_llm_returning({
+        "is_same_location": True,
+        "reason": "Candidate page says 'Istanbul' which IS Türkiye",
+    })
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        "We're hiring in Tokyo, Japan.",  # disjoint deterministic
+        llm=llm,
+    )
+    assert passes is True
+    assert "lifted by LLM" in reason
+
+
+def test_location_passes_reject_confirmed_by_llm():
+    """LLM agrees with the deterministic reject → reject stays."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    llm = _fake_llm_returning({
+        "is_same_location": False,
+        "reason": "Candidate is for Czech Republic only",
+    })
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        "Position: Prague, Czech Republic. Apply now.",
+        llm=llm,
+    )
+    assert passes is False
+    assert "confirmed by LLM" in reason
+
+
+def test_location_passes_pass_ambiguous_tightened_by_llm():
+    """3+ countries on candidate page + source country among them →
+    pass_ambiguous. LLM can tighten to reject when the source country
+    mention is incidental rather than the actual hiring location."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    llm = _fake_llm_returning({
+        "is_same_location": False,
+        "reason": "Türkiye mentioned only as customer market, role is Czech",
+    })
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        (
+            "Senior AI Engineer. Location: Prague, Czech Republic. "
+            "We serve customers across Türkiye, Germany, Japan, Brazil. "
+            "Our team is in Czech Republic."
+        ),
+        llm=llm,
+    )
+    assert passes is False
+    assert "tightened by LLM" in reason
+
+
+def test_location_passes_pass_ambiguous_kept_by_llm():
+    """3+ countries on candidate page; LLM confirms it's a legitimate
+    multi-region hiring page."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    llm = _fake_llm_returning({
+        "is_same_location": True,
+        "reason": "Multi-region role explicitly hiring in Türkiye",
+    })
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        (
+            "Senior AI Engineer. Hiring across: Türkiye, Germany, "
+            "Czech Republic, Brazil. Apply for any region."
+        ),
+        llm=llm,
+    )
+    assert passes is True
+    assert "verified by LLM" in reason
+
+
+def test_location_passes_falls_back_to_deterministic_when_llm_none():
+    """`llm=None` → no LLM call; deterministic verdict stands.
+    Reject case still rejects."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        "Position: Prague, Czech Republic. Apply now.",
+        llm=None,
+    )
+    assert passes is False
+    assert "location mismatch" in reason
+    # No LLM-flavour annotation
+    assert "LLM" not in reason
+
+
+def test_location_passes_handles_llm_exception():
+    """LLM throws (network blip / structured-output unsupported / etc.)
+    → _ask_llm_location_match returns None → caller falls back to
+    deterministic verdict."""
+    from uppgrad_agentic.tools.url_discovery import _location_passes
+    from unittest.mock import MagicMock
+    structured = MagicMock()
+    structured.invoke.side_effect = RuntimeError("OpenAI 503")
+    llm = MagicMock()
+    llm.with_structured_output.return_value = structured
+    passes, reason = _location_passes(
+        "Istanbul, Türkiye",
+        "Position: Prague, Czech Republic.",
+        llm=llm,
+    )
+    # Falls back to deterministic reject
+    assert passes is False
+    assert "LLM" not in reason
+
+
+def test_score_candidate_invokes_llm_for_pass_ambiguous():
+    """End-to-end through score_candidate: a multi-region candidate with
+    source-country mention should trigger LLM disambiguation. Patch
+    get_llm to provide a controllable fake."""
+    from unittest.mock import patch
+    from uppgrad_agentic.tools.url_discovery import score_candidate, VerifyInputs
+
+    fake_llm = _fake_llm_returning({
+        "is_same_location": True,
+        "reason": "Genuine multi-region listing covering Türkiye too",
+    })
+    inputs = VerifyInputs(
+        candidate_url="https://job-boards.greenhouse.io/co/jobs/1",
+        candidate_title="Senior AI Engineer",
+        candidate_text=(
+            "Senior AI Engineer at Co. Hiring across: Türkiye, "
+            "Germany, Czech Republic, Brazil. Apply now."
+        ),
+        candidate_posted_at=None,
+        job=_job(
+            title="Senior AI Engineer",
+            company="Co",
+            location="Istanbul, Türkiye",
+            description="Senior AI Engineer with Python and ML.",
+        ),
+        tier="ats",
+    )
+    with patch("uppgrad_agentic.tools.url_discovery.get_llm",
+               return_value=fake_llm):
+        score = score_candidate(inputs)
+    assert score.passed is True
+    fake_llm.with_structured_output.assert_called_once()
+
+
+def test_score_candidate_skips_llm_for_clear_pass():
+    """Single-country overlap (pass_clear) shouldn't waste an LLM call."""
+    from unittest.mock import patch
+    from uppgrad_agentic.tools.url_discovery import score_candidate, VerifyInputs
+
+    fake_llm = _fake_llm_returning({"is_same_location": False, "reason": "x"})
+    inputs = VerifyInputs(
+        candidate_url="https://job-boards.greenhouse.io/co/jobs/1",
+        candidate_title="Senior AI Engineer at Co",
+        candidate_text="Senior AI Engineer at Co. Location: Istanbul, Türkiye.",
+        candidate_posted_at=None,
+        job=_job(
+            title="Senior AI Engineer", company="Co",
+            location="Istanbul, Türkiye",
+        ),
+        tier="ats",
+    )
+    with patch("uppgrad_agentic.tools.url_discovery.get_llm",
+               return_value=fake_llm):
+        score = score_candidate(inputs)
+    fake_llm.with_structured_output.assert_not_called()
+    # And it still passes on the regular corroborator scoring
+    assert score.passed is True
+
+
 def test_location_check_handles_us_uk_aliases():
     """USA / U.S. / America / UK / Britain are common variants; each
     should canonicalise to the right country and overlap correctly."""
