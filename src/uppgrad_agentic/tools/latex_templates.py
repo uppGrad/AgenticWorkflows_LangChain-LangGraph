@@ -6,28 +6,38 @@ LaTeX source string that compiles standalone — the LLM fills in marked
 sections (CV bullets, paragraphs of the cover letter, etc.) without
 touching the preamble.
 
-Design constraints:
-  * Only Tectonic-installable packages. Stick to what ships in the default
-    TeX Live release so the backend image stays small. Currently:
-    `geometry`, `enumitem`, `hyperref`, `parskip`, `xcolor`, `titlesec`.
-    NO `moderncv`, `awesome-cv`, `fontawesome` — those drag in too many deps.
-  * No `\\input`, `\\include`, `\\write18`, or shell-escape commands. The
-    backend renders with `--no-shell-escape`; calls in the LLM output that
-    need them will fail at compile time, which we want.
-  * Preambles must declare a Latin-script-friendly font. Default Computer
-    Modern is fine; the user's tailored content is plain Unicode-friendly.
+The CV and prose templates are sourced from the document-feedback
+workflow's `finalize.py` (`_RESUME_TEMPLATE` and `_PROSE_TEMPLATE`). Doing
+this means:
+  * Auto-apply's CV LaTeX prompt has the SAME custom commands the LLM
+    has been trained on (via the doc-feedback path) — fewer syntax
+    errors, fewer fall-throughs to the ReportLab plain-text fallback.
+  * Both workflows produce typeset CVs with the same visual style.
+  * If doc-feedback's templates evolve (the teammate has been
+    iterating), one diff lands changes in both workflows — but to keep
+    the cross-workflow coupling explicit, we copy rather than import.
+    Re-sync points are flagged here and in the doc-feedback finalize node.
+
+Design constraints (mirrored from doc-feedback):
+  * Tectonic-installable packages only (no fontspec, moderncv, awesome-cv).
+  * No `\\input{glyphtounicode}` / `\\pdfgentounicode` (Tectonic
+    incompatibility).
+  * No `\\input`, `\\include`, `\\write18`, or shell-escape commands —
+    the backend renders with `--untrusted` (sandboxed mode).
 
 Per-doc-type templates:
-  * `CV_TEMPLATE` — resume layout: contact line, sections (Education,
-    Experience, Projects, Skills), bullet lists with `enumitem`.
-  * `COVER_LETTER_TEMPLATE` — letter-style article with sender block, date,
-    addressee, salutation, paragraphs, sign-off.
-  * `GENERIC_TEMPLATE` — fallback for SOP / Personal Statement / Motivation
-    Letter / Research Proposal: article class with reasonable margins.
+  * `CV_TEMPLATE` — sb2nov-based resume layout with `\\resumeItemPlain`
+    / `\\resumeSubheading` / `\\resumeItemListStart` helpers. Compatible
+    with the doc-feedback path's CV finalizer.
+  * `COVER_LETTER_TEMPLATE` — article + parskip prose. Mirrors
+    doc-feedback's `_PROSE_TEMPLATE`.
+  * `GENERIC_TEMPLATE` — fallback for SOP / Personal Statement /
+    Motivation Letter / Research Proposal: same prose template since
+    they all read as flowing paragraphs.
 
 The placeholders the LLM fills are explicit `% --- BEGIN BODY ---` /
-`% --- END BODY ---` markers; we keep them in the rendered output so future
-edits can locate where the model wrote.
+`% --- END BODY ---` markers; we keep them in the rendered output so
+future edits can locate where the model wrote.
 """
 from __future__ import annotations
 
@@ -35,63 +45,191 @@ from typing import Optional
 
 
 # ─── Templates ──────────────────────────────────────────────────────────────
+#
+# CV_TEMPLATE is sourced from `workflows/document_feedback/nodes/finalize.py`
+# `_RESUME_TEMPLATE` (sb2nov-derived). When that file changes, sync here.
+# The body markers + heading skeleton are appended so the LLM has explicit
+# fill instructions consistent with the cover-letter / generic templates.
 
-CV_TEMPLATE = r"""% Auto-generated CV — preamble fixed by uppgrad. Body filled by LLM.
-\documentclass[11pt,a4paper]{article}
-\usepackage[margin=0.85in]{geometry}
+CV_TEMPLATE = r"""%-------------------------
+% Auto-generated CV — preamble fixed by uppgrad. Body filled by LLM.
+% Sourced from workflows/document_feedback/nodes/finalize.py:_RESUME_TEMPLATE
+% (sb2nov-based). Tectonic-compatible — no glyphtounicode.
+%------------------------
+
+\documentclass[letterpaper,11pt]{article}
+
+\usepackage[empty]{fullpage}
+\usepackage{titlesec}
+\usepackage[usenames,dvipsnames]{color}
 \usepackage{enumitem}
-\usepackage{titlesec}
-\usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
-\usepackage{parskip}
-\setlist[itemize]{leftmargin=*,nosep,topsep=2pt}
-\titleformat{\section}{\large\bfseries\color{black!85}}{}{0em}{}[\titlerule]
-\titlespacing*{\section}{0pt}{8pt}{4pt}
-\pagenumbering{gobble}
+\usepackage{fancyhdr}
+\usepackage[english]{babel}
+\usepackage{tabularx}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Adjust margins
+\addtolength{\oddsidemargin}{-0.5in}
+\addtolength{\evensidemargin}{-0.5in}
+\addtolength{\textwidth}{1in}
+\addtolength{\topmargin}{-.5in}
+\addtolength{\textheight}{1.0in}
+
+\urlstyle{same}
+\raggedbottom
+\raggedright
+\setlength{\tabcolsep}{0in}
+
+% Sections formatting
+\titleformat{\section}{
+  \vspace{-4pt}\scshape\raggedright\large
+}{}{0em}{}[\color{black}\titlerule \vspace{-5pt}]
+
+%-------------------------
+% Custom commands
+\newcommand{\resumeItem}[2]{
+  \item\small{
+    \textbf{#1}{: #2 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubheading}[4]{
+  \vspace{-1pt}\item
+    \begin{tabular*}{0.97\textwidth}[t]{l@{\extracolsep{\fill}}r}
+      \textbf{#1} & #2 \\
+      \textit{\small #3} & \textit{\small #4} \\
+    \end{tabular*}\vspace{-5pt}
+}
+
+\newcommand{\resumeSubSubheading}[2]{
+    \begin{tabular*}{0.97\textwidth}{l@{\extracolsep{\fill}}r}
+      \textit{\small #1} & \textit{\small #2} \\
+    \end{tabular*}\vspace{-5pt}
+}
+
+\newcommand{\resumeItemPlain}[1]{
+  \item\small{
+    {#1 \vspace{-2pt}}
+  }
+}
+
+\newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{-4pt}}
+
+\renewcommand{\labelitemii}{$\circ$}
+
+\newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
+\newcommand{\resumeSubHeadingListEnd}{\end{itemize}}
+\newcommand{\resumeItemListStart}{\begin{itemize}}
+\newcommand{\resumeItemListEnd}{\end{itemize}\vspace{-5pt}}
+
+%-------------------------------------------
+%  DOCUMENT STARTS HERE
+%-------------------------------------------
+
 \begin{document}
+
 % --- BEGIN BODY ---
-%% LLM: replace this comment with the CV. Use \section{...} for each
-%% top-level section (Contact, Summary, Experience, Education, Projects,
-%% Skills). Use \begin{itemize} ... \end{itemize} for bullets. Keep
-%% inline links via \href{url}{label}.
+%% LLM: fill the resume here. Use the custom commands defined above:
+%%
+%% Header (top of doc):
+%%   \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
+%%     \textbf{\Large FULL NAME} & Email: \href{mailto:EMAIL}{EMAIL}\\
+%%     \href{WEBSITE}{WEBSITE} & Mobile: PHONE \\
+%%   \end{tabular*}
+%%
+%% Sections (Education / Experience / Projects / Skills, etc.):
+%%   \section{Section Name}
+%%     \resumeSubHeadingListStart
+%%       \resumeSubheading{ORG / SCHOOL}{LOCATION}{TITLE / DEGREE}{DATES}
+%%         \resumeItemListStart
+%%           \resumeItemPlain{Bullet text describing achievement.}
+%%         \resumeItemListEnd
+%%     \resumeSubHeadingListEnd
+%%
+%% Skills (categorised):
+%%   \section{Skills}
+%%     \resumeSubHeadingListStart
+%%       \item{
+%%         \textbf{Languages}{: Python, Go} \hfill
+%%         \textbf{Tools}{: Docker, Kubernetes}
+%%       }
+%%     \resumeSubHeadingListEnd
 % --- END BODY ---
+
 \end{document}
 """
 
 
-COVER_LETTER_TEMPLATE = r"""% Auto-generated cover letter — preamble fixed by uppgrad. Body filled by LLM.
-\documentclass[11pt,a4paper]{article}
+# ─── Prose template (Cover Letter / SOP / Personal Statement / etc.) ─────────
+#
+# Sourced from `workflows/document_feedback/nodes/finalize.py:_PROSE_TEMPLATE`.
+# Plain article class with parskip — paragraphs render as flowing prose with
+# blank-line breaks. NO list helpers; NEVER mix the resume-template custom
+# commands here (the LLM wrapping each cover-letter paragraph in
+# `\resumeItemPlain` was a real symptom in the doc-feedback path before this
+# template existed).
+
+_PROSE_TEMPLATE = r"""%-------------------------
+% Auto-generated prose document (cover letter / SOP / motivation letter)
+% Preamble fixed by uppgrad. Body filled by LLM.
+% Sourced from workflows/document_feedback/nodes/finalize.py:_PROSE_TEMPLATE
+% Tectonic-compatible.
+%-------------------------
+
+\documentclass[11pt,letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
 \usepackage[margin=1in]{geometry}
-\usepackage[hidelinks]{hyperref}
 \usepackage{parskip}
-\pagenumbering{gobble}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.7em}
+
 \begin{document}
+
 % --- BEGIN BODY ---
-%% LLM: emit a complete cover letter here — sender contact block at top,
-%% date, addressee, salutation, 2-4 paragraphs, sign-off. Use plain
-%% paragraphs separated by blank lines (parskip handles spacing). No
-%% \section{...} here — cover letters read better without headings.
+%% LLM: emit the document body here as FLOWING PARAGRAPHS separated by
+%% blank lines. NEVER use \begin{itemize}, \begin{enumerate}, \item, or
+%% any of the resume-template commands (\resumeItem, \resumeItemPlain,
+%% \resumeSubheading, etc.). Those don't exist in this preamble and will
+%% fail to compile.
+%%
+%% Cover letter shape:
+%%   <date>
+%%   <recipient address (optional)>
+%%   <salutation>
+%%
+%%   <opening paragraph>
+%%
+%%   <body paragraph 1>
+%%
+%%   <body paragraph 2>
+%%
+%%   <closing paragraph>
+%%
+%%   <sign-off>
+%%   <name>
+%%
+%% SOP shape: usually no headings — flowing paragraphs in document order.
+%% Use \section*{Heading} ONLY when the source document has clear section
+%% breaks. Most SOPs have no headings; that's fine.
 % --- END BODY ---
+
 \end{document}
 """
 
 
-GENERIC_TEMPLATE = r"""% Auto-generated document — preamble fixed by uppgrad. Body filled by LLM.
-\documentclass[11pt,a4paper]{article}
-\usepackage[margin=1in]{geometry}
-\usepackage{titlesec}
-\usepackage[hidelinks]{hyperref}
-\usepackage{parskip}
-\titleformat{\section}{\large\bfseries}{}{0em}{}
-\titlespacing*{\section}{0pt}{8pt}{4pt}
-\pagenumbering{arabic}
-\begin{document}
-% --- BEGIN BODY ---
-%% LLM: emit the document body here. Use \section{...} when the document
-%% has clear sections (SOP, Research Proposal); otherwise plain paragraphs.
-% --- END BODY ---
-\end{document}
-"""
+COVER_LETTER_TEMPLATE = _PROSE_TEMPLATE
+GENERIC_TEMPLATE = _PROSE_TEMPLATE
 
 
 # Map canonical document types → templates. The key matches the values in
