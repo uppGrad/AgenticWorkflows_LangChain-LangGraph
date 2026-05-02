@@ -291,6 +291,45 @@ starting on the [stated responsibility from opportunity], and growing \
 from there." (Specific, forward-looking, ties to a real anchor, no \
 boilerplate.)
 
+═══════════════════════ DISTINCTIVENESS PRESERVATION ═══════════════════════
+
+The previous failure mode this section guards against: rewrites that make \
+the document smoother and more concise but strip the candidate's voice and \
+distinctive specifics, leaving "safer, more generic" prose that could apply \
+to anyone. Three hard rules:
+
+1. **Differentiator preservation (per-paragraph, blocking)**. Every entry \
+in a rhetoric finding's `differentiators` MUST appear VERBATIM in any \
+rewrite of that paragraph. This is stricter than `preserve_sentences` \
+(which allows paraphrase as long as semantics survive) — differentiators \
+are character-for-character. Concrete: if `differentiators=["Turkish-\
+language LLM using QLoRA", "LangGraph-based SQL agent"]`, both phrases \
+must appear in after_text exactly. If you cannot fit them in, do not \
+emit the proposal — pick a less aggressive `rewrite_strategy` or skip it.
+
+2. **Differentiator orphan via delete (per-paragraph, blocking)**. If you \
+emit `action="delete"` for a paragraph whose `differentiators` are not \
+already present elsewhere in the document, the differentiator becomes \
+orphaned. Two ways to resolve: (a) downgrade to a minimal \
+`action="rewrite"` that keeps the differentiator and trims everything \
+else; (b) keep the delete AND emit a sibling `action="rewrite"` proposal \
+on a different paragraph that injects the differentiator. Pick whichever \
+reads better. Never strip a candidate's named anchor without redirecting \
+it.
+
+3. **Voice-signal coverage (whole-document, blocking)**. The post-\
+application document must keep ≥60% of `narrative.candidate_voice_signals` \
+as substring matches. These signals were chosen because they capture \
+what makes this candidate's positioning memorable. Do not silently smooth \
+them into generic phrasing. If a rewrite drops one, make sure another \
+rewrite preserves it or adds an equivalent specific.
+
+4. **Posting-phrase fence (whole-document, blocking)**. No `after_text` may \
+contain any phrase from `opportunity_alignment.posting_phrases` verbatim. \
+Echoing the posting back word-for-word is the fastest way to make \
+motivation feel borrowed and rehearsed. Paraphrase (use the same idea in \
+the candidate's own register) or skip — never copy.
+
 ═══════════════════════ AI-WRITTEN-TELL RULES ═══════════════════════
 
 The output must NOT read as machine-generated. Hard rules on after_text:

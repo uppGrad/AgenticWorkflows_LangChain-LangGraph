@@ -36,6 +36,18 @@ class OpportunityAlignmentAnalysis(BaseModel):
         description="Overall alignment between document and opportunity (0 = poor, 1 = strong).",
     )
     recommendations: List[str] = Field(default_factory=list)
+    posting_phrases: List[str] = Field(
+        default_factory=list,
+        description=(
+            "≤8 distinctive phrases (≤80 chars each) drawn VERBATIM from the "
+            "opportunity description / mission / values / responsibilities — "
+            "the kind of phrasing a candidate is at risk of parroting back to "
+            "sound aligned. Synth must NOT use any of these verbatim in any "
+            "after_text; the evaluator blocks otherwise. Skip generic phrases "
+            "every JD uses ('strong team player', 'fast-paced environment'); "
+            "include only company-/role-distinctive wording."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +140,20 @@ Assess:
 - missing_keywords: opportunity keywords absent from the document
 - alignment_score: 0.0–1.0 overall alignment
 - recommendations: specific actions to improve alignment
+- posting_phrases: ≤8 distinctive phrases (≤80 chars each) drawn VERBATIM
+  from the opportunity description / mission / values / responsibilities —
+  the kind of phrasing a candidate is at risk of parroting back to sound
+  aligned. Synth will be told NOT to use any of these verbatim in any
+  rewrite, so this list is a do-not-copy fence, not a target.
+  Include phrases like: "engineers create flexible code that can be updated
+  as the product evolves", "team members have a genuine chance to
+  contribute to the final product". These read as borrowed voice when a
+  candidate echoes them.
+  Skip generic JD boilerplate every posting uses: "strong team player",
+  "fast-paced environment", "passion for excellence", "competitive salary".
+  Skip plain noun phrases every candidate would naturally use ("software
+  engineer", "Unity", company name) — those are facts, not voice.
+  Empty list when the JD has no distinctive phrasing worth fencing.
 
 Be precise — quote requirement text and keyword text directly from the opportunity where possible.
 If an "Applicant profile" block is provided, ground recommendations in its skills/experience

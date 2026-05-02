@@ -62,6 +62,20 @@ analysis outputs. Evaluate each proposal for:
    "directly shapes", "play a meaningful role", "tapestry", "delve", "delving",
    "stands out to me", "matters to me because", and the metaphorical
    "leverage" / "navigate". Flag any violation.
+9. **Distinctiveness** (SOP / COVER_LETTER ONLY): rewrites must preserve
+   the candidate's distinctive specifics, not smooth them into safer
+   generic prose. Flag any of:
+   - a `rewrite` proposal whose `after_text` strips a `differentiator`
+     listed for the affected paragraph (the rhetoric finding whose
+     `paragraph_anchor` matches the proposal's `before_text`);
+   - a `delete` proposal targeting a paragraph whose `differentiators` are
+     not preserved elsewhere in the projected document;
+   - any `after_text` that copies a phrase from
+     `opportunity_alignment.posting_phrases` verbatim;
+   - rewrites that collectively drop more than 40% of
+     `narrative.candidate_voice_signals`.
+   Deterministic cross-checks enforce these mechanically; do not pass
+   the proposal set if any fire.
 
 Return:
 - passed: true only if no critical issues were found (minor style notes do not fail)
@@ -493,6 +507,170 @@ def _check_narrative_compliance(
     return issues
 
 
+def _check_distinctiveness(
+    proposals: List[dict],
+    doc_type: str,
+    analysis_results: dict,
+    raw_text: str,
+) -> List[str]:
+    """Distinctiveness audit (SOP/COVER_LETTER only).
+
+    Four checks:
+      (a) Differentiator preservation. For each rewrite proposal, every
+          differentiator tagged for the affected paragraph (via the rhetoric
+          finding whose anchor matches the proposal's before_text) must
+          appear verbatim in after_text.
+      (b) Differentiator orphan via delete. For each delete proposal, every
+          differentiator tagged for the deleted paragraph must survive
+          somewhere in the projected post-application document — either
+          still in an unchanged paragraph or injected by a sibling rewrite.
+          The projection reuses finalize's `_apply_proposals_to_text` so
+          the audit sees exactly what the user would.
+      (c) Voice-signal coverage. The projected document must keep ≥60% of
+          `narrative.candidate_voice_signals` (substring match).
+      (d) Posting-phrase fence. No after_text may contain any phrase from
+          `opportunity_alignment.posting_phrases` verbatim.
+
+    Why this exists: the previous pipeline reliably trimmed redundancy and
+    smoothed flow, but routinely stripped the candidate's strongest
+    specifics in the process — leaving documents that read cleaner but
+    could apply to anyone. These four checks make that failure mode
+    blocking instead of silent.
+    """
+    if doc_type not in ("SOP", "COVER_LETTER"):
+        return []
+
+    rhetoric = (analysis_results or {}).get("rhetoric") or {}
+    narrative = (analysis_results or {}).get("narrative") or {}
+    alignment = (analysis_results or {}).get("opportunity_alignment") or {}
+
+    findings = rhetoric.get("paragraph_findings") or []
+    voice_signals = [s for s in (narrative.get("candidate_voice_signals") or []) if s]
+    posting_phrases = [p for p in (alignment.get("posting_phrases") or []) if p]
+
+    # No signals to audit — analyzers either ran in heuristic-only mode or
+    # found nothing distinctive. Nothing to enforce.
+    if not findings and not voice_signals and not posting_phrases:
+        return []
+
+    issues: List[str] = []
+
+    # Project the post-application document. Uses the same deterministic
+    # applier finalize uses, so the audit sees exactly the text the user
+    # would after accepting all proposals.
+    try:
+        from uppgrad_agentic.workflows.document_feedback.nodes.finalize import (
+            _apply_proposals_to_text,
+        )
+        projected, _, _ = _apply_proposals_to_text(raw_text, proposals)
+    except Exception:
+        # If projection fails (shouldn't), fall back to raw_text. Voice-
+        # signal coverage will pass trivially; differentiator-orphan check
+        # still works because raw_text contains the original differentiators.
+        projected = raw_text
+    norm_projected = _normalize_for_match(projected)
+
+    # Map normalized paragraph_anchor → finding so we can locate the
+    # finding whose paragraph this proposal targets.
+    anchor_to_finding: dict = {}
+    for f in findings:
+        anchor = _normalize_for_match(f.get("paragraph_anchor", ""))
+        if anchor:
+            anchor_to_finding[anchor] = f
+
+    # ------------------------------------------------------------------
+    # (a) + (b): per-proposal differentiator preservation / orphan check.
+    # ------------------------------------------------------------------
+    for i, p in enumerate(proposals):
+        action = (p.get("action") or "rewrite").lower()
+        if action not in ("rewrite", "delete"):
+            continue
+        before_norm = _normalize_for_match(p.get("before_text", ""))
+        if not before_norm:
+            continue
+        finding = None
+        for norm_anchor, f in anchor_to_finding.items():
+            if norm_anchor in before_norm:
+                finding = f
+                break
+        if finding is None:
+            continue
+        differentiators = [d for d in (finding.get("differentiators") or []) if d]
+        if not differentiators:
+            continue
+        prefix = f"Proposal {i + 1} ({p.get('section', '?')})"
+
+        if action == "rewrite":
+            after_norm = _normalize_for_match(p.get("after_text", ""))
+            for diff in differentiators:
+                if _normalize_for_match(diff) not in after_norm:
+                    issues.append(
+                        f"Distinctiveness violation: {prefix} dropped "
+                        f"differentiator '{diff[:80]}{'...' if len(diff) > 80 else ''}' "
+                        "from after_text. Differentiators must be preserved "
+                        "VERBATIM in any rewrite of their paragraph."
+                    )
+        else:  # delete
+            for diff in differentiators:
+                if _normalize_for_match(diff) not in norm_projected:
+                    issues.append(
+                        f"Distinctiveness violation: {prefix} would orphan "
+                        f"differentiator '{diff[:80]}{'...' if len(diff) > 80 else ''}' "
+                        "— it does not survive elsewhere in the projected "
+                        "document. Either downgrade to a minimal rewrite that "
+                        "preserves the differentiator, or emit a sibling "
+                        "rewrite that injects it into another paragraph."
+                    )
+
+    # ------------------------------------------------------------------
+    # (c) voice-signal coverage on the projected document.
+    # ------------------------------------------------------------------
+    if voice_signals:
+        kept = 0
+        missing: List[str] = []
+        for signal in voice_signals:
+            if _normalize_for_match(signal) in norm_projected:
+                kept += 1
+            else:
+                missing.append(signal)
+        total = len(voice_signals)
+        ratio = kept / total
+        if ratio < 0.60:
+            issues.append(
+                f"Distinctiveness violation: only {kept}/{total} candidate "
+                f"voice signals ({int(ratio * 100)}%) survive in the projected "
+                f"document — required ≥60%. Missing: "
+                + ", ".join(f"'{m[:60]}'" for m in missing[:3])
+                + ". These signals capture what makes the candidate memorable; "
+                "rewrites must preserve them or substitute equivalent specifics."
+            )
+
+    # ------------------------------------------------------------------
+    # (d) posting-phrase fence on each after_text.
+    # ------------------------------------------------------------------
+    if posting_phrases:
+        for i, p in enumerate(proposals):
+            after_norm = _normalize_for_match(p.get("after_text", ""))
+            if not after_norm:
+                continue
+            for phrase in posting_phrases:
+                norm_phrase = _normalize_for_match(phrase)
+                if not norm_phrase:
+                    continue
+                if norm_phrase in after_norm:
+                    prefix = f"Proposal {i + 1} ({p.get('section', '?')})"
+                    issues.append(
+                        f"Distinctiveness violation: {prefix} echoes posting "
+                        f"phrase '{phrase[:80]}{'...' if len(phrase) > 80 else ''}' "
+                        "verbatim. Paraphrase in the candidate's own register "
+                        "or drop — copying the posting makes motivation feel "
+                        "borrowed."
+                    )
+                    break  # one violation per proposal is enough
+
+    return issues
+
+
 def _check_ai_tells(proposals: List[dict], doc_type: str) -> List[str]:
     """Em-dash + banned-phrase audit on after_text values.
 
@@ -584,6 +762,12 @@ def _heuristic_evaluate(
     ai_tell_issues = _check_ai_tells(proposals, doc_type)
     all_issues.extend(ai_tell_issues)
 
+    # Distinctiveness — SOP/COVER_LETTER only.
+    distinctiveness_issues = _check_distinctiveness(
+        proposals, doc_type, analysis_results or {}, raw_text
+    )
+    all_issues.extend(distinctiveness_issues)
+
     # Deduplicate
     seen: set[str] = set()
     unique_issues: List[str] = []
@@ -615,6 +799,7 @@ def _heuristic_evaluate(
         and len(substance_issues) == 0
         and len(narrative_issues) == 0
         and len(ai_tell_issues) == 0
+        and len(distinctiveness_issues) == 0
     )
 
     return EvaluationResult(
@@ -701,8 +886,11 @@ def evaluate_output(state: DocFeedbackState) -> dict:
         substance_issues = _check_substance_compliance(proposals, doc_type, analysis_results)
         narrative_issues = _check_narrative_compliance(proposals, doc_type, analysis_results)
         ai_tell_issues = _check_ai_tells(proposals, doc_type)
+        distinctiveness_issues = _check_distinctiveness(
+            proposals, doc_type, analysis_results, raw_text
+        )
         merged_issues = list(out.issues or [])
-        for iss in substance_issues + narrative_issues + ai_tell_issues:
+        for iss in substance_issues + narrative_issues + ai_tell_issues + distinctiveness_issues:
             if iss not in merged_issues:
                 merged_issues.append(iss)
         passed = (
@@ -710,6 +898,7 @@ def evaluate_output(state: DocFeedbackState) -> dict:
             and not substance_issues
             and not narrative_issues
             and not ai_tell_issues
+            and not distinctiveness_issues
         )
         result = EvaluationResult(
             passed=passed,

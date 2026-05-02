@@ -88,6 +88,20 @@ class ParagraphFinding(BaseModel):
             "from the paragraph. Empty list = nothing salvageable."
         ),
     )
+    differentiators: List[str] = Field(
+        default_factory=list,
+        description=(
+            "≤3 short phrases (≤80 chars each) drawn VERBATIM from this "
+            "paragraph that uniquely identify THIS candidate: named "
+            "projects ('Turkish-language LLM QLoRA fine-tune'), specific "
+            "technologies, ownership claims, concrete numeric outcomes. "
+            "Stronger contract than preserve_sentences — must survive any "
+            "rewrite of this paragraph VERBATIM, not just semantically. "
+            "Generic claims ('teamwork', 'problem solving', 'passionate') "
+            "do NOT belong here. Empty list = paragraph has no distinctive "
+            "specifics worth preserving."
+        ),
+    )
     rewrite_strategy: RewriteStrategy = Field(
         ...,
         description=(
@@ -421,6 +435,22 @@ whole paragraph is solid, list its sentences. The classic mistake is to flag \
 a paragraph as "generic" because of one boilerplate sentence and rewrite it \
 from scratch, destroying a real experience claim sitting in the next \
 sentence. Don't do that.
+- `differentiators`: ≤3 short phrases (≤80 chars) drawn VERBATIM from the \
+paragraph that uniquely identify THIS candidate — named projects \
+("Turkish-language LLM QLoRA fine-tune", "2D escape-room game in Unity"), \
+specific technologies, ownership claims tied to a real outcome, concrete \
+numeric figures. These are the SHORTEST chunks that make the candidate \
+recognisable; the synthesizer must keep them VERBATIM in any rewrite of \
+the paragraph (stronger contract than preserve_sentences, which allows \
+paraphrase as long as semantics survive). DO NOT include generic claims: \
+"teamwork", "problem solving", "passionate about technology", "I would \
+contribute positively" — those apply to any candidate. Empty list when \
+the paragraph has no distinctive specifics. The classic failure mode this \
+field protects against: the rewrite preserves the paragraph's MEANING but \
+strips the candidate's voice — turning "fine-tuned a Turkish-language LLM \
+with QLoRA at HAVELSAN" into "applied modern NLP techniques in a \
+professional setting". Mark the named anchor as a differentiator and the \
+synth has to keep it.
 - `rewrite_strategy`: 'augment' if the paragraph has substance on at least \
 one dimension and just needs a missing dimension added (most common — \
 preserve_sentences should be non-empty); 'restructure' if material is partly \

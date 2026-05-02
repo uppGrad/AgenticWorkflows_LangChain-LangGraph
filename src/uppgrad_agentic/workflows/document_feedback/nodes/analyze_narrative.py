@@ -260,6 +260,19 @@ document; 1 = each paragraph that needs an anchor draws on a different one.
 - `summary`: ONE sentence diagnosing narrative health. Different angle from \
 the per-paragraph rhetoric summary — focus on redundancy, progression, and \
 closing.
+- `candidate_voice_signals`: ≤5 short phrases (≤80 chars each), drawn \
+VERBATIM or NEAR-VERBATIM from the document, that capture what makes THIS \
+candidate's positioning distinctive vs. a generic applicant: role-specific \
+motivation ("build software that people use every day"), ownership mindset, \
+product framing, a memorable angle on why-this-company. These are the \
+DOCUMENT-LEVEL voice markers — broader than the per-paragraph \
+differentiators (which are named anchors), narrower than the whole \
+paragraph. The synthesizer must keep ≥60% of these (substring match) in \
+the post-application document; the evaluator blocks otherwise. Skip \
+generic phrases that apply to any candidate ("I am passionate about \
+software", "I want to learn and grow", "I see this as a great \
+opportunity"). Empty list when the document has no distinctive voice — \
+that itself is a finding worth surfacing in the summary.
 
 Hard rules:
 - DO NOT critique grammar, sentence flow, or word choice — other analyzers \

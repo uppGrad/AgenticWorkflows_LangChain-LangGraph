@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -98,10 +98,16 @@ _RESUME_TEMPLATE = r"""%-------------------------
 \begin{document}
 
 %----------HEADING-----------------
-% USE: \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r}
-%        \textbf{\Large FULL NAME} & Email: \href{mailto:EMAIL}{EMAIL}\\
-%        \href{WEBSITE}{WEBSITE} & Mobile: PHONE \\
-%      \end{tabular*}
+% USE a centered header so long contact lines wrap instead of overflowing.
+% Name on its own line, then \small contact info separated by $|$:
+%   \begin{center}
+%     {\Large \textbf{FULL NAME}} \\ \vspace{2pt}
+%     \small LOCATION $|$ \href{mailto:EMAIL}{EMAIL} $|$ PHONE \\
+%     \href{LINKEDIN_URL}{LinkedIn} $|$ \href{GITHUB_URL}{GitHub}
+%   \end{center}
+% Do NOT use \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r} for the
+% header — that layout cannot wrap and truncates email/phone off the page
+% when contact info is long.
 
 %----------EDUCATION-----------------
 % \section{Education}
@@ -148,15 +154,15 @@ _RESUME_TEMPLATE = r"""%-------------------------
 
 _LATEX_SYSTEM = r"""You are a professional resume/CV typesetter.
 You receive:
-  1. The full plain-text of a document (extracted from a PDF).
-  2. A list of ACCEPTED change proposals (each with before_text, after_text, rationale).
-  3. A LaTeX TEMPLATE with preamble, custom commands, and commented-out section markers.
+  1. The plain-text of a document (extracted from a PDF). All accepted user edits have ALREADY been merged into this text — treat it as the final content.
+  2. A LaTeX TEMPLATE with preamble, custom commands, and commented-out section markers.
+  3. Optionally, a list of ADDITIONAL HINTS — proposals that could not be auto-applied (typically structure-level suggestions with no specific anchor in the source). Apply each hint only if you can locate a sensible spot for it; otherwise ignore it.
 
 YOUR TASK:
   - Produce a COMPLETE, COMPILABLE LaTeX document using EXACTLY the provided template preamble and custom commands.
-  - Fill in the content sections (HEADING, EDUCATION, EXPERIENCE, PROJECTS, SKILLS, etc.) using the original document text AND the accepted changes.
+  - Render the document text faithfully into the template's section structure (HEADING, EDUCATION, EXPERIENCE, PROJECTS, SKILLS, etc.).
   - Use ONLY the custom commands defined in the template: \resumeSubheading, \resumeItemPlain, \resumeItem, \resumeSubItem, \resumeSubHeadingListStart/End, \resumeItemListStart/End.
-  - Incorporate every accepted change proposal (replace before_text with after_text).
+  - Preserve every sentence of the input text. Do NOT paraphrase, summarise, condense, or "improve" the wording — the upstream pipeline has already made all editorial decisions and any further rewriting silently overrides accepted user edits.
   - If a section from the original document is not covered by the template markers, create a new \section{} for it.
 
 CRITICAL RULES:
@@ -166,6 +172,19 @@ CRITICAL RULES:
   - Do NOT invent, fabricate, or add ANY facts, dates, skills, experiences, or achievements not present in the original document or the accepted proposals.
   - Do NOT remove any original content unless explicitly instructed by an accepted proposal.
   - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
+
+HEADER LAYOUT (very important — most common rendering bug):
+  - Render the contact header inside a \begin{center} ... \end{center} block, NOT inside a \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r} layout.
+  - The tabular* layout does not wrap text and silently truncates long emails / phone numbers / URLs off the right edge of the page.
+  - Use exactly this shape (adapt to whichever fields actually exist in the source CV — omit fields that are missing, do not fabricate):
+        \begin{center}
+          {\Large \textbf{FULL NAME}} \\ \vspace{2pt}
+          \small LOCATION $|$ \href{mailto:EMAIL}{EMAIL} $|$ PHONE \\
+          \href{LINKEDIN_URL}{LinkedIn} $|$ \href{GITHUB_URL}{GitHub}
+        \end{center}
+  - The contact line MUST be wrapped in \small (or \footnotesize). Default-size contacts overflow even inside center.
+  - Separate contact items with $|$ (math-mode pipe). Do NOT use plain `|`.
+  - Split contact info across two centered lines (with `\\`) when it's long; do not pack everything onto one line.
 
 Return ONLY the complete LaTeX source code. No explanations, no markdown fences.
 Start with \documentclass and end with \end{document}.
@@ -212,14 +231,14 @@ _LATEX_SYSTEM_PROSE = r"""You are a professional typesetter rendering a \
 Statement of Purpose or Cover Letter into LaTeX.
 
 You receive:
-  1. The full plain-text of the document (extracted from a PDF).
-  2. A list of ACCEPTED change proposals (each with before_text, after_text, rationale).
-  3. A minimal LaTeX TEMPLATE (article class, parskip-based prose).
+  1. The plain-text of the document (extracted from a PDF). All accepted user edits — paragraph rewrites, deletes, merges — have ALREADY been merged into this text. Treat it as the final content.
+  2. A minimal LaTeX TEMPLATE (article class, parskip-based prose).
+  3. Optionally, a list of ADDITIONAL HINTS — proposals that could not be auto-applied (typically structure-level suggestions with no specific anchor). Apply each hint only if you can locate a sensible spot; otherwise ignore.
 
 YOUR TASK:
   - Produce a COMPLETE, COMPILABLE LaTeX document using EXACTLY the template's preamble.
   - Render the document as FLOWING PROSE PARAGRAPHS separated by blank lines.
-  - Incorporate every accepted change proposal (replace before_text with after_text).
+  - Preserve every sentence of the input text verbatim. Do NOT paraphrase, summarise, condense, reorder, or "improve" any paragraph — the upstream pipeline has already produced the final wording and any further rewriting silently overrides accepted user edits.
 
 ABSOLUTE FORMATTING RULES — these are the most important rules:
   - DO NOT use \begin{itemize} or \begin{enumerate} or any list environment.
@@ -241,24 +260,13 @@ Do NOT add, remove, or change any packages.
   - Do NOT use \input{glyphtounicode} or \pdfgentounicode.
   - Do NOT use fontspec, moderncv, awesome-cv, or any custom .cls files.
   - Do NOT invent, fabricate, or add ANY facts, claims, names, dates, or \
-experiences not present in the original document or the accepted proposals.
-  - Do NOT remove any original content unless an accepted proposal replaces it.
-  - Each proposal carries an `action` field which controls what to do:
-    * `action="rewrite"` (default): the proposal's `before_text` matches a \
-paragraph in the original — REPLACE that paragraph with `after_text`.
-    * `action="delete"`: the proposal's `before_text` matches a paragraph in \
-the original — OMIT that paragraph entirely from your output. `after_text` \
-will be empty for delete proposals; do NOT include any placeholder text in \
-its place.
-    * `action="merge"`: the proposal's `before_text` is two paragraphs from \
-the original concatenated. Replace BOTH source paragraphs with the single \
-merged `after_text`.
-  - Apply proposals once each. Do NOT duplicate paragraphs. Do NOT keep a \
-paragraph that an accepted delete-proposal flagged for removal.
+experiences not present in the input document text.
+  - Do NOT remove or skip any paragraph from the input. Render every \
+paragraph that appears in the input, in the order it appears.
   - DO NOT use em-dashes (—) or double-hyphens (--) in the body. The \
-proposals were authored to avoid them; preserve that. Use commas, periods, \
-or colons instead. Em-dashes are the strongest "AI-generated" tell and \
-should not appear in the rendered document.
+upstream pipeline has already stripped these; preserve that. Use commas, \
+periods, or colons instead. Em-dashes are the strongest "AI-generated" tell \
+and should not appear in the rendered document.
   - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
   - Curly/smart quotes are fine — they render correctly under utf8.
 
@@ -271,6 +279,126 @@ _MAX_PROPOSALS_CHARS = 8000
 
 
 # ---------------------------------------------------------------------------
+# Deterministic proposal application
+# ---------------------------------------------------------------------------
+#
+# Why this exists: previously the LLM was asked to BOTH apply each accepted
+# proposal AND format the document as LaTeX in a single pass. The LLM would
+# silently drop proposals — most often the closing-paragraph rewrite for
+# SOPs/CLs — and `_build_diff` would still report them as "applied" because
+# nothing verified the output. The user-visible failure mode: an accepted
+# rewrite never made it into the rendered PDF.
+#
+# Fix: apply proposals to raw_text deterministically here, then send the
+# already-edited text to the LLM for formatting only. The LLM cannot drop
+# what was never in its input. Heuristic-fallback proposals with no anchor
+# (empty or `[bracketed]` before_text) are passed to the LLM as hints since
+# they have nowhere to attach deterministically.
+
+def _build_match_pattern(before: str) -> Optional[re.Pattern]:
+    """Compile a regex that matches `before` with whitespace + typography slack.
+
+    Tolerances applied:
+      - any run of whitespace in `before` matches any run of whitespace in
+        the source (lets a paragraph survive PDF→text line-wrap reflow)
+      - smart vs straight quotes (' vs ’ vs ‘, " vs ” vs “)
+      - en-dash / em-dash / hyphen (-, –, —)
+
+    Case-sensitive on purpose: a "fix capitalization" proposal must land at
+    the lowercase original, not the rewrite's already-capitalised copy.
+    """
+    if not before.strip():
+        return None
+    tokens = before.split()
+    if not tokens:
+        return None
+    parts: List[str] = []
+    for token in tokens:
+        chars: List[str] = []
+        for ch in token:
+            if ch in "'’‘":
+                chars.append(r"['’‘]")
+            elif ch in '"”“':
+                chars.append(r'["”“]')
+            elif ch in "-—–":
+                chars.append(r"[-—–]")
+            else:
+                chars.append(re.escape(ch))
+        parts.append("".join(chars))
+    pattern = r"\s+".join(parts)
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
+
+
+def _apply_proposals_to_text(
+    raw_text: str,
+    proposals: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Apply accepted proposals to raw_text deterministically.
+
+    Returns (modified_text, applied_proposals, unapplied_entries) where each
+    unapplied entry is {"proposal": ..., "reason": ...}. Reasons:
+      - "no_anchor": before_text is empty or a `[placeholder]` (heuristic
+        fallback only — these are passed to the LLM as hints).
+      - "before_text_not_found": the regex pattern didn't match the source
+        (synthesizer hallucination that escaped the upstream grounding
+        check, or document text changed between synth and finalize).
+      - "overlap_with_earlier_proposal": this proposal's match span overlaps
+        a span already claimed by an earlier-positioned proposal.
+    """
+    if not proposals:
+        return raw_text, [], []
+
+    located: List[Tuple[int, int, Dict[str, Any]]] = []
+    unapplied: List[Dict[str, Any]] = []
+
+    for p in proposals:
+        before = (p.get("before_text") or "").strip()
+        if not before or before.startswith("["):
+            unapplied.append({"proposal": p, "reason": "no_anchor"})
+            continue
+        pattern = _build_match_pattern(before)
+        if pattern is None:
+            unapplied.append({"proposal": p, "reason": "no_anchor"})
+            continue
+        m = pattern.search(raw_text)
+        if not m:
+            unapplied.append({"proposal": p, "reason": "before_text_not_found"})
+            continue
+        located.append((m.start(), m.end(), p))
+
+    located.sort(key=lambda t: t[0])
+    accepted: List[Tuple[int, int, Dict[str, Any]]] = []
+    last_end = -1
+    for start, end, p in located:
+        if start < last_end:
+            unapplied.append({"proposal": p, "reason": "overlap_with_earlier_proposal"})
+            continue
+        accepted.append((start, end, p))
+        last_end = end
+
+    text = raw_text
+    applied: List[Dict[str, Any]] = []
+    # Right-to-left so earlier spans aren't shifted by later substitutions.
+    for start, end, p in reversed(accepted):
+        action = (p.get("action") or "rewrite").lower()
+        after = p.get("after_text") or ""
+        if action == "delete":
+            seg_end = end
+            while seg_end < len(text) and text[seg_end] in "\r\n":
+                seg_end += 1
+            text = text[:start] + text[seg_end:]
+        else:
+            text = text[:start] + after + text[end:]
+        applied.append(p)
+
+    applied.reverse()
+    return text, applied, unapplied
+
+
+# ---------------------------------------------------------------------------
 # LLM-driven LaTeX generation
 # ---------------------------------------------------------------------------
 
@@ -278,46 +406,57 @@ def _generate_latex(
     raw_text: str,
     approved_proposals: List[Dict[str, Any]],
     doc_type: str,
-) -> Tuple[str, bool]:
-    """Ask the LLM to generate a complete LaTeX document.
+) -> Tuple[str, bool, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Apply accepted proposals deterministically, then format as LaTeX.
 
-    Returns (latex_source, llm_succeeded).
-    Falls back to a minimal template wrapping raw_text if LLM is unavailable.
+    Returns (latex_source, llm_succeeded, applied_proposals, unapplied_entries).
+    Falls back to a minimal template wrapping the modified text if LLM is
+    unavailable. Either way, deterministic application has already happened
+    so accepted edits will always be in the output text.
     """
+    modified_text, applied, unapplied = _apply_proposals_to_text(
+        raw_text, approved_proposals
+    )
+    if unapplied and approved_proposals:
+        logger.warning(
+            "Could not deterministically apply %d/%d accepted proposals — "
+            "passing them to the LLM as hints (reasons: %s)",
+            len(unapplied), len(approved_proposals),
+            ", ".join(sorted({u["reason"] for u in unapplied})),
+        )
+
     llm = get_llm()
     if llm is None:
         logger.warning("LLM unavailable — using plain-text LaTeX fallback")
-        return _fallback_latex(raw_text), False
+        return _fallback_latex(modified_text), False, applied, unapplied
 
-    # Build the proposals text
-    proposals_text = ""
-    for i, p in enumerate(approved_proposals, 1):
-        proposals_text += (
-            f"\n--- Proposal {i} ---\n"
-            f"Section: {p.get('section', 'N/A')}\n"
-            f"Rationale: {p.get('rationale', 'N/A')}\n"
-            f"Before: {p.get('before_text', '(empty)')}\n"
-            f"After: {p.get('after_text', '(empty)')}\n"
-        )
-
-    # CV → resume template + bullet-list helpers.
-    # SOP / COVER_LETTER → prose template, no list helpers (avoids the
-    # bug where every paragraph rendered as a bullet point because the
-    # resume prompt instructed the LLM to wrap content in \resumeItemPlain).
     is_prose = doc_type in ("SOP", "COVER_LETTER")
     template = _PROSE_TEMPLATE if is_prose else _RESUME_TEMPLATE
     system_prompt = _LATEX_SYSTEM_PROSE if is_prose else _LATEX_SYSTEM
+
+    hints_text = ""
+    for entry in unapplied:
+        p = entry["proposal"]
+        hints_text += (
+            f"\n--- Hint ---\n"
+            f"Section: {p.get('section', 'N/A')}\n"
+            f"Rationale: {p.get('rationale', 'N/A')}\n"
+            f"Suggested addition / change: {p.get('after_text', '(empty)')}\n"
+        )
 
     human_content = (
         f"Document type: {doc_type}\n\n"
         f"=== LATEX TEMPLATE (use this preamble EXACTLY) ===\n"
         f"{template}\n\n"
-        f"=== ORIGINAL DOCUMENT TEXT ===\n"
-        f"{raw_text[:_MAX_DOC_CHARS]}\n\n"
-        f"=== ACCEPTED CHANGE PROPOSALS ({len(approved_proposals)} total) ===\n"
-        f"{proposals_text[:_MAX_PROPOSALS_CHARS]}\n\n"
-        f"Generate the complete LaTeX source now, using the template above."
+        f"=== DOCUMENT TEXT (accepted edits already applied) ===\n"
+        f"{modified_text[:_MAX_DOC_CHARS]}\n\n"
     )
+    if hints_text:
+        human_content += (
+            f"=== ADDITIONAL HINTS (could not be auto-applied — apply only if you can locate the right spot) ===\n"
+            f"{hints_text[:_MAX_PROPOSALS_CHARS]}\n\n"
+        )
+    human_content += "Generate the complete LaTeX source now, using the template above."
 
     msgs = [
         SystemMessage(content=system_prompt),
@@ -339,13 +478,13 @@ def _generate_latex(
         # Basic sanity check
         if r"\documentclass" not in latex or r"\end{document}" not in latex:
             logger.warning("LLM output doesn't look like valid LaTeX — falling back")
-            return _fallback_latex(raw_text), False
+            return _fallback_latex(modified_text), False, applied, unapplied
 
-        return latex, True
+        return latex, True, applied, unapplied
 
     except Exception as e:
         logger.exception("LLM LaTeX generation failed: %s", e)
-        return _fallback_latex(raw_text), False
+        return _fallback_latex(modified_text), False, applied, unapplied
 
 
 # ---------------------------------------------------------------------------
@@ -534,9 +673,16 @@ def _escape_latex(text: str) -> str:
 def _build_diff(
     all_proposals: List[Dict[str, Any]],
     approved_proposals: List[Dict[str, Any]],
+    applied_proposals: List[Dict[str, Any]],
+    unapplied_entries: List[Dict[str, Any]],
     llm_succeeded: bool,
 ) -> Dict[str, Any]:
-    """Build a summary of what was done."""
+    """Build a summary of what was done.
+
+    `applied_proposals` and `unapplied_entries` come from
+    `_apply_proposals_to_text` and reflect what was actually merged into the
+    document text — not just what the user approved.
+    """
     approved_keys = {
         (p.get("section", ""), p.get("rationale", ""))
         for p in approved_proposals
@@ -557,15 +703,30 @@ def _build_diff(
             "before": (p.get("before_text") or "")[:120],
             "after": (p.get("after_text") or "")[:120],
         }
-        for p in approved_proposals
+        for p in applied_proposals
+    ]
+
+    could_not_apply = [
+        {
+            "section": entry["proposal"].get("section", ""),
+            "rationale": entry["proposal"].get("rationale", ""),
+            "reason": entry["reason"],
+        }
+        for entry in unapplied_entries
     ]
 
     n_applied = len(applied)
     n_rejected = len(rejected)
+    n_unapplied = len(could_not_apply)
 
     parts: List[str] = []
     if n_applied:
         parts.append(f"{n_applied} change{'s' if n_applied != 1 else ''} incorporated")
+    if n_unapplied:
+        parts.append(
+            f"{n_unapplied} could not be applied automatically "
+            "(passed to formatter as hints)"
+        )
     if n_rejected:
         parts.append(f"{n_rejected} rejected by user")
     if llm_succeeded:
@@ -579,7 +740,7 @@ def _build_diff(
         "applied": applied,
         "rejected": rejected,
         "conflicts": [],
-        "could_not_apply": [],
+        "could_not_apply": could_not_apply,
         "smoothing_applied": False,
         "latex_generated": llm_succeeded,
         "summary": summary,
@@ -602,10 +763,10 @@ def finalize(state: DocFeedbackState) -> dict:
     doc_type = (state.get("doc_classification") or {}).get("doc_type", "CV")
 
     # ------------------------------------------------------------------
-    # Step 1: Generate LaTeX document with accepted changes
+    # Step 1: Apply accepted proposals deterministically + generate LaTeX
     # ------------------------------------------------------------------
     try:
-        latex_source, llm_succeeded = _generate_latex(
+        latex_source, llm_succeeded, applied, unapplied = _generate_latex(
             raw_text, approved_proposals, doc_type
         )
     except Exception as e:
@@ -657,6 +818,8 @@ def finalize(state: DocFeedbackState) -> dict:
     diff = _build_diff(
         all_proposals=all_proposals,
         approved_proposals=approved_proposals,
+        applied_proposals=applied,
+        unapplied_entries=unapplied,
         llm_succeeded=llm_succeeded,
     )
 

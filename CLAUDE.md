@@ -498,6 +498,22 @@ Schemas in `workflows/document_feedback/schemas.py`:
   Phrases live in `_BANNED_PHRASES` (evaluator) and `_BANNED_PHRASE_REWRITES`
   (finalize normalize pass) — keep them in sync. CV path is exempt
   (em-dashes legitimate in date ranges).
+- SOP/CL `differentiators` (rhetoric per-paragraph finding) MUST appear
+  VERBATIM in any rewrite of that paragraph. Stricter than
+  `preserve_sentences` (which allows paraphrase). For `action="delete"`
+  proposals, every differentiator MUST survive in the projected post-
+  application document — either via an unchanged paragraph or via a
+  sibling rewrite that injects it. The evaluator's `_check_distinctiveness`
+  blocks both cases.
+- SOP/CL `candidate_voice_signals` (narrative whole-doc finding) — ≥60%
+  of these short verbatim phrases must survive (substring match) in the
+  projected post-application document. Protects against the "smoothed
+  into generic prose" failure mode where rewrites strip the candidate's
+  memorable specifics.
+- SOP/CL `posting_phrases` (opportunity_alignment finding) — no
+  `after_text` may contain any of these verbatim. Prevents the document
+  reading like the candidate is parroting the JD back. Paraphrase
+  required.
 - `ChangeProposal.action="delete"` carries empty `after_text`; consumers
   (frontend `ProposalReviewPane`, backend serializer, LaTeX prose
   prompt) all handle this. CV synth never emits `delete`/`merge` so

@@ -179,3 +179,16 @@ class NarrativeAnalysis(BaseModel):
             "rhetoric.summary which covers per-paragraph substance)."
         ),
     )
+    candidate_voice_signals: List[str] = Field(
+        default_factory=list,
+        description=(
+            "≤5 short phrases (≤80 chars each), drawn verbatim or near-"
+            "verbatim from the document, capturing what makes THIS "
+            "candidate's positioning distinctive vs. a generic applicant — "
+            "role-specific motivation, ownership mindset, product framing. "
+            "Synth must keep ≥60% of these (substring match) in the post-"
+            "application document; the evaluator blocks otherwise. Generic "
+            "claims ('teamwork', 'problem solving') do NOT belong here. "
+            "Empty list = no distinctive signals detected."
+        ),
+    )
