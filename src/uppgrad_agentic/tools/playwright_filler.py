@@ -367,12 +367,39 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
         except Exception as exc:
             return ("radio_error", str(exc)[:90])
 
-    # text-like
+    # text-like — Recruitee / SmartRecruiters / similar use React-wrapped
+    # inputs where the visible element is `[name="candidate[first_name]"]`
+    # but the *actionable* input only becomes interactive after a focus
+    # event or hydration animation. Plain `.fill()` with a 2s budget
+    # times out before the input accepts input.
+    #
+    # Three-step recovery:
+    #   1. `.fill()` with a slightly longer 5s budget — covers normal
+    #      hydration delay (Recruitee usually settles within ~1-3s).
+    #   2. On timeout, click to focus + retry `.fill()` (3s). The click
+    #      kicks React into "actionable" state for the wrapped input.
+    #   3. On timeout still, click + `keyboard.press_sequentially()`
+    #      types char-by-char, which most React onChange handlers accept.
     try:
-        await locator.fill(str(value), timeout=2000)
+        await locator.fill(str(value), timeout=5000)
         return ("ok", str(value)[:60])
-    except Exception as exc:
-        return ("fill_error", str(exc)[:90])
+    except Exception as fill_exc:
+        # Step 2: click first, then fill again
+        try:
+            await locator.click(timeout=2000)
+            await locator.fill(str(value), timeout=3000)
+            return ("ok", f"fill_after_click:{str(value)[:50]}")
+        except Exception:
+            pass
+        # Step 3: type char-by-char
+        try:
+            await locator.click(timeout=2000)
+            await locator.press_sequentially(str(value), delay=20, timeout=5000)
+            return ("ok", f"press_sequentially:{str(value)[:40]}")
+        except Exception as exc:
+            # Surface the original .fill() failure — that's the more
+            # informative error when triaging.
+            return ("fill_error", str(fill_exc)[:90])
 
 
 # ─── Tier 4 — LLM picker ──────────────────────────────────────────────────────

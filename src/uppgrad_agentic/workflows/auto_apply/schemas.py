@@ -174,6 +174,10 @@ FormFieldFillSource = Literal[
     "user_answer",        # LLM-drafted free-text answer for the question
     "computed",           # derived (e.g. today's date)
     "mock",               # placeholder used in dry-run / test mode
+    "llm_inferred",       # Tier 4b: LLM derived a value from profile+CV for
+                          # a field value_planner couldn't fill deterministically.
+                          # Bounded budget; only fires for skipped+no_value entries
+                          # whose label survives the deny-list (salary/SSN/DOB).
     "no_value",           # no value could be planned (skipped)
 ]
 
