@@ -120,6 +120,27 @@ Bad proposal examples (NEVER do these):
   ❌ Recommending a Summary section on a 1-page early-career CV
   ❌ Categorising a 6-item Skills list — there is nothing to scan past
 
+PRESERVE WHAT WORKS — well_constructed_bullets:
+The content_gaps analysis surfaces a `well_constructed_bullets` list (CV only).
+These bullets ALREADY do the right thing — past-tense action verb at the start
+plus a numeric outcome OR concrete named technology. DO NOT propose a rewrite
+of any bullet that appears in this list. The only acceptable proposal touching
+a well-constructed bullet is an ATS-keyword-synonym injection (e.g. adding
+"REST API" alongside an existing "REST" mention), and even then only when the
+ATS analysis flagged the synonym as missing. Rewriting "Reduced p99 latency
+by 40% via async batching" into your preferred phrasing produces something
+different, not better.
+
+ANTI-PATTERN REMOVALS — cv_antipatterns:
+For each entry in `cv_antipatterns`, emit ONE proposal with before_text =
+the verbatim excerpt and after_text = "" (empty string indicating deletion)
+or the rewritten line per the recommendation. These are universal CV
+anti-patterns (References-on-request, generic Hobbies, "Curriculum Vitae"
+title, first-person Experience bullets, photo, PII like DOB/marital status).
+Removing them is high-leverage and costs the candidate nothing. Mark
+`requires_confirmation=true` for PII removals (visa context can justify
+keeping them) and `false` for the others.
+
 Merge overlapping findings into a single proposal. Avoid duplicates.
 Return 8-15 high-impact proposals. Quality over quantity.
 """
