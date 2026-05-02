@@ -439,23 +439,57 @@ Fully implemented across phases 0-6:
   build_context_pack).
 - **Phase 2**: parallel analysis fan-out — analyze_structure,
   analyze_style, analyze_content_gaps, analyze_ats,
-  analyze_opportunity_alignment (LangGraph `Send` from
-  build_context_pack). The 5 parallel nodes write only `step_history`
+  analyze_opportunity_alignment, analyze_rhetoric (LangGraph `Send`
+  from build_context_pack). The 6 parallel nodes write only `step_history`
   (concurrent `current_step` writes would conflict);
-  `build_context_pack` sets `current_step="parallel_analysis"` for the
-  frontend.
+  `build_context_pack` sets `current_step="parallel_analysis"`.
+  analyze_ats is CV-only; analyze_rhetoric is SOP/CL-only — both still
+  write step_history so the frontend shape is doc-type-agnostic.
 - **Phase 3**: synthesize_feedback with grounding validation (drops
   proposals whose `before_text` cannot be fuzzy-matched to the document).
+  Doc-type branch: CV → `_SYSTEM_CV` (sentence-level polish); SOP/CL →
+  `_SYSTEM_SUBSTANCE` (paragraph rewrites driven by rhetoric findings,
+  polish capped at ~30%).
 - **Phase 4**: evaluate_output retry loop, capped at
-  `MAX_EVAL_ITERATIONS=2`.
+  `MAX_EVAL_ITERATIONS=2`. SOP/CL adds a deterministic substance audit
+  (coverage / preservation / polish ≤30% when substance is unaddressed)
+  — failures are blocking and trigger retry.
 - **Phase 5**: human_gate using `interrupt()` with a frontend-friendly
   resume payload.
-- **Phase 6**: finalize applies accepted proposals right-to-left,
-  resolves overlapping spans by confidence, runs an LLM coherence
-  smoothing pass, produces a diff summary and final document.
+- **Phase 6**: finalize generates LaTeX via LLM and compiles via tectonic.
+  Doc-type branch: CV → resume template (`\resumeItem*` helpers); SOP/CL →
+  prose template (article + parskip, no list helpers).
+  `_strip_resume_commands_for_prose` defensively unwraps stray list
+  commands on the prose path.
 
 Schemas in `workflows/document_feedback/schemas.py`:
 `DocTypeClassification`, `ChangeProposal`, `EvaluationResult`.
+
+### Doc-type contracts (don't break these without touching both producer + consumer)
+
+- SOP/CL `preserve_sentences` (analyze_rhetoric per-paragraph finding)
+  MUST appear verbatim in any proposal's after_text that targets the same
+  paragraph, or the evaluator drops the proposal. Paraphrasing is a
+  violation. `rewrite_strategy` (augment / restructure / replace) signals
+  how aggressive a rewrite is allowed.
+- SOP/CL `opportunity_context` menu fields (`mission`, `products`,
+  `values`, `distinctive_responsibilities`, `recent_signals`) are a
+  *menu, not a checklist* — synth uses ≤1 signal per rewritten paragraph,
+  never reuses one across paragraphs, and never invents signals not
+  present in the menu.
+- CV: Summary and Skills-categorisation are CONTEXTUAL, not default —
+  Summary only for 5+ years / career-changer / explicit user request;
+  categorise Skills only when the list has 12+ entries. Default to NOT
+  recommending either.
+- CV `well_constructed_bullets` (analyze_content_gaps) are past-tense
+  action + numeric outcome OR named tech; the synthesizer must NOT
+  propose rewrites of these — only ATS-keyword-synonym injection is
+  permitted.
+- CV `cv_antipatterns` (References-on-request, generic Hobbies, "CV"
+  title, first-person Experience bullets, photo, DOB/marital status) are
+  emitted as one removal proposal each; PII removals get
+  `requires_confirmation=true` because visa context can justify keeping
+  them.
 
 ---
 
