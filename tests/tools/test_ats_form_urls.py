@@ -43,9 +43,22 @@ def test_greenhouse_overview_unchanged():
     assert resolve_application_form_url(url) == url
 
 
-def test_workable_unchanged():
-    """Workable also keeps form on the same URL."""
+def test_workable_appends_apply_suffix():
+    """Workable's listing URL renders an "Apply for this job" CTA that
+    NAVIGATES to `<listing>/apply/`. Pre-resolving here lets the
+    standard fetch flow grab the form HTML directly without clicking
+    any button — passive, no submission risk. Multi-step Workable
+    variants (page-2+ behind a "Continue" button) remain out of scope."""
     url = "https://apply.workable.com/intellecthq/j/539DCA61EB"
+    assert (
+        resolve_application_form_url(url)
+        == "https://apply.workable.com/intellecthq/j/539DCA61EB/apply/"
+    )
+
+
+def test_workable_apply_suffix_idempotent():
+    """When the URL already ends with `/apply/`, don't double-append."""
+    url = "https://apply.workable.com/intellecthq/j/539DCA61EB/apply/"
     assert resolve_application_form_url(url) == url
 
 

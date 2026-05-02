@@ -24,7 +24,11 @@ from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
 
 logger = logging.getLogger(__name__)
 
-_MAX_FORM_HTML_FOR_LLM = 80_000  # gpt-4o-mini handles 128k tokens; 80k chars is well within budget
+_MAX_FORM_HTML_FOR_LLM = 160_000  # gpt-4o-mini handles 128k tokens; ~160k chars
+# fits within budget AND covers single-page forms with substantial markup
+# (Workable's `/apply/` route ships ~95k chars including all 11 inputs;
+# the previous 80k cap truncated the file-upload + Q&A sections off and
+# the LLM only saw the contact-info portion).
 
 _SYSTEM = """You are extracting the structured fields of a job application form.
 
@@ -143,6 +147,18 @@ def extract_form_fields(state: AutoApplyState) -> dict:
     if not form_html:
         logger.info("extract_form_fields: no <form>/inputs found for %s after all tiers", form_url)
         return {**updates, "form_fields": []}
+
+    # Diagnostic: count input-like markers in the form HTML before the
+    # LLM call. Lets us tell apart "LLM saw the markup but didn't
+    # extract everything" (raw_inputs >> len(fields), prompt issue) from
+    # "the markup was missing the fields in the first place" (raw_inputs
+    # already low, browser/extraction issue) when triaging from prod logs.
+    import re as _re
+    _input_count = len(_re.findall(r"<(input|textarea|select)\b", form_html, _re.IGNORECASE))
+    logger.info(
+        "extract_form_fields: form_html=%d chars, raw_inputs=%d for %s",
+        len(form_html), _input_count, form_url,
+    )
 
     llm = get_llm()
     if llm is None:

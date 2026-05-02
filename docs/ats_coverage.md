@@ -27,7 +27,8 @@ that map back to the actual ATS form (not the per-type defaults).
 | Ashby (`jobs.ashbyhq.com`) | ✅ Tier 1 ATS | ✅ full | Form on `/application` suffix. `ats_form_urls` rewrites the URL. | 2026-04 |
 | Lever (`jobs.lever.co`) | ✅ Tier 1 ATS | ✅ full | Form on `/apply` suffix. | 2026-04 |
 | SmartRecruiters (`*.smartrecruiters.com`) | ✅ Tier 1 ATS | ⚠️ partial | Form on `/apply` suffix. Single-page-gated forms now extract via Tier 2b click-through (PR #13). Multi-step variants reach page 1 only. | 2026-05 |
-| Workable (`apply.workable.com/<org>/j/<id>/`) | ✅ Tier 1 ATS | ⚠️ partial | Listing page 1 (contact info) extracts via Tier 2b click-through. **Page 2+ (CV upload + cover letter + custom questions) NOT reached** — needs recursive click-through across "Continue" buttons. See "Known limitations" below. | 2026-05 |
+| Workable single-page (`apply.workable.com/<org>/j/<id>/`) | ✅ Tier 1 ATS | ✅ full | `ats_form_urls` rewrites listing URL → `<listing>/apply/`; passive fetch picks up every input (contact + CV upload + Q&A) when the form is single-page. LLM-extraction cap raised to 160k chars to cover the full ~95k-char form HTML. | 2026-05 |
+| Workable multi-step (`apply.workable.com/...` with page-2+ progressive disclosure) | ✅ Tier 1 ATS | 🚫 out of scope | Some Workable postings hide CV upload + cover letter / Q&A behind a "Continue" button on a second page. Traversing those would mean clicking buttons mid-form-extraction with no robust runtime way to tell a navigation CTA from a final submit. **Intentionally OUT OF SCOPE** until the auto-submit feature ships — see "Known limitations" below. | 2026-05 |
 | Workable iframe-embed | ✅ Tier 2 careers | ✅ full | Same as the listing case once iframe is followed. | 2026-04 |
 | Workday (`*.myworkdayjobs.com`) | ✅ Tier 1 ATS | ❌ blocked | Auth wall — no public form URL. `ats_form_urls.resolve_application_form_url` returns `None`; the graph correctly produces no form fields and the user gets a handoff package. | 2026-04 |
 | MongoDB careers (cross-origin Greenhouse iframe) | ✅ Tier 2 careers | ✅ full | `extract_ats_iframe_src` follows the iframe to the Greenhouse form. | 2026-04 |
@@ -38,30 +39,34 @@ that map back to the actual ATS form (not the per-type defaults).
 
 ## Known limitations
 
-### Workable multi-step apply flow
+### Workable multi-step apply flow — OUT OF SCOPE
 
-Workable's `/j/<slug>/` URL is a hydration shell with the company logo, JD,
-and an "Apply for this job" CTA. Our Tier 2b click-through (PR #13) clicks
-that CTA and reaches the contact-info page, but Workable's apply flow
-continues over multiple pages:
+`ats_form_urls` rewrites Workable listing URLs (`apply.workable.com/<org>/j/<id>/`)
+to their `/apply/` form route, so passive extraction picks up every
+input on a single-page Workable form (contact + CV upload + cover
+letter + Q&A — typically 11 visible inputs). That's full coverage
+for the common case and requires no clicking.
 
-```
-page 0: listing            (CTA: "Apply for this job")
-page 1: contact info       (CTA: "Continue")        ← Tier 2b stops here
-page 2: CV upload          (CTA: "Continue")
-page 3: cover letter / Q&A (CTA: "Submit")
-```
+Some Workable postings split the same content across multiple pages —
+contact info on page 1, CV upload on page 2, etc., with a "Continue"
+button between them. **Multi-step traversal is intentionally
+out of scope.** Going further would mean clicking buttons mid-extraction,
+and there's no robust runtime way to tell whether a given "Apply" /
+"Continue" / "Submit" button is a navigation CTA or the final form
+submission. A misclassified click would cause an unintended submission
+to the real ATS, which is strictly worse than missing some fields.
 
-End-to-end coverage requires recursive click-through across page transitions.
-The current Tier 2b is single-click only. Until that lands, Workable
-postings will surface profile-fillable RequirementItems but **no
-CV/Cover Letter requirement** — even though both will be required at
-submit time. Practical workaround for the user: use the "package and
-bounce" path (gate-1 `ignore_for_now` for required items) and finish in
-the browser.
+Auto-submit is its own signed-off feature (see top-level CLAUDE.md
+"Open / out-of-scope"). Once that lands, the same UX guarantees apply
+to multi-step traversal: a user-confirmed submission is the only path
+where any form-action button is allowed to fire. Until then,
+multi-step Workable postings surface page-1 fields only; users
+complete the rest manually via the handoff package.
 
-Tracked: TODO open dedicated issue for `extract_form_fields` recursive
-click-through.
+Practical workaround for the user today on multi-step Workable
+postings: use the "package and bounce" path (gate-1 `ignore_for_now`
+for required items) and finish in the browser. The tailored CV /
+Cover Letter / answers are still produced and downloadable.
 
 ### `expected_source` classification quality
 
