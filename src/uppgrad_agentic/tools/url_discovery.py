@@ -41,6 +41,158 @@ _CORROBORATORS_REQUIRED = {
 _DESCRIPTION_KEYWORD_HIT_THRESHOLD = 3   # ≥3 of extracted distinctive terms must appear
 _DESCRIPTION_KEYWORD_LIMIT = 10          # extract at most 10 distinctive tokens
 
+
+# ─── Country detection for location-mismatch rejection ──────────────────────
+#
+# A multi-location ATS (e.g. Workable / Greenhouse multi-region postings)
+# can list the same role under several country listings — all sharing the
+# title and most of the description. The current corroborator-based check
+# happily verifies any of them. Live failure: a user clicked the
+# Istanbul, Türkiye listing of a Jimmy posting and discovery returned the
+# Czech Republic instance because both pages cleared title-fuzz +
+# company-in-text + keyword-overlap — and there's no penalty when the
+# CANDIDATE page mentions a country that DOES NOT match the source
+# posting's country.
+#
+# This block defines a country-canonicalising layer. The source posting's
+# location string and the candidate page text are both reduced to a set
+# of canonical country names. When BOTH sides carry country signals AND
+# the sets are disjoint, score_candidate hard-rejects regardless of any
+# other corroborators.
+#
+# Skip rules (deliberately permissive — false negatives over false
+# positives):
+#   * Source location empty / generic ("Remote", "Worldwide", "Multiple
+#     locations") → no constraint enforced.
+#   * Candidate page mentions no recognised country → location-agnostic,
+#     no constraint enforced.
+#   * Either side mentions a country we don't have in the canonical list
+#     → falls through to the existing corroborator scoring.
+
+# Canonical country name → set of textual variants (lowercase, no
+# punctuation). The lookup is single-direction: any variant in the page
+# text canonicalises to the country key. The country key itself MUST be
+# in its own variant set so a page that just says "Türkiye" matches.
+_COUNTRY_VARIANTS = {
+    "turkey": {"turkey", "türkiye", "turkiye"},
+    "czech republic": {"czech republic", "czechia", "czech"},
+    "united states": {
+        "united states", "usa", "u.s.a.", "u.s.", "united states of america",
+        "america",
+    },
+    "united kingdom": {
+        "united kingdom", "uk", "u.k.", "britain", "great britain", "england",
+        "scotland", "wales",
+    },
+    "germany": {"germany", "deutschland"},
+    "france": {"france"},
+    "spain": {"spain", "españa"},
+    "italy": {"italy", "italia"},
+    "netherlands": {"netherlands", "the netherlands", "holland"},
+    "belgium": {"belgium"},
+    "switzerland": {"switzerland", "schweiz", "suisse"},
+    "austria": {"austria", "österreich"},
+    "ireland": {"ireland", "éire"},
+    "portugal": {"portugal"},
+    "poland": {"poland", "polska"},
+    "denmark": {"denmark"},
+    "sweden": {"sweden", "sverige"},
+    "norway": {"norway", "norge"},
+    "finland": {"finland", "suomi"},
+    "greece": {"greece"},
+    "hungary": {"hungary", "magyarország"},
+    "romania": {"romania"},
+    "bulgaria": {"bulgaria"},
+    "ukraine": {"ukraine"},
+    "russia": {"russia"},
+    "canada": {"canada"},
+    "mexico": {"mexico", "méxico"},
+    "brazil": {"brazil", "brasil"},
+    "argentina": {"argentina"},
+    "australia": {"australia"},
+    "new zealand": {"new zealand"},
+    "japan": {"japan", "nippon"},
+    "south korea": {"south korea", "republic of korea"},
+    "china": {"china"},
+    "india": {"india"},
+    "singapore": {"singapore"},
+    "indonesia": {"indonesia"},
+    "philippines": {"philippines"},
+    "thailand": {"thailand"},
+    "vietnam": {"vietnam"},
+    "malaysia": {"malaysia"},
+    "uae": {"united arab emirates", "uae", "u.a.e.", "dubai", "abu dhabi"},
+    "israel": {"israel"},
+    "south africa": {"south africa"},
+    "egypt": {"egypt"},
+    "morocco": {"morocco"},
+    "kenya": {"kenya"},
+    "nigeria": {"nigeria"},
+    "chile": {"chile"},
+    "colombia": {"colombia"},
+}
+
+# Generic / location-agnostic source values that should bypass the
+# location-mismatch check (the source isn't asking for a specific country).
+_LOCATION_AGNOSTIC_TOKENS = {
+    "remote", "worldwide", "global", "anywhere", "multiple locations",
+    "multiple", "various", "hybrid",
+}
+
+
+def _detect_countries(text: str) -> set:
+    """Return canonical country names found in `text` (lowercased,
+    word-boundary matched). Empty when none of our recognised variants
+    appear."""
+    if not text:
+        return set()
+    lowered = text.lower()
+    found: set = set()
+    for canonical, variants in _COUNTRY_VARIANTS.items():
+        for variant in variants:
+            # Anchor on word boundaries so "us" doesn't match "user" /
+            # "trust". `re.escape` keeps multi-word variants safe.
+            if re.search(rf"\b{re.escape(variant)}\b", lowered):
+                found.add(canonical)
+                break
+    return found
+
+
+def _location_is_agnostic(location: str) -> bool:
+    if not location:
+        return True
+    lowered = location.lower().strip()
+    if not lowered:
+        return True
+    return any(tok in lowered for tok in _LOCATION_AGNOSTIC_TOKENS)
+
+
+def _location_mismatch(source_location: str, candidate_text: str) -> Optional[str]:
+    """Detect when the candidate page is for a different country than the
+    source posting. Returns a human-readable reason string when a
+    mismatch is detected; None when no constraint applies or both sides
+    agree on at least one country.
+
+    The candidate text is searched in its first 4000 chars only —
+    location signals are typically near the top of an apply page (header,
+    "Location:" line, hero section) and scanning the full page lets
+    incidental mentions in long descriptions create false rejections.
+    """
+    if _location_is_agnostic(source_location):
+        return None
+    src_countries = _detect_countries(source_location)
+    if not src_countries:
+        return None
+    cand_countries = _detect_countries(candidate_text[:4000] if candidate_text else "")
+    if not cand_countries:
+        return None
+    if src_countries & cand_countries:
+        return None
+    return (
+        f"location mismatch: source country={sorted(src_countries)} "
+        f"candidate country={sorted(cand_countries)}"
+    )
+
 # Minimum fuzzy-match score for company-vs-slug normalization. Below this we
 # treat the slug as a different company and reject the candidate outright.
 # Example normalizations: 'github' vs 'github' = 100, 'notion' vs 'notionhq' = ~80
@@ -250,6 +402,22 @@ def score_candidate(inputs: VerifyInputs) -> VerificationScore:
         return VerificationScore(passed=False, confidence=0.0,
                                  reasons=[f"title fuzzy {title_score} < {_TITLE_FUZZY_MIN}"])
     reasons.append(f"title fuzzy {title_score}")
+
+    # ── Hard prerequisite: country match (when both sides carry a signal) ──
+    # Multi-region postings list the same role under multiple country
+    # listings — title-fuzz + company-in-text trivially match the wrong
+    # one. Block here so the downstream auto-fill never targets a form
+    # for the wrong country. Permissive on missing data: if either side
+    # has no recognised country, this falls through.
+    mismatch_reason = _location_mismatch(
+        job.get("location") or "",
+        f"{inputs.candidate_title}\n{inputs.candidate_text}",
+    )
+    if mismatch_reason:
+        return VerificationScore(
+            passed=False, confidence=0.0,
+            reasons=[*reasons, mismatch_reason],
+        )
 
     text_lower = inputs.candidate_text.lower()
     candidate_url_lower = inputs.candidate_url.lower()

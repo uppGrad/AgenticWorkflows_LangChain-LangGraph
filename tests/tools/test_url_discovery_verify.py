@@ -310,3 +310,142 @@ def test_careers_tier_unaffected_by_slug_check():
     )
     score = score_candidate(inputs)
     assert score.passed is True
+
+
+# ─── Location-mismatch hard reject (multi-region postings) ──────────────────
+
+def test_location_mismatch_rejects_when_countries_disjoint():
+    """The exact live failure: user clicks the Istanbul, Türkiye listing
+    of a job posted in multiple countries. The Czech Republic instance
+    of the same role passes title + company-in-text + keywords. Location-
+    mismatch must reject it before any of those corroborators count."""
+    inputs = VerifyInputs(
+        candidate_url="https://jobs.fromjimmy.com/o/senior-ai-engineer/c/new",
+        candidate_title="Senior AI Engineer",
+        candidate_text=(
+            "Senior AI Engineer at Jimmy. Location: Prague, Czech Republic. "
+            "Apply now to join our Prague-based team. Required: Python, ML."
+        ),
+        candidate_posted_at=None,
+        job=_job(
+            title="Senior AI Engineer",
+            company="Jimmy",
+            location="Istanbul, Türkiye",
+            description="Senior AI Engineer with Python and ML.",
+        ),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is False
+    assert any("location mismatch" in r for r in score.reasons), score.reasons
+    # Confirms 'turkey' / 'czech republic' are normalised even though the
+    # source spelt it "Türkiye".
+    joined = " ".join(score.reasons).lower()
+    assert "turkey" in joined and "czech republic" in joined
+
+
+def test_location_match_passes_when_country_overlaps():
+    """Source Istanbul, Türkiye + candidate page mentions Türkiye →
+    countries overlap → no rejection (existing corroborator scoring
+    decides pass/fail)."""
+    inputs = VerifyInputs(
+        candidate_url="https://jobs.fromjimmy.com/o/senior-ai-engineer/c/new",
+        candidate_title="Senior AI Engineer",
+        candidate_text=(
+            "Senior AI Engineer at Jimmy. Location: Istanbul, Türkiye. "
+            "Required: Python, ML."
+        ),
+        candidate_posted_at=None,
+        job=_job(
+            title="Senior AI Engineer",
+            company="Jimmy",
+            location="Istanbul, Türkiye",
+            description="Senior AI Engineer with Python and ML.",
+        ),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is True
+
+
+def test_remote_source_skips_location_check():
+    """Source location 'Remote' / 'Worldwide' shouldn't constrain — the
+    candidate page is allowed to be in any country."""
+    inputs = VerifyInputs(
+        candidate_url="https://acmecorp.com/careers/role",
+        candidate_title="Senior Backend Engineer",
+        candidate_text=(
+            "Senior Backend Engineer at Acme Corp. Location: Berlin, Germany."
+        ),
+        candidate_posted_at=None,
+        job=_job(location="Remote"),
+        tier="careers",
+    )
+    score = score_candidate(inputs)
+    assert score.passed is True
+
+
+def test_location_check_skips_when_candidate_has_no_country():
+    """Candidate page that's location-agnostic (no recognised country
+    mentioned in the first 4000 chars) shouldn't be rejected — falls
+    through to corroborator scoring."""
+    inputs = VerifyInputs(
+        candidate_url="https://x.com/1",
+        candidate_title="Senior Backend Engineer at Acme Corp",
+        candidate_text="Acme Corp is hiring a backend engineer.",
+        candidate_posted_at=None,
+        job=_job(location="Istanbul, Türkiye"),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    # Title fuzz passes, company corroborates, no location signal in
+    # candidate → no rejection. Whether it ultimately passes depends on
+    # corroborator count; we just assert it WASN'T rejected for location.
+    if not score.passed:
+        assert not any("location mismatch" in r for r in score.reasons)
+
+
+def test_location_check_skips_when_source_country_unknown():
+    """Source location uses a country we don't have in our canonical
+    list — the check falls through (false negative is acceptable; over-
+    rejecting common cases isn't)."""
+    inputs = VerifyInputs(
+        candidate_url="https://x.com/1",
+        candidate_title="Senior Backend Engineer at Acme Corp",
+        candidate_text="Acme Corp is hiring in Quito, Ecuador.",
+        candidate_posted_at=None,
+        # 'Ecuador' isn't in _COUNTRY_VARIANTS
+        job=_job(location="Lima, Peru"),
+        tier="ats",
+    )
+    score = score_candidate(inputs)
+    # No mismatch reason — the check returned None.
+    assert not any("location mismatch" in r for r in score.reasons)
+
+
+def test_location_check_handles_us_uk_aliases():
+    """USA / U.S. / America / UK / Britain are common variants; each
+    should canonicalise to the right country and overlap correctly."""
+    src_us = _job(location="San Francisco, USA")
+    cand_us = "Position: San Francisco, U.S.A. Apply now."
+    inputs = VerifyInputs(
+        candidate_url="https://x.com/us",
+        candidate_title="Senior Backend Engineer at Acme Corp",
+        candidate_text=cand_us,
+        candidate_posted_at=None,
+        job=src_us, tier="ats",
+    )
+    score = score_candidate(inputs)
+    assert not any("location mismatch" in r for r in score.reasons)
+
+    # Now disjoint US vs UK
+    inputs_disjoint = VerifyInputs(
+        candidate_url="https://x.com/uk",
+        candidate_title="Senior Backend Engineer at Acme Corp",
+        candidate_text="Position: London, United Kingdom. Apply now.",
+        candidate_posted_at=None,
+        job=src_us, tier="ats",
+    )
+    score = score_candidate(inputs_disjoint)
+    assert score.passed is False
+    assert any("location mismatch" in r for r in score.reasons)
