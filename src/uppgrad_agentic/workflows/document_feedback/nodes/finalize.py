@@ -243,9 +243,22 @@ Do NOT add, remove, or change any packages.
   - Do NOT invent, fabricate, or add ANY facts, claims, names, dates, or \
 experiences not present in the original document or the accepted proposals.
   - Do NOT remove any original content unless an accepted proposal replaces it.
-  - When an accepted proposal has a non-empty before_text that matches a \
-paragraph in the original, REPLACE that paragraph with after_text. Apply \
-proposals once each. Do NOT duplicate paragraphs.
+  - Each proposal carries an `action` field which controls what to do:
+    * `action="rewrite"` (default): the proposal's `before_text` matches a \
+paragraph in the original — REPLACE that paragraph with `after_text`.
+    * `action="delete"`: the proposal's `before_text` matches a paragraph in \
+the original — OMIT that paragraph entirely from your output. `after_text` \
+will be empty for delete proposals; do NOT include any placeholder text in \
+its place.
+    * `action="merge"`: the proposal's `before_text` is two paragraphs from \
+the original concatenated. Replace BOTH source paragraphs with the single \
+merged `after_text`.
+  - Apply proposals once each. Do NOT duplicate paragraphs. Do NOT keep a \
+paragraph that an accepted delete-proposal flagged for removal.
+  - DO NOT use em-dashes (—) or double-hyphens (--) in the body. The \
+proposals were authored to avoid them; preserve that. Use commas, periods, \
+or colons instead. Em-dashes are the strongest "AI-generated" tell and \
+should not appear in the rendered document.
   - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
   - Curly/smart quotes are fine — they render correctly under utf8.
 
@@ -355,6 +368,76 @@ def _sanitize_latex(latex: str) -> str:
     # Remove fontawesome icon commands (replace with empty)
     latex = re.sub(r"\\fa[A-Z][a-zA-Z]*", "", latex)
     return latex
+
+
+# ---------------------------------------------------------------------------
+# AI-tell normalize pass (SOP/COVER_LETTER prose path only)
+# ---------------------------------------------------------------------------
+#
+# Belt-and-suspenders against AI-writing tells. The synthesizer prompt forbids
+# them and the evaluator blocks on em-dashes + banned phrases, but the
+# finalize LLM can still re-introduce them while reflowing the document into
+# LaTeX. We strip them deterministically before compile so the rendered PDF
+# stays clean even if the LLM regresses.
+#
+# Single-rule em-dash policy: replace with comma. Predictable; risks an
+# occasional awkward comma where a colon would read better, but that's a
+# smaller cost than letting an em-dash slip into the rendered PDF.
+
+# Banned-phrase rewrites — same list as the synth/evaluator. Conservative
+# substitutions that read fine in any context the original phrase appeared in.
+_BANNED_PHRASE_REWRITES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r"\bI\s+believe\s+my\s+background\s+in\b", re.IGNORECASE), "My background in"),
+    (re.compile(r"\bI\s+see\s+this\s+(opportunity|position)\s+as\s+a\s+chance\s+to\b", re.IGNORECASE), r"This \1 would let me"),
+    (re.compile(r"\bcontinue\s+developing\s+myself\b", re.IGNORECASE), "keep developing"),
+    (re.compile(r"\bI\s+am\s+especially\s+motivated\s+by\b", re.IGNORECASE), "What draws me to this is"),
+    (re.compile(r"\bdirectly\s+shapes\b", re.IGNORECASE), "shapes"),
+    (re.compile(r"\bplay\s+a\s+meaningful\s+role\b", re.IGNORECASE), "contribute"),
+    (re.compile(r"\btapestry\b", re.IGNORECASE), "mix"),
+    (re.compile(r"\bdelving\s+into\b", re.IGNORECASE), "working on"),
+    (re.compile(r"\bdelve\s+into\b", re.IGNORECASE), "work on"),
+    (re.compile(r"\bstands\s+out\s+to\s+me\b", re.IGNORECASE), "interests me"),
+    (re.compile(r"\bmatters\s+to\s+me\s+because\b", re.IGNORECASE), "is important because"),
+]
+
+
+def _normalize_ai_tells(latex_body: str) -> str:
+    """Strip em-dashes and banned phrases from LaTeX prose body.
+
+    Operates on the rendered LaTeX source after the LLM produces it; runs
+    only on the SOP/COVER_LETTER prose path. The CV path is untouched
+    because em-dashes in CV bullets (date ranges, "Aug 2023 — present") are
+    a legitimate convention.
+
+    Em-dashes:
+      - Long em-dash `—` and double-hyphen ` -- ` → comma + space.
+      - Hyphen-with-spaces ` - ` (when used as a dash) is left alone — it's
+        ambiguous with compound modifiers and replacing risks worse output
+        than leaving it.
+
+    Banned phrases:
+      - Conservative regex map; same list as the synth prompt and evaluator.
+      - Substitutions are deliberately tame — they shouldn't change meaning,
+        only register. A document that produced these phrases despite the
+        synth prompt and evaluator block is already past two filters; this
+        is the last line of defense.
+    """
+    # 1. Em-dashes. Long em-dash → comma; double-hyphen → comma. Run after
+    # other rules so banned phrases match against the original wording.
+    out = latex_body
+
+    # 2. Banned phrases.
+    for pattern, replacement in _BANNED_PHRASE_REWRITES:
+        out = pattern.sub(replacement, out)
+
+    # 3. Em-dash variants → comma. Handle spaced ` — ` first to avoid
+    # producing double commas, then bare `—`, then ` -- ` (LaTeX en-dash
+    # input that renders as em-dash via ligature).
+    out = re.sub(r"\s+—\s+", ", ", out)
+    out = re.sub(r"—", ", ", out)
+    out = re.sub(r"\s--\s", ", ", out)
+
+    return out
 
 
 def _strip_resume_commands_for_prose(latex: str) -> str:
@@ -552,8 +635,12 @@ def finalize(state: DocFeedbackState) -> dict:
         # For SOP / COVER_LETTER, the prose template defines no resume / list
         # commands. If the LLM regressed and emitted them anyway, unwrap to
         # plain paragraphs so the PDF doesn't bullet-point every paragraph.
+        # Then strip AI-writing tells (em-dashes, banned phrases) — the
+        # synth prompt and evaluator block these, but the finalize LLM can
+        # re-introduce them while reflowing prose into LaTeX.
         if doc_type in ("SOP", "COVER_LETTER"):
             latex_source = _strip_resume_commands_for_prose(latex_source)
+            latex_source = _normalize_ai_tells(latex_source)
 
         pdf_bytes = compile_latex(latex_source)
         if pdf_bytes is None:

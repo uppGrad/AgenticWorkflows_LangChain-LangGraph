@@ -19,8 +19,8 @@ from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 SYSTEM = """You are a quality-control reviewer for an AI document feedback system.
 
 You will receive a list of change proposals, the original document, the user
-profile, and (for SOP / COVER_LETTER docs) the rhetoric analysis output.
-Evaluate each proposal for:
+profile, and (for SOP / COVER_LETTER docs) the rhetoric and narrative
+analysis outputs. Evaluate each proposal for:
 
 1. **Groundedness**: Does before_text actually appear in the document? If before_text is non-empty
    and not a placeholder, it must be a real excerpt from the document — flag any that are fabricated.
@@ -28,8 +28,9 @@ Evaluate each proposal for:
    are not in the document or the user's profile? Flag anything invented.
 3. **Specificity**: Is the rationale clear and specific? Reject vague rationales under 15 characters
    or after_text values that are unresolved placeholders like "[Add content here]".
-4. **Format compliance**: Every proposal must have a non-empty section, rationale, and after_text,
-   and a confidence value between 0.0 and 1.0.
+4. **Format compliance**: Every proposal must have a non-empty section, rationale, and a
+   confidence value between 0.0 and 1.0. `after_text` must be non-empty UNLESS
+   `action="delete"`, in which case it MUST be the empty string.
 5. **Substance compliance** (SOP / COVER_LETTER ONLY): for each rhetoric
    finding with `priority: "high"` there MUST be at least one proposal whose
    before_text matches that paragraph (anchor substring is enough). If a
@@ -41,14 +42,34 @@ Evaluate each proposal for:
    sentence-level polish (style/grammar/keyword) while one or more high-
    priority rhetoric findings remain unaddressed, flag the mix as
    polish-dominated. Substance work comes first; polish only after.
+7. **Narrative compliance** (SOP / COVER_LETTER ONLY): the proposals must
+   address the document-level narrative findings.
+   - For every entry in `narrative.repeated_anchors`, the resulting document
+     (after applying all proposals) must NOT keep the same anchor as the
+     focus of two or more paragraphs. If a repeated anchor is still being
+     leaned on across proposals, flag the redundancy.
+   - For every paragraph index in `narrative.paragraphs_to_delete`, there
+     must be a corresponding `action="delete"` (or `action="merge"`)
+     proposal targeting that paragraph. Flag missing deletions.
+   - If `narrative.conclusion_commits_forward` is false, there must be a
+     proposal rewriting the closing paragraph that names the target org
+     AND specifies a concrete contribution. Flag a generic closing.
+8. **AI-tell density** (SOP / COVER_LETTER ONLY): no `after_text` may
+   contain an em-dash (—) or a double-hyphen ( -- ). The total count of
+   banned phrases across all `after_text` values combined must be at most 1.
+   The banned phrases are: "I believe my background", "see this opportunity
+   as a chance", "continue developing myself", "I am especially motivated",
+   "directly shapes", "play a meaningful role", "tapestry", "delve", "delving",
+   "stands out to me", "matters to me because", and the metaphorical
+   "leverage" / "navigate". Flag any violation.
 
 Return:
 - passed: true only if no critical issues were found (minor style notes do not fail)
 - issues: a list of specific problem descriptions — empty if passed
 - iteration: the iteration index provided
 
-Be strict about groundedness, hallucinations, and substance compliance;
-lenient about minor wording or ordering choices.
+Be strict about groundedness, hallucinations, substance/narrative compliance,
+and AI-tell density; lenient about minor wording or ordering choices.
 """
 
 _MAX_PROPOSALS_CHARS = 4000
@@ -75,6 +96,7 @@ def _check_format(proposal: dict, index: int) -> List[str]:
     """Return a list of format-compliance issue strings for one proposal."""
     issues: List[str] = []
     prefix = f"Proposal {index + 1} ({proposal.get('section', '?')})"
+    action = (proposal.get("action") or "rewrite").lower()
 
     if not (proposal.get("section") or "").strip():
         issues.append(f"{prefix}: 'section' is empty.")
@@ -82,8 +104,29 @@ def _check_format(proposal: dict, index: int) -> List[str]:
         issues.append(f"{prefix}: 'rationale' is empty.")
     elif len(proposal["rationale"].strip()) < 15:
         issues.append(f"{prefix}: rationale is too short to be meaningful.")
-    if not (proposal.get("after_text") or "").strip():
-        issues.append(f"{prefix}: 'after_text' is empty — every proposal must supply replacement text.")
+
+    # Delete proposals must have empty after_text; rewrite/merge must not.
+    after_text = (proposal.get("after_text") or "").strip()
+    if action == "delete":
+        if after_text:
+            issues.append(
+                f"{prefix}: action='delete' requires after_text to be empty, "
+                "but a non-empty replacement was supplied."
+            )
+        # Delete must also have a non-empty before_text — there must be
+        # something to remove.
+        if not (proposal.get("before_text") or "").strip():
+            issues.append(
+                f"{prefix}: action='delete' requires before_text to identify "
+                "the paragraph being removed."
+            )
+    else:
+        if not after_text:
+            issues.append(
+                f"{prefix}: 'after_text' is empty — every {action} proposal "
+                "must supply replacement text."
+            )
+
     conf = proposal.get("confidence")
     if conf is None or not (0.0 <= float(conf) <= 1.0):
         issues.append(f"{prefix}: 'confidence' is missing or out of range [0, 1].")
@@ -285,6 +328,215 @@ def _check_substance_compliance(
     return issues
 
 
+# Banned phrases — must mirror the synth prompt. The total count across all
+# after_text values must be at most _AI_TELL_PHRASE_BUDGET.
+_BANNED_PHRASES = [
+    "i believe my background",
+    "see this opportunity as a chance",
+    "continue developing myself",
+    "i am especially motivated",
+    "directly shapes",
+    "play a meaningful role",
+    "tapestry",
+    "delve",
+    "delving",
+    "stands out to me",
+    "matters to me because",
+]
+_AI_TELL_PHRASE_BUDGET = 1
+
+
+def _check_narrative_compliance(
+    proposals: List[dict],
+    doc_type: str,
+    analysis_results: dict,
+) -> List[str]:
+    """Audit proposals against narrative findings.
+
+    Three checks:
+      1. Repeated-anchor diversity — for every entry in repeated_anchors,
+         at most ONE rewrite/merge proposal may keep that anchor as the
+         dominant focus of after_text. The rest must either delete or
+         pivot to a different anchor.
+      2. Deletion coverage — every paragraph index in paragraphs_to_delete
+         must be matched by a delete or merge proposal whose before_text
+         contains that paragraph.
+      3. Closing commitment — when conclusion_commits_forward is false,
+         there must be a proposal whose after_text names the target org
+         AND avoids the generic closing patterns.
+    """
+    if doc_type not in ("SOP", "COVER_LETTER"):
+        return []
+
+    narrative = (analysis_results or {}).get("narrative") or {}
+    if not narrative:
+        return []
+
+    issues: List[str] = []
+
+    # 1. Repeated-anchor diversity.
+    repeated = narrative.get("repeated_anchors") or []
+    rewrite_or_merge = [
+        p for p in proposals
+        if (p.get("action") or "rewrite").lower() in ("rewrite", "merge")
+    ]
+    for entry in repeated:
+        # Tuple was serialised as a list by Pydantic's model_dump.
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        anchor = str(entry[0]).strip()
+        if not anchor:
+            continue
+        anchor_lower = anchor.lower()
+        # Count how many rewrite/merge proposals end up dominated by the
+        # same anchor. We define "dominated" as: the anchor appears in
+        # after_text. If a proposal wraps the anchor in passing only, we
+        # accept up to one such mention; the test is whether the anchor
+        # appears as a focal noun phrase (proxied by appearing 2+ times in
+        # after_text or appearing in the first 200 chars).
+        focusing = 0
+        for p in rewrite_or_merge:
+            after = (p.get("after_text") or "").lower()
+            if not after:
+                continue
+            if after.count(anchor_lower) >= 2 or anchor_lower in after[:200]:
+                focusing += 1
+        if focusing >= 2:
+            issues.append(
+                f"Narrative violation: anchor '{anchor}' is still the focus "
+                f"of {focusing} proposals' after_text — narrative analysis "
+                "flagged it as repeated; rewrites must distribute focus "
+                "across different anchors."
+            )
+
+    # 2. Deletion coverage.
+    paragraph_roles = narrative.get("paragraph_roles") or []
+    role_index_to_anchor = {
+        int(pr.get("paragraph_index", -1)): str(pr.get("paragraph_anchor", "")).strip()
+        for pr in paragraph_roles
+        if isinstance(pr, dict)
+    }
+    delete_or_merge_proposals = [
+        p for p in proposals
+        if (p.get("action") or "rewrite").lower() in ("delete", "merge")
+    ]
+    for idx in (narrative.get("paragraphs_to_delete") or []):
+        try:
+            idx_int = int(idx)
+        except (TypeError, ValueError):
+            continue
+        anchor = role_index_to_anchor.get(idx_int, "")
+        if not anchor:
+            continue
+        norm_anchor = _normalize_for_match(anchor)
+        covered = any(
+            norm_anchor in _normalize_for_match(p.get("before_text", ""))
+            for p in delete_or_merge_proposals
+        )
+        if not covered:
+            issues.append(
+                f"Narrative violation: paragraph {idx_int} ('{anchor[:60]}...') "
+                "was flagged for deletion but no delete/merge proposal "
+                "targets it. Emit an action='delete' proposal."
+            )
+
+    # 3. Closing commitment.
+    if narrative.get("conclusion_commits_forward") is False:
+        # The closing is the highest paragraph_index in paragraph_roles
+        # whose role is "closing"; fall back to the highest index overall.
+        closing_anchor = ""
+        closing_indices = [
+            int(pr.get("paragraph_index", -1))
+            for pr in paragraph_roles
+            if isinstance(pr, dict) and pr.get("role") == "closing"
+        ]
+        if closing_indices:
+            closing_anchor = role_index_to_anchor.get(max(closing_indices), "")
+        elif role_index_to_anchor:
+            closing_anchor = role_index_to_anchor.get(max(role_index_to_anchor.keys()), "")
+        norm_closing = _normalize_for_match(closing_anchor)
+        # Find a rewrite proposal that targets this paragraph.
+        targeting = [
+            p for p in proposals
+            if (p.get("action") or "rewrite").lower() == "rewrite"
+            and norm_closing
+            and norm_closing in _normalize_for_match(p.get("before_text", ""))
+        ]
+        if not targeting:
+            issues.append(
+                "Narrative violation: closing paragraph is generic "
+                "(no forward commitment) but no rewrite proposal targets "
+                "it. Emit a rewrite that names the target org and a "
+                "concrete contribution."
+            )
+        else:
+            # Confirm at least one targeting proposal commits forward —
+            # i.e. its after_text avoids the generic patterns.
+            generic_patterns = [
+                re.compile(r"\bthank\s+you\s+for\s+(your\s+)?(time|consideration|considering)", re.IGNORECASE),
+                re.compile(r"\bcontinue\s+developing\s+myself", re.IGNORECASE),
+                re.compile(r"\bwould\s+be\s+happy\s+for\s+the\s+opportunity", re.IGNORECASE),
+                re.compile(r"\bI\s+believe\s+my\s+background", re.IGNORECASE),
+                re.compile(r"\bsee\s+this\s+opportunity\s+as\s+a\s+chance", re.IGNORECASE),
+            ]
+            forward_committing = any(
+                not any(p.search(t.get("after_text") or "") for p in generic_patterns)
+                for t in targeting
+            )
+            if not forward_committing:
+                issues.append(
+                    "Narrative violation: closing rewrite still uses "
+                    "generic sign-off language. The new closing must "
+                    "name the target org and a concrete contribution."
+                )
+
+    return issues
+
+
+def _check_ai_tells(proposals: List[dict], doc_type: str) -> List[str]:
+    """Em-dash + banned-phrase audit on after_text values.
+
+    SOP/COVER_LETTER only — CV bullets sometimes legitimately use em-dashes
+    in date ranges, and the banned-phrase list targets prose AI tells.
+    """
+    if doc_type not in ("SOP", "COVER_LETTER"):
+        return []
+
+    issues: List[str] = []
+
+    for i, p in enumerate(proposals):
+        after = p.get("after_text") or ""
+        if not after.strip():
+            continue
+        # 1. Em-dashes / double hyphens.
+        if "—" in after or " -- " in after:
+            prefix = f"Proposal {i + 1} ({p.get('section', '?')})"
+            issues.append(
+                f"{prefix}: after_text contains an em-dash (—) or "
+                "double-hyphen — these are AI-writing tells. Replace "
+                "with a comma, period, semicolon, or colon."
+            )
+
+    # 2. Banned-phrase budget — counted across the entire after_text corpus.
+    corpus = " ".join((p.get("after_text") or "").lower() for p in proposals)
+    total_hits = 0
+    hit_phrases: List[str] = []
+    for phrase in _BANNED_PHRASES:
+        count = corpus.count(phrase)
+        if count > 0:
+            total_hits += count
+            hit_phrases.append(f"'{phrase}' ({count}x)")
+    if total_hits > _AI_TELL_PHRASE_BUDGET:
+        issues.append(
+            f"Banned-phrase budget exceeded ({total_hits} > "
+            f"{_AI_TELL_PHRASE_BUDGET}): {', '.join(hit_phrases)}. "
+            "These are AI-writing tells — rewrite the after_text values "
+            "to avoid them."
+        )
+
+    return issues
+
+
 def _heuristic_evaluate(
     proposals: List[dict],
     raw_text: str,
@@ -324,6 +576,14 @@ def _heuristic_evaluate(
     substance_issues = _check_substance_compliance(proposals, doc_type, analysis_results or {})
     all_issues.extend(substance_issues)
 
+    # Narrative compliance — SOP/COVER_LETTER only.
+    narrative_issues = _check_narrative_compliance(proposals, doc_type, analysis_results or {})
+    all_issues.extend(narrative_issues)
+
+    # AI-tell density — SOP/COVER_LETTER only.
+    ai_tell_issues = _check_ai_tells(proposals, doc_type)
+    all_issues.extend(ai_tell_issues)
+
     # Deduplicate
     seen: set[str] = set()
     unique_issues: List[str] = []
@@ -338,6 +598,9 @@ def _heuristic_evaluate(
     # - Groundedness failures on real (non-placeholder) text are blocking if > 20% of proposals.
     # - Substance gaps + preservation violations + polish-dominated mix are
     #   blocking — they are the failure mode this evaluator was extended for.
+    # - Narrative gaps (uncovered deletions, repeated anchors, generic closing)
+    #   and AI-tell violations are also blocking — these are the failure modes
+    #   the second-pass extension was added for.
     # - Placeholder proposals are a quality note but not blocking on their own
     #   (they come from the heuristic synthesizer and are expected without an LLM).
     format_failures = [i for i in unique_issues if "empty" in i or "missing" in i or "out of range" in i]
@@ -350,6 +613,8 @@ def _heuristic_evaluate(
         len(format_failures) == 0
         and grounding_failure_rate <= 0.20
         and len(substance_issues) == 0
+        and len(narrative_issues) == 0
+        and len(ai_tell_issues) == 0
     )
 
     return EvaluationResult(
@@ -393,16 +658,23 @@ def evaluate_output(state: DocFeedbackState) -> dict:
     doc_excerpt = raw_text[:_MAX_DOC_CHARS]
     profile_text = json.dumps(profile_snapshot)[:_MAX_PROFILE_CHARS]
 
-    # For SOP/CL include the rhetoric findings so the LLM can audit substance
-    # compliance (rules 5 + 6 in the system prompt). Stays out of the prompt
-    # for CV — substance audit doesn't apply there.
+    # For SOP/CL include the rhetoric and narrative findings so the LLM can
+    # audit substance + mix (rules 5-6) and narrative compliance (rule 7).
+    # Stays out of the prompt for CV — neither audit applies there.
     rhetoric_section = ""
     if doc_type in ("SOP", "COVER_LETTER"):
         rhetoric = analysis_results.get("rhetoric") or {}
+        narrative = analysis_results.get("narrative") or {}
         if rhetoric:
-            rhetoric_section = (
+            rhetoric_section += (
                 "\n\nRhetoric analysis (drives substance + mix audit):\n"
-                + json.dumps(rhetoric, indent=2)[:3000]
+                + json.dumps(rhetoric, indent=2)[:2500]
+            )
+        if narrative:
+            rhetoric_section += (
+                "\n\nNarrative analysis (drives narrative-compliance audit "
+                "— repeated anchors, deletions, closing commitment):\n"
+                + json.dumps(narrative, indent=2)[:2500]
             )
 
     structured = llm.with_structured_output(_EvalOut)
@@ -422,15 +694,23 @@ def evaluate_output(state: DocFeedbackState) -> dict:
 
     try:
         out: _EvalOut = structured.invoke(msgs)
-        # Always cross-check against the deterministic substance auditor; the
-        # LLM evaluator can be lenient on its own, but coverage / preservation
-        # / mix can be verified mechanically and shouldn't depend on the LLM.
+        # Always cross-check against the deterministic auditors; the LLM
+        # evaluator can be lenient on its own, but substance / narrative /
+        # AI-tell rules can be verified mechanically and shouldn't depend
+        # on the LLM.
         substance_issues = _check_substance_compliance(proposals, doc_type, analysis_results)
+        narrative_issues = _check_narrative_compliance(proposals, doc_type, analysis_results)
+        ai_tell_issues = _check_ai_tells(proposals, doc_type)
         merged_issues = list(out.issues or [])
-        for iss in substance_issues:
+        for iss in substance_issues + narrative_issues + ai_tell_issues:
             if iss not in merged_issues:
                 merged_issues.append(iss)
-        passed = bool(out.passed) and not substance_issues
+        passed = (
+            bool(out.passed)
+            and not substance_issues
+            and not narrative_issues
+            and not ai_tell_issues
+        )
         result = EvaluationResult(
             passed=passed,
             issues=merged_issues,

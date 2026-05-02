@@ -439,31 +439,39 @@ Fully implemented across phases 0-6:
   build_context_pack).
 - **Phase 2**: parallel analysis fan-out — analyze_structure,
   analyze_style, analyze_content_gaps, analyze_ats,
-  analyze_opportunity_alignment, analyze_rhetoric (LangGraph `Send`
-  from build_context_pack). The 6 parallel nodes write only `step_history`
-  (concurrent `current_step` writes would conflict);
+  analyze_opportunity_alignment, analyze_rhetoric, analyze_narrative
+  (LangGraph `Send` from build_context_pack). The 7 parallel nodes write
+  only `step_history` (concurrent `current_step` writes would conflict);
   `build_context_pack` sets `current_step="parallel_analysis"`.
-  analyze_ats is CV-only; analyze_rhetoric is SOP/CL-only — both still
-  write step_history so the frontend shape is doc-type-agnostic.
+  analyze_ats is CV-only; analyze_rhetoric and analyze_narrative are
+  SOP/CL-only — all still write step_history so the frontend shape is
+  doc-type-agnostic. analyze_rhetoric is per-paragraph; analyze_narrative
+  is whole-document (anchor reuse, paragraph progression, closing audit).
 - **Phase 3**: synthesize_feedback with grounding validation (drops
   proposals whose `before_text` cannot be fuzzy-matched to the document).
   Doc-type branch: CV → `_SYSTEM_CV` (sentence-level polish); SOP/CL →
   `_SYSTEM_SUBSTANCE` (paragraph rewrites driven by rhetoric findings,
-  polish capped at ~30%).
+  narrative-driven delete/merge proposals + closing rewrite, polish
+  capped at ~30%).
 - **Phase 4**: evaluate_output retry loop, capped at
-  `MAX_EVAL_ITERATIONS=2`. SOP/CL adds a deterministic substance audit
-  (coverage / preservation / polish ≤30% when substance is unaddressed)
-  — failures are blocking and trigger retry.
+  `MAX_EVAL_ITERATIONS=2`. SOP/CL adds three blocking deterministic
+  audits: substance (coverage / preservation / polish-mix), narrative
+  (uncovered deletions / repeated-anchor diversity / closing
+  commitment), and AI-tell density (0 em-dashes; banned-phrase budget
+  ≤1 across all after_text values combined).
 - **Phase 5**: human_gate using `interrupt()` with a frontend-friendly
   resume payload.
 - **Phase 6**: finalize generates LaTeX via LLM and compiles via tectonic.
   Doc-type branch: CV → resume template (`\resumeItem*` helpers); SOP/CL →
   prose template (article + parskip, no list helpers).
   `_strip_resume_commands_for_prose` defensively unwraps stray list
-  commands on the prose path.
+  commands on the prose path; `_normalize_ai_tells` (SOP/CL only)
+  deterministically strips em-dashes (→ comma) and a curated banned-
+  phrase list as belt-and-suspenders against synth/finalize regressions.
 
 Schemas in `workflows/document_feedback/schemas.py`:
-`DocTypeClassification`, `ChangeProposal`, `EvaluationResult`.
+`DocTypeClassification`, `ChangeProposal` (with `action: rewrite | delete
+| merge`), `EvaluationResult`, `NarrativeAnalysis`.
 
 ### Doc-type contracts (don't break these without touching both producer + consumer)
 
@@ -477,6 +485,23 @@ Schemas in `workflows/document_feedback/schemas.py`:
   *menu, not a checklist* — synth uses ≤1 signal per rewritten paragraph,
   never reuses one across paragraphs, and never invents signals not
   present in the menu.
+- SOP/CL anchor diversity: each named anchor (project / internship)
+  may serve as the focus of at most ONE paragraph. Every entry in
+  `narrative.repeated_anchors` MUST be resolved by refocusing or
+  deleting all-but-one of the listed paragraphs. Every entry in
+  `narrative.paragraphs_to_delete` MUST get an `action="delete"`
+  proposal; closings flagged `conclusion_commits_forward=false` MUST
+  get a rewrite that names the org + a concrete contribution. The
+  evaluator blocks on all three.
+- SOP/CL AI-tell rules: no em-dashes (`—`) anywhere in any after_text;
+  banned-phrase budget ≤1 total across all after_text values combined.
+  Phrases live in `_BANNED_PHRASES` (evaluator) and `_BANNED_PHRASE_REWRITES`
+  (finalize normalize pass) — keep them in sync. CV path is exempt
+  (em-dashes legitimate in date ranges).
+- `ChangeProposal.action="delete"` carries empty `after_text`; consumers
+  (frontend `ProposalReviewPane`, backend serializer, LaTeX prose
+  prompt) all handle this. CV synth never emits `delete`/`merge` so
+  backwards compat is preserved.
 - CV: Summary and Skills-categorisation are CONTEXTUAL, not default —
   Summary only for 5+ years / career-changer / explicit user request;
   categorise Skills only when the list has 12+ entries. Default to NOT

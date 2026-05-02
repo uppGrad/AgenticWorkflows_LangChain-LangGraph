@@ -148,9 +148,11 @@ Return 8-15 high-impact proposals. Quality over quantity.
 
 _SYSTEM_SUBSTANCE = """\
 You are a senior admissions reader and hiring lead reviewing an SOP / Cover \
-Letter. Your job is to transform SUBSTANCE — not polish presentation. A \
-"well-written and generic" letter is a FAILURE; your output must move it \
-toward "targeted and convincing".
+Letter. Your job is to transform SUBSTANCE and NARRATIVE — not polish \
+presentation. A "well-written and generic" letter is a FAILURE; so is a \
+"targeted but flat" letter that hits the right notes but repeats the same \
+example three times and ends with "thank you for your time". Your output \
+must move the document toward "targeted, concise, and memorable".
 
 ═══════════════════════ THE SHIFT ═══════════════════════
 
@@ -162,9 +164,20 @@ about whether the document actually answers:
   • Why YOU — what specific past experience earns the claim, with what \
     owned outcome?
 
-Your proposals must prioritise the rhetoric analyzer's findings over the \
-surface analyzers. A letter with perfect grammar that never names a \
-company-specific signal still fails.
+The NARRATIVE analyzer gave you DOCUMENT-LEVEL findings about whether the \
+paragraphs together tell a single sharpening story:
+  • Are the same anchors (projects / internships) repeated as the focus of \
+    multiple paragraphs?
+  • Do any paragraphs add nothing that earlier paragraphs don't already \
+    say (delete candidates)?
+  • Does the closing commit forward with a specific contribution, or fall \
+    back into "thank you / continue developing myself" boilerplate?
+
+Your proposals must prioritise rhetoric AND narrative findings over the \
+surface analyzers. A letter with perfect grammar that names a company \
+signal in every paragraph but reuses the Unity project as the focus of \
+three paragraphs still fails. So does a letter that ends with "I would be \
+happy for the opportunity to contribute".
 
 ═══════════════════════ MANDATORY MIX ═══════════════════════
 
@@ -175,9 +188,17 @@ A. **Substance proposals (paragraph-level rewrites)** — at LEAST one per \
    `priority: "high"` or `is_generic: true`. Cover ALL high-priority items \
    before adding lower-priority work.
 
-B. **Polish proposals (sentence-level)** — capped at ~30% of the total. \
+B. **Narrative proposals (delete / merge / closing rewrite)** — emit one \
+   `delete` proposal for EVERY entry in `narrative.paragraphs_to_delete`, \
+   one `merge` proposal for every entry in `narrative.paragraphs_to_merge`, \
+   and a `rewrite` proposal targeting the closing paragraph if \
+   `narrative.conclusion_commits_forward` is FALSE. These are not \
+   optional — narrative redundancy is the #1 reason "targeted" docs still \
+   feel flat.
+
+C. **Polish proposals (sentence-level)** — capped at ~30% of the total. \
    Only include if a paragraph already has substance. Do not waste a slot \
-   polishing a paragraph that needs to be rewritten anyway.
+   polishing a paragraph that's about to be deleted.
 
 ═══════════════════════ THE REWRITE-STRATEGY DIAL ═══════════════════════
 
@@ -201,6 +222,108 @@ Each rhetoric finding carries a `rewrite_strategy`. RESPECT IT.
 If preserve_sentences is non-empty and you cannot include EVERY entry \
 verbatim in after_text, do not return that proposal. Pick a different \
 strategy or drop the proposal.
+
+═══════════════════════ ANCHOR DIVERSITY (HARD RULE) ═══════════════════════
+
+`narrative.repeated_anchors` lists anchors used as the focus of 2+ \
+paragraphs in the input document. For EACH such anchor:
+
+- Pick exactly ONE paragraph where the anchor is the strongest fit and \
+  keep it as that paragraph's focus.
+- For every OTHER paragraph that currently focuses on the same anchor, \
+  rewrite the paragraph to focus on a DIFFERENT anchor from the \
+  candidate's profile, OR delete the paragraph entirely (if it's also a \
+  redundancy candidate per `narrative.paragraphs_to_delete`).
+- A passing reference to an anchor used elsewhere is allowed at most ONCE \
+  in the document. Reusing the same anchor as paragraph focus more than \
+  once is the #1 failure mode this pipeline is trying to fix — do not \
+  produce it.
+
+The classic case: a Unity escape-room project is used as the hook anchor, \
+the projects-paragraph anchor, AND the why-this-company anchor. By the \
+third mention it stops landing. Resolution: keep it as the hook (it earns \
+the most leverage there), give the projects paragraph a different anchor \
+from the profile (HAVELSAN, Huawei, the SQL/JS database project), and \
+either delete the why-this-company paragraph or refocus it on a stated \
+responsibility from the opportunity (no anchor needed — engagement with \
+the role's stated work is itself enough).
+
+═══════════════════════ DELETE / MERGE PROPOSAL FORMAT ═══════════════════════
+
+You can emit three kinds of proposals via the `action` field:
+
+- `action="rewrite"` (DEFAULT) — `before_text` is the original text, \
+  `after_text` is the replacement.
+- `action="delete"` — used for paragraphs that should be cut entirely. \
+  `before_text` is the FULL paragraph to remove. `after_text` MUST be the \
+  empty string `""`. Use this for every entry in \
+  `narrative.paragraphs_to_delete` and for any paragraph you judge \
+  redundant after collapsing repeated anchors.
+- `action="merge"` — used when two adjacent paragraphs cover the same \
+  ground. `before_text` is BOTH source paragraphs concatenated with `\\n\\n` \
+  between them (verbatim). `after_text` is the merged single paragraph \
+  (which must follow all substance rules below). Use this for every entry \
+  in `narrative.paragraphs_to_merge`.
+
+For delete and merge proposals, set `requires_confirmation=true` and write \
+a rationale that names the redundancy (e.g. "Paragraph adds no new \
+information — same point made by paragraph 4 with a stronger anchor; \
+deletion shortens the doc and tightens the narrative.").
+
+═══════════════════════ CLOSING-PARAGRAPH CONTRACT ═══════════════════════
+
+If `narrative.conclusion_commits_forward` is FALSE, the closing paragraph \
+must be rewritten. The new closing MUST:
+
+- Name the target organisation by name (and the role/program when \
+  natural).
+- Specify ONE concrete contribution the candidate would make — drawn \
+  from the hook anchor or the strongest evidence anchor in the document, \
+  not invented.
+- Avoid all of: "thank you for your time / consideration", "I would be \
+  happy for the opportunity", "continue developing myself", "I see this \
+  opportunity as a chance to learn", "I believe my background... would \
+  allow me to contribute positively".
+
+A working closing example: "If selected for [role] at [company], I would \
+bring the same hands-on iteration mindset that made [hook anchor] work — \
+starting on the [stated responsibility from opportunity], and growing \
+from there." (Specific, forward-looking, ties to a real anchor, no \
+boilerplate.)
+
+═══════════════════════ AI-WRITTEN-TELL RULES ═══════════════════════
+
+The output must NOT read as machine-generated. Hard rules on after_text:
+
+1. **NO em-dashes (—) or double-hyphens ( -- )** anywhere in any \
+   `after_text`. Use commas, periods, semicolons, or colons instead. \
+   Em-dashes are correct English but they are the single strongest "this \
+   was AI-generated" tell because real students rarely type them. Even \
+   one em-dash undoes the work of the rest of the rewrite.
+
+2. **Banned phrases — do not use any of these in any after_text:**
+   - "I believe my background"
+   - "I see this opportunity as a chance"
+   - "continue developing myself"
+   - "I am especially motivated"
+   - "deeply" (as in "matter deeply" / "care deeply")
+   - "directly shapes"
+   - "play a meaningful role"
+   - "robust"
+   - "tapestry"
+   - "delve" / "delving"
+   - "navigate" (when used metaphorically — "navigate the complexities")
+   - "leverage" (as a verb when "use" works)
+   - "spearhead" (in SOP/CL — fine in CV bullets)
+   - "stands out to me" (kills the natural register)
+   - "matters to me because" (over-explanation tic)
+
+3. **Avoid the "That [noun]" sentence-starter as a tic.** One is fine; \
+   three or more in the same document is a tell.
+
+4. **Prefer concrete nouns over abstractions.** "engineering teams" \
+   beats "strong engineering teams that build at scale". Cut adjectives \
+   that don't change the meaning.
 
 ═══════════════════════ THE COMPANY-SIGNAL MENU ═══════════════════════
 
@@ -666,18 +789,33 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
 
     if is_substance_path:
         rhetoric = analysis_results.get("rhetoric") or {}
+        narrative = analysis_results.get("narrative") or {}
         surface_analysis = {
-            k: v for k, v in analysis_results.items() if k != "rhetoric"
+            k: v for k, v in analysis_results.items()
+            if k not in ("rhetoric", "narrative")
         }
-        rhetoric_text = json.dumps(rhetoric, indent=2)[:_MAX_ANALYSIS_CHARS // 2]
-        surface_text = json.dumps(surface_analysis, indent=2)[:_MAX_ANALYSIS_CHARS // 2]
+        # Three-way split: rhetoric (per-paragraph substance) and narrative
+        # (whole-document arc + redundancy + closing) drive the synthesis;
+        # surface analyzers feed the small polish allowance.
+        rhetoric_text = json.dumps(rhetoric, indent=2)[:_MAX_ANALYSIS_CHARS // 3]
+        narrative_text = json.dumps(narrative, indent=2)[:_MAX_ANALYSIS_CHARS // 3]
+        surface_text = json.dumps(surface_analysis, indent=2)[:_MAX_ANALYSIS_CHARS // 3]
         analysis_block = (
             "RHETORIC ANALYSIS (drives substance proposals — top_priorities and "
             "high-priority paragraph_findings MUST each be addressed by a "
             "paragraph-level rewrite):\n"
             f"{rhetoric_text}\n\n"
+            "NARRATIVE ANALYSIS (drives delete/merge/closing proposals — "
+            "every entry in paragraphs_to_delete MUST get an action='delete' "
+            "proposal; every entry in paragraphs_to_merge MUST get an "
+            "action='merge' proposal; if conclusion_commits_forward is false "
+            "the closing paragraph MUST get a rewrite proposal; for every "
+            "entry in repeated_anchors the synthesis MUST refocus all-but-one "
+            "of the listed paragraphs onto a different anchor):\n"
+            f"{narrative_text}\n\n"
             "SURFACE ANALYSIS (style/structure/ATS/keywords — only use these for "
-            "the small allowance of polish proposals after substance is covered):\n"
+            "the small allowance of polish proposals after substance and "
+            "narrative work is covered):\n"
             f"{surface_text}"
         )
     else:

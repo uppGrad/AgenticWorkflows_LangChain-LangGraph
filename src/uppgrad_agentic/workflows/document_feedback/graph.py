@@ -19,6 +19,7 @@ from uppgrad_agentic.workflows.document_feedback.nodes.analyze_content_gaps impo
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_ats import analyze_ats
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_opportunity_alignment import analyze_opportunity_alignment
 from uppgrad_agentic.workflows.document_feedback.nodes.analyze_rhetoric import analyze_rhetoric
+from uppgrad_agentic.workflows.document_feedback.nodes.analyze_narrative import analyze_narrative
 from uppgrad_agentic.workflows.document_feedback.nodes.synthesize_feedback import synthesize_feedback
 from uppgrad_agentic.workflows.document_feedback.nodes.evaluate_output import evaluate_output
 from uppgrad_agentic.workflows.document_feedback.nodes.human_gate import human_gate
@@ -34,6 +35,7 @@ _ANALYSIS_NODES = [
     "analyze_ats",
     "analyze_opportunity_alignment",
     "analyze_rhetoric",
+    "analyze_narrative",
 ]
 
 
@@ -123,6 +125,7 @@ def build_graph(checkpointer=None):
     g.add_node("analyze_ats", analyze_ats)
     g.add_node("analyze_opportunity_alignment", analyze_opportunity_alignment)
     g.add_node("analyze_rhetoric", analyze_rhetoric)
+    g.add_node("analyze_narrative", analyze_narrative)
 
     # Phase 3 — synthesis and planning
     g.add_node("synthesize_feedback", synthesize_feedback)
