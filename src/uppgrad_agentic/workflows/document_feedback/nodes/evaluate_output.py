@@ -455,55 +455,68 @@ def _check_narrative_compliance(
             )
 
     # 3. Closing commitment.
-    if narrative.get("conclusion_commits_forward") is False:
-        # The closing is the highest paragraph_index in paragraph_roles
-        # whose role is "closing"; fall back to the highest index overall.
-        closing_anchor = ""
-        closing_indices = [
-            int(pr.get("paragraph_index", -1))
-            for pr in paragraph_roles
-            if isinstance(pr, dict) and pr.get("role") == "closing"
-        ]
-        if closing_indices:
-            closing_anchor = role_index_to_anchor.get(max(closing_indices), "")
-        elif role_index_to_anchor:
-            closing_anchor = role_index_to_anchor.get(max(role_index_to_anchor.keys()), "")
-        norm_closing = _normalize_for_match(closing_anchor)
-        # Find a rewrite proposal that targets this paragraph.
-        targeting = [
-            p for p in proposals
-            if (p.get("action") or "rewrite").lower() == "rewrite"
-            and norm_closing
-            and norm_closing in _normalize_for_match(p.get("before_text", ""))
-        ]
-        if not targeting:
+    # Banned closing patterns. The list is checked unconditionally — even when
+    # narrative.conclusion_commits_forward=true, because the analyzer is
+    # lenient about what counts as forward commitment ("I would welcome the
+    # opportunity to further discuss" reads forward to a model but is the
+    # canonical CL boilerplate close).
+    generic_closing_patterns = [
+        re.compile(r"\bthank\s+you\s+for\s+(your\s+)?(time|consideration|considering)", re.IGNORECASE),
+        re.compile(r"\bcontinue\s+developing\s+myself", re.IGNORECASE),
+        re.compile(r"\bwould\s+be\s+happy\s+for\s+the\s+opportunity", re.IGNORECASE),
+        re.compile(r"\bwould\s+welcome\s+the\s+(opportunity|chance)\s+to\s+(further\s+)?(discuss|talk|chat|connect)", re.IGNORECASE),
+        re.compile(r"\bI\s+believe\s+my\s+background", re.IGNORECASE),
+        re.compile(r"\bsee\s+this\s+opportunity\s+as\s+a\s+chance", re.IGNORECASE),
+        re.compile(r"^\s*if\s+selected\s+for\b", re.IGNORECASE | re.MULTILINE),
+    ]
+
+    closing_anchor = ""
+    closing_indices = [
+        int(pr.get("paragraph_index", -1))
+        for pr in paragraph_roles
+        if isinstance(pr, dict) and pr.get("role") == "closing"
+    ]
+    if closing_indices:
+        closing_anchor = role_index_to_anchor.get(max(closing_indices), "")
+    elif role_index_to_anchor:
+        closing_anchor = role_index_to_anchor.get(max(role_index_to_anchor.keys()), "")
+    norm_closing = _normalize_for_match(closing_anchor)
+
+    # Always check the rendered closing for banned phrases. The closing is
+    # either (a) the after_text of a rewrite proposal that targets it, or (b)
+    # the original closing paragraph itself if no proposal targets it.
+    targeting_closing = [
+        p for p in proposals
+        if (p.get("action") or "rewrite").lower() == "rewrite"
+        and norm_closing
+        and norm_closing in _normalize_for_match(p.get("before_text", ""))
+    ]
+    closing_text = (
+        targeting_closing[0].get("after_text") or ""
+    ) if targeting_closing else closing_anchor
+    if closing_text and any(p.search(closing_text) for p in generic_closing_patterns):
+        if targeting_closing:
             issues.append(
-                "Narrative violation: closing paragraph is generic "
-                "(no forward commitment) but no rewrite proposal targets "
-                "it. Emit a rewrite that names the target org and a "
-                "concrete contribution."
+                "Narrative violation: closing rewrite still uses generic "
+                "sign-off language. The new closing must name the target "
+                "org and a concrete contribution, and must not contain "
+                "banned phrases (thank you for your time / would welcome "
+                "the opportunity to discuss / etc.)."
             )
         else:
-            # Confirm at least one targeting proposal commits forward —
-            # i.e. its after_text avoids the generic patterns.
-            generic_patterns = [
-                re.compile(r"\bthank\s+you\s+for\s+(your\s+)?(time|consideration|considering)", re.IGNORECASE),
-                re.compile(r"\bcontinue\s+developing\s+myself", re.IGNORECASE),
-                re.compile(r"\bwould\s+be\s+happy\s+for\s+the\s+opportunity", re.IGNORECASE),
-                re.compile(r"\bI\s+believe\s+my\s+background", re.IGNORECASE),
-                re.compile(r"\bsee\s+this\s+opportunity\s+as\s+a\s+chance", re.IGNORECASE),
-                re.compile(r"^\s*if\s+selected\s+for\b", re.IGNORECASE | re.MULTILINE),
-            ]
-            forward_committing = any(
-                not any(p.search(t.get("after_text") or "") for p in generic_patterns)
-                for t in targeting
+            issues.append(
+                "Narrative violation: closing paragraph contains banned "
+                "boilerplate (thank you for your time / would welcome the "
+                "opportunity to discuss / etc.) but no rewrite proposal "
+                "targets it. Emit a rewrite that names the target org and "
+                "a concrete contribution."
             )
-            if not forward_committing:
-                issues.append(
-                    "Narrative violation: closing rewrite still uses "
-                    "generic sign-off language. The new closing must "
-                    "name the target org and a concrete contribution."
-                )
+    elif narrative.get("conclusion_commits_forward") is False and not targeting_closing:
+        issues.append(
+            "Narrative violation: closing paragraph is generic (no forward "
+            "commitment) but no rewrite proposal targets it. Emit a rewrite "
+            "that names the target org and a concrete contribution."
+        )
 
     return issues
 

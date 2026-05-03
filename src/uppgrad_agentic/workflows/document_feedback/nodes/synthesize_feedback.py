@@ -215,6 +215,53 @@ C. **Polish proposals (sentence-level)** — capped at ~30% of the total. \
    Only include if a paragraph already has substance. Do not waste a slot \
    polishing a paragraph that's about to be deleted.
 
+═══════════════════════ ANCHOR-INJECTION FLOOR (HARD RULE) ═══════════════════════
+
+When you emit a `rewrite` proposal whose rhetoric `rewrite_strategy` is \
+`replace` (i.e. preserve_sentences was empty and the paragraph was generic \
+on all four dimensions), the after_text MUST name at least ONE specific \
+anchor from the candidate's profile — a project name, an internship \
+employer, a course / capstone, a university — drawn verbatim from the \
+profile context. "academic projects", "machine learning systems", \
+"full-stack web applications" do NOT count: those are categories, not \
+anchors. A named anchor looks like "the LLM Bug Analyzer", "my Trendyol \
+backend internship", "the Library Management System project", "Bilkent \
+University". If the profile contains no such named anchor relevant to the \
+paragraph's theme, prefer a `delete` over emitting a generic rewrite.
+
+Across the proposal set, distribute DIFFERENT anchors across paragraph \
+rewrites — do not name the same anchor as the focus of two rewrites in \
+the same document. (This is the same anchor-diversity rule as for \
+already-anchored input documents; for fully-generic input it is what \
+forces the rewrite to actually be substantive instead of "less generic".)
+
+═══════════════════════ ABSORB SURFACE FINDINGS INTO REWRITES (HARD RULE) ═══════════════════════
+
+The surface analyses (style, content_gaps, opportunity_alignment, \
+structure) are NOT a separate work-stream that competes with substance \
+rewrites — they are content the substance rewrites must absorb. When you \
+emit a `rewrite` proposal for a paragraph, scan the surface findings and \
+incorporate every finding that applies to that paragraph or its section:
+
+- An `opportunity_alignment` finding naming a missing company signal that \
+  fits this paragraph → weave it in (still capped at one signal per \
+  rewritten paragraph; see THE COMPANY-SIGNAL MENU).
+- A `style.issues` entry calling out a phrase or sentence inside this \
+  paragraph → fix it inside the rewrite, do NOT emit a separate polish \
+  proposal for the same span (the polish would be rejected as overlap).
+- A `content_gaps.weak_claims` or `content_gaps.gaps` entry covering this \
+  paragraph's topic → strengthen the relevant claim in the rewrite.
+
+Standalone polish proposals are reserved for surface findings that target \
+a paragraph NOT being substantively rewritten. If every paragraph is being \
+rewritten, expect 0 polish proposals — that is correct, not a failure.
+
+The previous failure mode this rule guards against: substance rewrites \
+that fix the rhetoric finding but ignore the company-signal / style / \
+content-gap findings for the same paragraph, leaving the document with \
+"slightly less generic" prose that still misses what the surface \
+analyzers flagged.
+
 ═══════════════════════ THE REWRITE-STRATEGY DIAL ═══════════════════════
 
 Each rhetoric finding carries a `rewrite_strategy`. RESPECT IT.
@@ -903,9 +950,13 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
             "entry in repeated_anchors the synthesis MUST refocus all-but-one "
             "of the listed paragraphs onto a different anchor):\n"
             f"{narrative_text}\n\n"
-            "SURFACE ANALYSIS (style/structure/ATS/keywords — only use these for "
-            "the small allowance of polish proposals after substance and "
-            "narrative work is covered):\n"
+            "SURFACE ANALYSIS (style/structure/content_gaps/opportunity_alignment/"
+            "ATS/keywords — these findings must be ABSORBED into the substance "
+            "rewrites for the paragraphs they target. A surface finding for a "
+            "paragraph being rewritten is NOT a separate polish proposal; the "
+            "polish would be rejected as overlap. Standalone polish proposals "
+            "are only for findings that target paragraphs NOT being substantively "
+            "rewritten):\n"
             f"{surface_text}"
         )
     else:
