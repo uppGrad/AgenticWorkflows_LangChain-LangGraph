@@ -363,6 +363,24 @@ def _build_match_pattern(before: str) -> Optional[re.Pattern]:
         return None
 
 
+# A "kitchen-sink" proposal bundles 3+ paragraphs into one before_text. The
+# greedy non-overlapping applier accepts the kitchen-sink first (lowest start
+# position) and rejects every per-paragraph proposal nested inside it as
+# overlap — leaving the document with one mega-rewrite and zero of the
+# targeted edits the synth also emitted. Reject such proposals so the
+# per-paragraph ones can apply.
+#
+# Threshold is 2+ paragraph breaks (i.e. 3+ paragraphs). One break is allowed
+# for every action so legitimate two-paragraph operations pass:
+#   * action="merge"   — two adjacent paragraphs collapsed to one (canonical)
+#   * action="rewrite" — two-paragraph restructure or swap (the schema has no
+#                        explicit "reorder" action, so the synth may encode
+#                        an A+B → B+A swap as a 1-break rewrite)
+#   * action="delete"  — two adjacent paragraphs cut together
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+_MAX_PARAGRAPH_BREAKS_IN_BEFORE_TEXT = 1
+
+
 def _apply_proposals_to_text(
     raw_text: str,
     proposals: List[Dict[str, Any]],
@@ -376,6 +394,9 @@ def _apply_proposals_to_text(
       - "before_text_not_found": the regex pattern didn't match the source
         (synthesizer hallucination that escaped the upstream grounding
         check, or document text changed between synth and finalize).
+      - "before_text_spans_too_many_paragraphs": before_text covers 3+
+        paragraphs (2+ for non-merge); kitchen-sink proposals get dropped
+        so they cannot swallow per-paragraph edits as overlap.
       - "overlap_with_earlier_proposal": this proposal's match span overlaps
         a span already claimed by an earlier-positioned proposal.
     """
@@ -389,6 +410,11 @@ def _apply_proposals_to_text(
         before = (p.get("before_text") or "").strip()
         if not before or before.startswith("["):
             unapplied.append({"proposal": p, "reason": "no_anchor"})
+            continue
+        if len(_PARAGRAPH_BREAK.findall(before)) > _MAX_PARAGRAPH_BREAKS_IN_BEFORE_TEXT:
+            unapplied.append(
+                {"proposal": p, "reason": "before_text_spans_too_many_paragraphs"}
+            )
             continue
         pattern = _build_match_pattern(before)
         if pattern is None:

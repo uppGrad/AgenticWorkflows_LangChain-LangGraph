@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from uppgrad_agentic.tools.documents import extract_text_from_file
+from uppgrad_agentic.tools.documents import (
+    extract_text_from_file,
+    normalize_paragraph_breaks,
+)
 from uppgrad_agentic.workflows.document_feedback.state import DocFeedbackState
 
 
@@ -37,7 +40,7 @@ def load_document(state: DocFeedbackState) -> dict:
             },
         }
 
-    text = (res.text or "").strip()
+    text = normalize_paragraph_breaks((res.text or "").strip())
     meta = {
         "file_name": name,
         "mime": mime,

@@ -285,6 +285,22 @@ a rationale that names the redundancy (e.g. "Paragraph adds no new \
 information — same point made by paragraph 4 with a stronger anchor; \
 deletion shortens the doc and tightens the narrative.").
 
+═══════════════════════ before_text SCOPE LIMIT (HARD RULE) ═══════════════════════
+
+`before_text` must cover at most TWO paragraphs in any single proposal, \
+regardless of action. The canonical shapes are: ONE paragraph for \
+`rewrite` and `delete`, TWO adjacent paragraphs for `merge`. A two-\
+paragraph `rewrite` is also acceptable when you genuinely need to \
+restructure or swap two paragraphs together. NEVER bundle three or more \
+paragraphs into one proposal — the deterministic applier rejects such \
+"kitchen-sink" proposals because they would otherwise swallow your \
+per-paragraph proposals as overlap and leave the rendered document with \
+only the kitchen-sink applied. If you want to change three paragraphs, \
+emit three separate proposals (combining rewrite, delete, and merge \
+actions as appropriate). Counting rule: `before_text` may contain at \
+most ONE blank-line separator. Anything more is a synth failure and the \
+proposal will be dropped.
+
 ═══════════════════════ CLOSING-PARAGRAPH CONTRACT ═══════════════════════
 
 If `narrative.conclusion_commits_forward` is FALSE, the closing paragraph \
