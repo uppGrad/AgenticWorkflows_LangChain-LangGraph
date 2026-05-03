@@ -28,6 +28,7 @@ from uppgrad_agentic.workflows.auto_apply.nodes.upload_light_post_analysis impor
     analyze_upload_light_post,
 )
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
+from uppgrad_agentic.workflows.document_feedback.graph import build_auto_tailoring_graph
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +479,138 @@ def _split_latex_and_plain(raw: str, doc_type: str) -> tuple[str, str]:
     return _truncate_to_cap(plain, doc_type), latex_source
 
 
+# Auto-apply canonical doc types → doc-feedback DocType literals. Anything
+# not in this map (e.g. "Motivation Letter" — no doc-feedback analog) falls
+# back to the legacy T1→T2 path.
+_DOC_FEEDBACK_TYPE_MAP = {
+    "CV": "CV",
+    "Cover Letter": "COVER_LETTER",
+    "Motivation Letter": "COVER_LETTER",
+    "SOP": "SOP",
+    "Personal Statement": "SOP",
+}
+
+
+def _tailor_via_doc_feedback(
+    doc_type: str,
+    uploaded_text: str,
+    user_prompt: Optional[str],
+    opportunity_data: Dict[str, Any],
+    opportunity_type: str,
+    profile: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Drive the doc-feedback graph in auto-tailoring mode against the
+    user's uploaded document. Returns a tailored_documents entry on
+    success, None on any failure (caller falls back to T1→T2)."""
+    df_doc_type = _DOC_FEEDBACK_TYPE_MAP.get(doc_type)
+    if df_doc_type is None:
+        logger.info(
+            "application_tailoring: %s has no doc-feedback analog — using T1→T2",
+            doc_type,
+        )
+        return None
+
+    # Pre-populate the doc-feedback state. We skip Phase 0 (load_document /
+    # detect_doc_type) entirely because the source text is already
+    # extracted and we know the doc_type from the requirement_item.
+    df_state = {
+        "raw_text": uploaded_text,
+        "doc_meta": {
+            "file_name": f"{doc_type}.txt",
+            "mime": "text/plain",
+            "char_count": len(uploaded_text),
+            "page_count": None,
+            "extraction_warnings": [],
+        },
+        "doc_classification": {
+            "doc_type": df_doc_type,
+            "relevant": True,
+            "confidence": 1.0,
+            "reasons": ["pre-classified by auto_apply requirement_item"],
+            "language": None,
+        },
+        "user_instructions": (user_prompt or "").strip(),
+        "profile_snapshot": profile,
+        "opportunity_context": _opportunity_context_for_doc_feedback(
+            opportunity_data, opportunity_type
+        ),
+        "iteration_count": 0,
+    }
+
+    try:
+        graph = build_auto_tailoring_graph()
+        # Sub-graph runs to completion (no interrupt). thread_id is per-doc
+        # so concurrent docs (CV + CL in same session) don't share state.
+        config = {"configurable": {"thread_id": f"auto-tailor-{doc_type}"}}
+        result = graph.invoke(df_state, config=config)
+    except Exception as exc:
+        logger.warning(
+            "application_tailoring: doc-feedback graph crashed for %s — falling back to T1→T2 (%s)",
+            doc_type, exc,
+        )
+        return None
+
+    if (result.get("result") or {}).get("status") == "error":
+        logger.info(
+            "application_tailoring: doc-feedback ended with error for %s — falling back to T1→T2",
+            doc_type,
+        )
+        return None
+
+    latex_source = (result.get("final_document") or "").strip()
+    if not latex_source:
+        return None
+
+    plain = _latex_to_plain(latex_source)
+    diff = result.get("diff") or {}
+    accepted = len((result.get("human_review") or {}).get("approved_proposals") or [])
+
+    return {
+        "content": _truncate_to_cap(plain, doc_type),
+        "latex_source": latex_source,
+        "tailoring_depth": "doc_feedback",
+        "source": "upload",
+        "llm_used": True,
+        "passes": int(result.get("iteration_count") or 0),
+        "doc_feedback_diff": diff,
+        "doc_feedback_accepted_proposals": accepted,
+    }
+
+
+def _opportunity_context_for_doc_feedback(
+    opportunity_data: Dict[str, Any], opportunity_type: str
+) -> Dict[str, Any]:
+    """Map auto_apply's opportunity_data dict to the shape doc-feedback's
+    analyze_opportunity_alignment node expects. Best-effort — every field
+    is optional on the doc-feedback side; missing fields just degrade the
+    quality of the alignment analysis."""
+    if not opportunity_data:
+        return {}
+    title = (
+        opportunity_data.get("title")
+        or opportunity_data.get("name")
+        or ""
+    )
+    org = (
+        opportunity_data.get("company")
+        or opportunity_data.get("university")
+        or opportunity_data.get("provider_name")
+        or ""
+    )
+    description = (
+        opportunity_data.get("description")
+        or opportunity_data.get("eligibility_text")
+        or ""
+    )
+    return {
+        "opportunity_type": opportunity_type,
+        "title": title,
+        "organisation": org,
+        "location": opportunity_data.get("location") or "",
+        "description": description[:_MAX_OPP_CHARS],
+    }
+
+
 def _process_document(
     item: Dict[str, Any],
     choice: str,
@@ -508,6 +641,23 @@ def _process_document(
                 "llm_used": False,
                 "passes": 0,
             }
+
+        # Try the doc-feedback graph first — it produces grounded edits
+        # (proposals must fuzzy-match source text → no hallucination) plus
+        # a deterministic evaluator with retry. Falls back to the legacy
+        # T1→T2 path on any failure.
+        df_result = _tailor_via_doc_feedback(
+            doc_type, uploaded_text, user_prompt,
+            opportunity_data, opportunity_type, profile,
+        )
+        if df_result is not None:
+            logger.info(
+                "application_tailoring: %s tailored via doc-feedback graph "
+                "(accepted=%s, content_chars=%d)",
+                doc_type, df_result.get("doc_feedback_accepted_proposals"),
+                len(df_result.get("content") or ""),
+            )
+            return df_result
 
         # PreA
         pre = analyze_upload_pre(opportunity_data, profile, uploaded_text, doc_type, user_prompt)
