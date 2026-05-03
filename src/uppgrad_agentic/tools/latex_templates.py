@@ -121,6 +121,15 @@ CV_TEMPLATE = r"""%-------------------------
 
 \newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{-4pt}}
 
+% Project heading — for projects that have MULTIPLE bullets. Wrap with
+% \resumeItemListStart / \resumeItemPlain / \resumeItemListEnd. Use this
+% instead of stacking multiple \resumeSubItem calls with the same name
+% (which prints the project name once per bullet) or empty-name sub-items.
+\newcommand{\resumeProjectHeading}[1]{
+  \vspace{-1pt}\item
+    \textbf{#1}\vspace{-5pt}
+}
+
 \renewcommand{\labelitemii}{$\circ$}
 
 \newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
@@ -159,6 +168,19 @@ CV_TEMPLATE = r"""%-------------------------
 %%         \textbf{Languages}{: Python, Go} \hfill
 %%         \textbf{Tools}{: Docker, Kubernetes}
 %%       }
+%%     \resumeSubHeadingListEnd
+%%
+%% Projects (use \resumeProjectHeading for multi-bullet projects;
+%% \resumeSubItem only for single-line projects). NEVER stack multiple
+%% \resumeSubItem with the same name, and NEVER use an empty first arg.
+%%   \section{Projects}
+%%     \resumeSubHeadingListStart
+%%       \resumeSubItem{ONE-LINE PROJECT}{Single description.}
+%%       \resumeProjectHeading{MULTI-BULLET PROJECT NAME}
+%%         \resumeItemListStart
+%%           \resumeItemPlain{First bullet.}
+%%           \resumeItemPlain{Second bullet.}
+%%         \resumeItemListEnd
 %%     \resumeSubHeadingListEnd
 % --- END BODY ---
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import os
@@ -15,6 +16,24 @@ class ExtractResult:
 def _read_txt(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
+
+
+# Per-page trailing footer patterns. pypdf includes the page-number footer
+# in extracted text, which then renders as a stray "1" paragraph between the
+# closing salutation and the real PDF page number on the rendered output.
+# Real CV/SOP/CL content never ends a page with a bare digit or "Page N" line.
+_PAGE_NUMBER_FOOTER = re.compile(
+    r"(?:\s*\n)+\s*(?:"
+    r"\d{1,3}"                     # bare "1", "12"
+    r"|[Pp]age\s*\d{1,3}"          # "Page 1"
+    r"|\d{1,3}\s*(?:of|/)\s*\d{1,3}"  # "1 of 2", "1/2"
+    r")\s*$"
+)
+
+
+def _strip_page_footer(page_text: str) -> str:
+    """Remove a trailing page-number-only line if present."""
+    return _PAGE_NUMBER_FOOTER.sub("", page_text)
 
 
 def extract_text_from_file(path: str) -> ExtractResult:
@@ -63,7 +82,7 @@ def extract_text_from_file(path: str) -> ExtractResult:
                 t = ""
                 warnings.append(f"Failed to extract text from page {i+1}.")
             if t.strip():
-                texts.append(t)
+                texts.append(_strip_page_footer(t))
 
         text = "\n".join(texts)
         if not text.strip():

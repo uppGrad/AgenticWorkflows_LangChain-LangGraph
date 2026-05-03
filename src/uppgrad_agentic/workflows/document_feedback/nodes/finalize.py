@@ -84,6 +84,15 @@ _RESUME_TEMPLATE = r"""%-------------------------
 
 \newcommand{\resumeSubItem}[2]{\resumeItem{#1}{#2}\vspace{-4pt}}
 
+% Project heading — for projects that have MULTIPLE bullets. Wrap with
+% \resumeItemListStart / \resumeItemPlain / \resumeItemListEnd. Use this
+% instead of stacking multiple \resumeSubItem calls with the same name
+% (which prints the project name once per bullet) or empty-name sub-items.
+\newcommand{\resumeProjectHeading}[1]{
+  \vspace{-1pt}\item
+    \textbf{#1}\vspace{-5pt}
+}
+
 \renewcommand{\labelitemii}{$\circ$}
 
 \newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=*]}
@@ -127,7 +136,16 @@ _RESUME_TEMPLATE = r"""%-------------------------
 %----------PROJECTS-----------------
 % \section{Projects}
 %   \resumeSubHeadingListStart
-%     \resumeSubItem{PROJECT NAME}{DESCRIPTION}
+%     % Single-line project (one description):
+%     \resumeSubItem{PROJECT NAME}{ONE-LINE DESCRIPTION}
+%     % Project with MULTIPLE bullets — use \resumeProjectHeading + bullet list.
+%     % NEVER repeat the project name across multiple \resumeSubItem calls,
+%     % and NEVER emit \resumeSubItem with an empty first argument.
+%     \resumeProjectHeading{PROJECT NAME}
+%       \resumeItemListStart
+%         \resumeItemPlain{FIRST BULLET}
+%         \resumeItemPlain{SECOND BULLET}
+%       \resumeItemListEnd
 %   \resumeSubHeadingListEnd
 
 %----------SKILLS-----------------
@@ -161,7 +179,7 @@ You receive:
 YOUR TASK:
   - Produce a COMPLETE, COMPILABLE LaTeX document using EXACTLY the provided template preamble and custom commands.
   - Render the document text faithfully into the template's section structure (HEADING, EDUCATION, EXPERIENCE, PROJECTS, SKILLS, etc.).
-  - Use ONLY the custom commands defined in the template: \resumeSubheading, \resumeItemPlain, \resumeItem, \resumeSubItem, \resumeSubHeadingListStart/End, \resumeItemListStart/End.
+  - Use ONLY the custom commands defined in the template: \resumeSubheading, \resumeItemPlain, \resumeItem, \resumeSubItem, \resumeProjectHeading, \resumeSubHeadingListStart/End, \resumeItemListStart/End.
   - Preserve every sentence of the input text. Do NOT paraphrase, summarise, condense, or "improve" the wording — the upstream pipeline has already made all editorial decisions and any further rewriting silently overrides accepted user edits.
   - If a section from the original document is not covered by the template markers, create a new \section{} for it.
 
@@ -172,6 +190,19 @@ CRITICAL RULES:
   - Do NOT invent, fabricate, or add ANY facts, dates, skills, experiences, or achievements not present in the original document or the accepted proposals.
   - Do NOT remove any original content unless explicitly instructed by an accepted proposal.
   - Escape special LaTeX characters in user content: & % $ # _ { } ~ ^
+
+PROJECTS SECTION SHAPE (very important — common rendering bug):
+  - When a project in the source has MULTIPLE descriptions / bullet points, render it as:
+        \resumeProjectHeading{PROJECT NAME}
+          \resumeItemListStart
+            \resumeItemPlain{FIRST BULLET}
+            \resumeItemPlain{SECOND BULLET}
+          \resumeItemListEnd
+  - When a project has exactly ONE description line, use:
+        \resumeSubItem{PROJECT NAME}{DESCRIPTION}
+  - NEVER stack multiple `\resumeSubItem{NAME}{...}` calls with the same NAME — that prints the project name once per bullet.
+  - NEVER emit `\resumeSubItem{}{...}` with an empty first argument — the rendered output will show as a stray "`: description`" line.
+  - If the source text shows a project header followed by lines that look like sub-bullets (indented, dash-prefixed, or just continuing under the header without a new colon-prefixed name), those lines are bullets of the SAME project — group them under one `\resumeProjectHeading`.
 
 HEADER LAYOUT (very important — most common rendering bug):
   - Render the contact header inside a \begin{center} ... \end{center} block, NOT inside a \begin{tabular*}{\textwidth}{l@{\extracolsep{\fill}}r} layout.
@@ -603,6 +634,8 @@ def _strip_resume_commands_for_prose(latex: str) -> str:
     latex = re.sub(r"^\s*\\item\s+", "\n", latex, flags=re.MULTILINE)
     # \resumeSubheading is too specific to safely unwrap; just drop the call.
     latex = re.sub(r"\\resumeSubheading\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{[^{}]*\}", "", latex)
+    # \resumeProjectHeading{X} → X as a paragraph.
+    latex = re.sub(r"\\resumeProjectHeading\s*\{([^{}]*)\}", r"\1\n", latex)
     return latex
 
 

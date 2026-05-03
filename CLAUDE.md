@@ -462,12 +462,19 @@ Fully implemented across phases 0-6:
 - **Phase 5**: human_gate using `interrupt()` with a frontend-friendly
   resume payload.
 - **Phase 6**: finalize generates LaTeX via LLM and compiles via tectonic.
-  Doc-type branch: CV → resume template (`\resumeItem*` helpers); SOP/CL →
-  prose template (article + parskip, no list helpers).
+  Doc-type branch: CV → resume template (`\resumeItem*` helpers, plus
+  `\resumeProjectHeading{name}` for projects with multiple bullets — the
+  prompt forbids stacking `\resumeSubItem` with the same or empty name,
+  which previously rendered as duplicated/empty-titled project lines);
+  SOP/CL → prose template (article + parskip, no list helpers).
   `_strip_resume_commands_for_prose` defensively unwraps stray list
   commands on the prose path; `_normalize_ai_tells` (SOP/CL only)
   deterministically strips em-dashes (→ comma) and a curated banned-
   phrase list as belt-and-suspenders against synth/finalize regressions.
+  PDF text extraction (`tools/documents.py`) strips per-page trailing
+  page-number footers (bare digit, "Page N", "N of M") so the page
+  number doesn't leak into raw_text and get typeset as a body paragraph
+  on prose docs.
 
 Schemas in `workflows/document_feedback/schemas.py`:
 `DocTypeClassification`, `ChangeProposal` (with `action: rewrite | delete
@@ -526,6 +533,12 @@ Schemas in `workflows/document_feedback/schemas.py`:
   action + numeric outcome OR named tech; the synthesizer must NOT
   propose rewrites of these — only ATS-keyword-synonym injection is
   permitted.
+- CV Skills enrichment from in-document evidence: skills the candidate
+  demonstrably uses in Experience/Projects but that are missing from
+  the Skills section MAY be added (one bundled proposal targeting the
+  Skills line). This is grounded enrichment — the document itself
+  proves the skill — and is NOT subject to the "synonyms only" rule.
+  Inventing skills with no in-document evidence is still forbidden.
 - CV `cv_antipatterns` (References-on-request, generic Hobbies, "CV"
   title, first-person Experience bullets, photo, DOB/marital status) are
   emitted as one removal proposal each; PII removals get

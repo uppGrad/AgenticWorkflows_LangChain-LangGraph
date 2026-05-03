@@ -57,6 +57,14 @@ concrete, high-impact change proposals.
      result, then method, then tech)
    - Add industry-standard keywords that are SYNONYMS of existing skills \
      (e.g. if they mention "React" you can add "React.js")
+   - **Surface skills already EVIDENCED in Experience or Projects** that are \
+     missing from the Skills section. If a bullet mentions building REST \
+     APIs, the candidate has REST API skills — add it to Skills if absent. \
+     If a project uses PostgreSQL, add PostgreSQL. This is grounded \
+     enrichment, not invention: you are only naming skills the document \
+     itself proves the candidate has used. Bundle these into ONE proposal \
+     targeting the Skills section (before_text = current Skills line, \
+     after_text = expanded line) so the user reviews them together.
 
 2. **before_text MUST be a VERBATIM QUOTE** copied exactly from the document text \
    provided below. It must appear character-for-character in the document. \
@@ -112,6 +120,13 @@ Good proposal examples:
   ✅ For a senior CV with 8 years across 4 companies: adding a 2-line Summary
      that names the candidate's specialism and orient to the target role
   ✅ For a 20+ entry Skills section: reorganising into Languages | Frameworks | Tools
+  ✅ Skills enrichment from evidence: original Skills = "JavaScript, Node.js, Python, SQL, React".
+     Experience mentions "Developed REST APIs", "microservices", "agile team", "payment APIs",
+     "authentication"; projects mention "ML model", "recommendation system". → ONE proposal:
+     before_text = "JavaScript, Node.js, Python, SQL, React"
+     after_text  = "JavaScript, Node.js, Python, SQL, React, REST APIs, Microservices,
+                    Authentication, Payment Integration, Machine Learning, Agile"
+     Every added item is provably present elsewhere in the document.
 
 Bad proposal examples (NEVER do these):
   ❌ Adding "AWS, Azure, Kubernetes" when candidate only mentions "Docker"
