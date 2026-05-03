@@ -11,7 +11,17 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 15.0
+# Markdown/text cap — bounds the value passed to thin-detection and to
+# downstream prose-extraction LLM calls (e.g. requirements parsing).
 _MAX_BYTES = 500_000
+# Raw-HTML cap — a separate, larger ceiling because some ATSes (Lever
+# served-from-Cloudflare) inline ~700KB of CSS before the semantic body, so
+# the actual <form> element can sit beyond the 500K mark. We extract the form
+# subtree (`extract_form_html`) before any LLM call, so the bloat doesn't
+# reach the LLM. Without this, Lever apply pages ≥500KB silently produced
+# zero form fields (Dreamgames Senior Software Engineer was 722KB with the
+# <form> starting at byte 709929).
+_MAX_RAW_HTML_BYTES = 2_000_000
 
 # Strong keywords: specific multi-word phrases that effectively never appear on
 # a legitimate apply page. A single hit flags the page thin.
@@ -89,7 +99,9 @@ def fetch_url(url: str) -> FetchResult:
             thin_signals=["network_error"],
         )
 
-    text = resp.text[:_MAX_BYTES]
+    body = resp.text
+    text = body[:_MAX_BYTES]
+    raw_html = body[:_MAX_RAW_HTML_BYTES]
     thin, signals = _detect_thin(text, resp.status_code)
 
     return FetchResult(
@@ -98,7 +110,7 @@ def fetch_url(url: str) -> FetchResult:
         text=text,
         http_status=resp.status_code,
         final_url=str(resp.url),
-        raw_html=text,  # httpx response body IS HTML
+        raw_html=raw_html,  # httpx response body IS HTML — keep full DOM up to 2MB
         thin_signals=signals,
     )
 
@@ -232,7 +244,7 @@ async def _crawl_with_browser(
         )
 
     md = (getattr(result, "markdown", "") or "")[:_MAX_BYTES]
-    raw_html = (getattr(result, "html", "") or "")[:_MAX_BYTES]
+    raw_html = (getattr(result, "html", "") or "")[:_MAX_RAW_HTML_BYTES]
     thin, signals = _detect_thin(md, getattr(result, "status_code", 200))
     return FetchResult(
         success=True, thin=thin, text=md,
