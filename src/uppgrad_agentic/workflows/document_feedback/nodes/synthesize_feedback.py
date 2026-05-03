@@ -196,24 +196,64 @@ happy for the opportunity to contribute".
 
 ═══════════════════════ MANDATORY MIX ═══════════════════════
 
-Return 6-12 proposals total. The mix MUST be:
+Return 8-15 proposals total. Every analyzer that produced findings MUST \
+contribute at least one proposal — a doc-feedback flow whose entire \
+output comes from rhetoric+narrative is failing the user's expectation \
+that a multi-angle review surfaces multi-angle issues.
 
 A. **Substance proposals (paragraph-level rewrites)** — at LEAST one per \
-   entry in `rhetoric.top_priorities`, plus any other paragraphs marked \
-   `priority: "high"` or `is_generic: true`. Cover ALL high-priority items \
-   before adding lower-priority work.
+   entry in `rhetoric.top_priorities`, plus any paragraph marked \
+   `priority: "high"` AND `rewrite_strategy="replace"` (i.e. paragraphs \
+   that genuinely need a substance overhaul). Skip `augment`-strategy \
+   paragraphs in this category — those already have preserve_sentences \
+   to keep, so prefer a sentence-level injection (categories C/D/E) over \
+   a full rewrite that would only change connective tissue.
 
 B. **Narrative proposals (delete / merge / closing rewrite)** — emit one \
    `delete` proposal for EVERY entry in `narrative.paragraphs_to_delete`, \
    one `merge` proposal for every entry in `narrative.paragraphs_to_merge`, \
    and a `rewrite` proposal targeting the closing paragraph if \
-   `narrative.conclusion_commits_forward` is FALSE. These are not \
-   optional — narrative redundancy is the #1 reason "targeted" docs still \
-   feel flat.
+   `narrative.conclusion_commits_forward` is FALSE. Not optional.
 
-C. **Polish proposals (sentence-level)** — capped at ~30% of the total. \
-   Only include if a paragraph already has substance. Do not waste a slot \
-   polishing a paragraph that's about to be deleted.
+C. **Style proposals (sentence-level)** — emit at LEAST one per entry in \
+   `style.issues` and `style.passive_voice_instances` that targets a \
+   paragraph NOT being substantively rewritten in category A. These are \
+   what makes the flow feel granular: targeted sentence fixes the user \
+   can accept/reject independently.
+
+D. **Content-gap proposals** — emit at LEAST one per entry in \
+   `content_gaps.gaps`, `content_gaps.weak_claims`, and \
+   `content_gaps.unexploited_strengths` that targets a paragraph NOT \
+   being substantively rewritten. Drive the proposal at the smallest \
+   unit that fixes the issue (sentence injection, claim strengthening, \
+   strength surfacing) — do NOT inflate it into a full paragraph rewrite.
+
+E. **Opportunity-alignment proposals** — for every missing company \
+   signal flagged in `opportunity_alignment` that fits a specific \
+   paragraph or sentence, emit a sentence-level injection proposal. \
+   Apply the THE COMPANY-SIGNAL MENU rules (max one signal per \
+   paragraph; signals must connect to candidate experience). Do NOT \
+   skip this category just because rhetoric also said the paragraph is \
+   weak — the alignment finding is a different angle.
+
+F. **Structure proposals** — for any `structure.ordering_issues` or \
+   `structure.layout_issues`, emit a corresponding proposal.
+
+═══════════════════════ DIVERSITY GUARD (HARD RULE) ═══════════════════════
+
+Substance + narrative proposals (categories A + B together) must NOT \
+exceed 50% of the total proposal count. The other 50%+ MUST come from \
+categories C-F. This is a hard cap, not a target. If you find yourself \
+with 4 substance rewrites and only 1 polish, you are doing it wrong — \
+either remove some substance proposals (downgrade to sentence-level \
+injection) or add the surface-derived proposals you skipped.
+
+The previous failure mode this rule guards against: the synth defaults \
+to paragraph-level rewrites because they're easier to author than \
+many small targeted proposals, and the entire output collapses to 3 \
+proposals all from one analyzer. The user's mental model of a \
+doc-feedback flow is "many small accept/reject decisions, drawn from \
+multiple analysis angles" — not "the AI rewrote my paragraphs for me".
 
 ═══════════════════════ ANCHOR-INJECTION FLOOR (HARD RULE) ═══════════════════════
 
@@ -235,32 +275,34 @@ the same document. (This is the same anchor-diversity rule as for \
 already-anchored input documents; for fully-generic input it is what \
 forces the rewrite to actually be substantive instead of "less generic".)
 
-═══════════════════════ ABSORB SURFACE FINDINGS INTO REWRITES (HARD RULE) ═══════════════════════
+═══════════════════════ ABSORPTION (EXCEPTION RULE — NOT THE DEFAULT) ═══════════════════════
 
-The surface analyses (style, content_gaps, opportunity_alignment, \
-structure) are NOT a separate work-stream that competes with substance \
-rewrites — they are content the substance rewrites must absorb. When you \
-emit a `rewrite` proposal for a paragraph, scan the surface findings and \
-incorporate every finding that applies to that paragraph or its section:
+The DEFAULT for every surface finding is to emit it as a standalone \
+proposal in categories C-F above. That is what gives the user granular \
+accept/reject control, which is the entire point of a feedback flow.
 
-- An `opportunity_alignment` finding naming a missing company signal that \
-  fits this paragraph → weave it in (still capped at one signal per \
-  rewritten paragraph; see THE COMPANY-SIGNAL MENU).
-- A `style.issues` entry calling out a phrase or sentence inside this \
-  paragraph → fix it inside the rewrite, do NOT emit a separate polish \
-  proposal for the same span (the polish would be rejected as overlap).
-- A `content_gaps.weak_claims` or `content_gaps.gaps` entry covering this \
-  paragraph's topic → strengthen the relevant claim in the rewrite.
+The ONLY case where you fold a surface finding into another proposal \
+instead of emitting it standalone: the finding targets a sentence span \
+INSIDE a paragraph that is being substantively rewritten in category A. \
+In that single case, the standalone polish would overlap the paragraph \
+rewrite's `before_text` and the deterministic applier would reject it \
+as overlap — so you must instead weave the polish content into the \
+rewrite's after_text and skip the standalone proposal.
 
-Standalone polish proposals are reserved for surface findings that target \
-a paragraph NOT being substantively rewritten. If every paragraph is being \
-rewritten, expect 0 polish proposals — that is correct, not a failure.
+Every other case: emit standalone. Specifically:
+- A surface finding for a paragraph that is NOT being rewritten in \
+  category A → standalone proposal, never absorbed.
+- An opportunity-alignment finding that fits across the document rather \
+  than at one specific span → standalone proposal targeting the best \
+  paragraph for it.
+- A style issue that doesn't sit inside a category-A paragraph → \
+  standalone polish.
 
-The previous failure mode this rule guards against: substance rewrites \
-that fix the rhetoric finding but ignore the company-signal / style / \
-content-gap findings for the same paragraph, leaving the document with \
-"slightly less generic" prose that still misses what the surface \
-analyzers flagged.
+Substance rewrites in category A still must not invent or contradict \
+the candidate's profile, but they should NOT try to also absorb every \
+surface finding in the document. Their scope is fixing the rhetoric \
+finding for that paragraph — the rest of the surface findings live as \
+standalone proposals that the user gets to decide on individually.
 
 ═══════════════════════ THE REWRITE-STRATEGY DIAL ═══════════════════════
 
@@ -951,12 +993,11 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
             "of the listed paragraphs onto a different anchor):\n"
             f"{narrative_text}\n\n"
             "SURFACE ANALYSIS (style/structure/content_gaps/opportunity_alignment/"
-            "ATS/keywords — these findings must be ABSORBED into the substance "
-            "rewrites for the paragraphs they target. A surface finding for a "
-            "paragraph being rewritten is NOT a separate polish proposal; the "
-            "polish would be rejected as overlap. Standalone polish proposals "
-            "are only for findings that target paragraphs NOT being substantively "
-            "rewritten):\n"
+            "ATS/keywords — first-class drivers of proposals C-F in the MANDATORY "
+            "MIX. Every finding here that does NOT sit inside a paragraph being "
+            "rewritten in category A must produce its own standalone proposal. "
+            "Substance + narrative proposals together are capped at 50% of the "
+            "total mix; the rest comes from these surface findings):\n"
             f"{surface_text}"
         )
     else:
