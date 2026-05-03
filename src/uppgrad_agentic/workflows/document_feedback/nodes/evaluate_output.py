@@ -492,6 +492,7 @@ def _check_narrative_compliance(
                 re.compile(r"\bwould\s+be\s+happy\s+for\s+the\s+opportunity", re.IGNORECASE),
                 re.compile(r"\bI\s+believe\s+my\s+background", re.IGNORECASE),
                 re.compile(r"\bsee\s+this\s+opportunity\s+as\s+a\s+chance", re.IGNORECASE),
+                re.compile(r"^\s*if\s+selected\s+for\b", re.IGNORECASE | re.MULTILINE),
             ]
             forward_committing = any(
                 not any(p.search(t.get("after_text") or "") for p in generic_patterns)

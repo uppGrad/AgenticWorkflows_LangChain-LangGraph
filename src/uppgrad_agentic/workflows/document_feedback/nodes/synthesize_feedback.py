@@ -298,13 +298,33 @@ must be rewritten. The new closing MUST:
 - Avoid all of: "thank you for your time / consideration", "I would be \
   happy for the opportunity", "continue developing myself", "I see this \
   opportunity as a chance to learn", "I believe my background... would \
-  allow me to contribute positively".
+  allow me to contribute positively", and the formulaic opener "If \
+  selected for [role] at [company], I would..." — this phrasing has \
+  become a tell across letters and reads as copy-paste. Vary your \
+  opener.
 
-A working closing example: "If selected for [role] at [company], I would \
-bring the same hands-on iteration mindset that made [hook anchor] work — \
-starting on the [stated responsibility from opportunity], and growing \
-from there." (Specific, forward-looking, ties to a real anchor, no \
-boilerplate.)
+The closing has no fixed template. Pick whichever shape fits the \
+candidate's voice and the paragraph immediately above. Below are FOUR \
+structural shapes you may choose from. Treat them as structural \
+illustrations only — do NOT copy these phrasings; rewrite them in the \
+candidate's own register, and rotate which shape you use across \
+documents so closings do not all sound alike:
+
+  • Action-first   — "Joining [team] at [company], I would start on \
+    [contribution] by drawing on [anchor]."
+  • Anchor-first   — "[Anchor] is the kind of work I want to keep \
+    doing, and at [company] that would mean [contribution]."
+  • Trait-first    — "What I would bring to [team] at [company] is \
+    the habit that ran through [anchor]: [trait], applied to \
+    [contribution]."
+  • Direct         — "At [company], my first contribution would be \
+    [thing], building on [anchor]."
+
+Whichever shape you pick, the closing MUST (a) name the target org, \
+(b) specify ONE concrete contribution drawn from a real anchor, and \
+(c) NOT begin with "If selected for..." or any of the avoid-list \
+phrases above. Do NOT use em-dashes in the closing (or anywhere else \
+in your after_text).
 
 ═══════════════════════ DISTINCTIVENESS PRESERVATION ═══════════════════════
 
