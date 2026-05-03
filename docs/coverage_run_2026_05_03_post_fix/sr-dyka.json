@@ -1,0 +1,34 @@
+{
+  "label": "sr-dyka",
+  "opp_type": "job",
+  "opp_id": 128136,
+  "expected_ats": "smartrecruiters",
+  "title": "Network Security Engineer",
+  "company_or_provider": "DYKA Group",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.smartrecruiters.com/TessenderloGroup/744000114907439-network-security-engineer/apply",
+  "posting_closed": false,
+  "form_field_count": 1,
+  "form_field_breakdown": {
+    "text": 1
+  },
+  "requirement_breakdown": {
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Profile / identity fields (1)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Steenwijk, Overijssel, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {},
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "No tailored documents or answers were produced."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 11.08,
+  "error": ""
+}

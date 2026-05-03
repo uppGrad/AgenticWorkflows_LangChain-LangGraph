@@ -1,0 +1,43 @@
+{
+  "label": "ashby-monumental",
+  "opp_type": "job",
+  "opp_id": 129010,
+  "expected_ats": "ashby",
+  "title": "Technical Sourcer",
+  "company_or_provider": "Monumental",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.ashbyhq.com/monumental/6d0428f7-88bd-4e37-9a5a-926664987308/application",
+  "posting_closed": false,
+  "form_field_count": 8,
+  "form_field_breakdown": {
+    "file": 2,
+    "text": 2,
+    "email": 1,
+    "textarea": 3
+  },
+  "requirement_breakdown": {
+    "document": 1,
+    "text": 3,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume",
+    "Tell us about the hardest engineering role you've ever fille",
+    "Tell us about a hire you've owned that made outsized impact ",
+    "g-recaptcha-response",
+    "Profile / identity fields (3)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {
+    "Resume": 28
+  },
+  "tailored_answers_count": 3,
+  "evaluation_warnings": [
+    "Resume: content is short (28 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 72.74,
+  "error": ""
+}

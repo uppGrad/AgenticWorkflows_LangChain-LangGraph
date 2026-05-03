@@ -1,0 +1,40 @@
+{
+  "label": "ashby-filigran",
+  "opp_type": "job",
+  "opp_id": 127628,
+  "expected_ats": "ashby",
+  "title": "Senior Business System Manager",
+  "company_or_provider": "Filigran",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.ashbyhq.com/filigran/c71e7d2c-7eeb-4003-b3db-f21b6b67b702/application",
+  "posting_closed": false,
+  "form_field_count": 12,
+  "form_field_breakdown": {
+    "file": 2,
+    "text": 2,
+    "email": 1,
+    "checkbox": 2,
+    "radio": 5
+  },
+  "requirement_breakdown": {
+    "document": 1,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume",
+    "Profile / identity fields (10)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {
+    "CV": 165
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (165 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 18.25,
+  "error": ""
+}

@@ -1,0 +1,32 @@
+{
+  "label": "masters-mba-turan",
+  "opp_type": "masters",
+  "opp_id": 71103,
+  "expected_ats": "",
+  "title": "Business Administration (MBA)",
+  "company_or_provider": "Turan International University",
+  "discovery_method": "",
+  "discovered_form_url": "",
+  "posting_closed": false,
+  "form_field_count": 0,
+  "form_field_breakdown": {},
+  "requirement_breakdown": {
+    "document": 1
+  },
+  "requirement_labels": [
+    "CV"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {
+    "CV": 113
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (113 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 3.4,
+  "error": ""
+}

@@ -1,0 +1,45 @@
+{
+  "label": "gh-dept",
+  "opp_type": "job",
+  "opp_id": 129958,
+  "expected_ats": "greenhouse",
+  "title": "Account Director, Media",
+  "company_or_provider": "DEPT\u00ae",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://job-boards.greenhouse.io/dept/jobs/7715161&urlHash=L1Dd",
+  "posting_closed": false,
+  "form_field_count": 13,
+  "form_field_breakdown": {
+    "text": 9,
+    "tel": 1,
+    "file": 2,
+    "textarea": 1
+  },
+  "requirement_breakdown": {
+    "document": 2,
+    "text": 1,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume/CV",
+    "Cover Letter",
+    "Please share examples where you have organically grown accou",
+    "Profile / identity fields (10)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Rotterdam, South Holland, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 128,
+    "Cover Letter": 1198
+  },
+  "tailored_answers_count": 1,
+  "evaluation_warnings": [
+    "CV: content is short (128 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 15.8,
+  "error": ""
+}
