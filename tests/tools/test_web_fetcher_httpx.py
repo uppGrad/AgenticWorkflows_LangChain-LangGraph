@@ -152,6 +152,30 @@ def test_raw_html_populated_for_httpx_path():
 
 
 @respx.mock
+def test_raw_html_keeps_form_when_page_exceeds_text_cap():
+    """Some ATSes (Lever served from Cloudflare) inline ~700KB of CSS before
+    the actual <form>, so the form sits past the 500K text cap. raw_html
+    must use a separate, larger ceiling so the form survives — otherwise
+    extract_form_html sees nothing and form_fields ends up empty.
+
+    Real-world case (2026-05-03): Lever Dreamgames apply page was 722KB
+    with the <form> starting at byte 709929; the old shared 500K cap
+    truncated the form off and the user got `[CV, Cover Letter]` defaults."""
+    # Build a body that exceeds the text cap (500K) before the form lands.
+    css_prelude = "/* css */ " * 60_000  # ~600K of inline CSS noise
+    form_html = "<form id='application-form'><input name='resume' type='file' /></form>"
+    body = f"<html><head><style>{css_prelude}</style></head><body>{form_html}</body></html>"
+    assert len(body) > 500_000, "test premise: body must exceed text cap"
+    respx.get("https://jobs.lever.co/x/y/apply").mock(return_value=httpx.Response(200, text=body))
+    result = fetch_url("https://jobs.lever.co/x/y/apply")
+    # raw_html keeps the form even though the page is past the 500K text cap.
+    assert "<form id='application-form'>" in result.raw_html
+    assert "name='resume'" in result.raw_html
+    # text remains capped at 500K (used for thin-detection / prose extraction).
+    assert len(result.text) <= 500_000
+
+
+@respx.mock
 def test_final_url_reflects_followed_redirect():
     """httpx with follow_redirects=True chases 301/302 and lands at the final
     URL. We must surface that final URL so downstream callers (browser
