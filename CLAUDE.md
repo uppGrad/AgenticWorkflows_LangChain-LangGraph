@@ -49,6 +49,7 @@ emit empty results — never raise.
 | `UPPGRAD_SEARCH_PROVIDER` | `brave` (only one wired) | _url_direct only_ |
 | `BRAVE_SEARCH_API_KEY` | required when provider is brave | _(none)_ |
 | `UPPGRAD_BROWSER_SCRAPE_ENABLED` | `true` enables Crawl4AI/Playwright fallback | `false` |
+| `UPPGRAD_AUTO_FILL_HEADLESS` | falsy (`0\|false\|no\|off`) launches a visible Chromium for the auto-fill step (`tools/playwright_filler.fill_form_async`). Use for local demos / debugging. Anything else → headless. | `true` (headless) |
 
 ---
 
