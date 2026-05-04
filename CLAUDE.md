@@ -385,6 +385,24 @@ LangGraph imports.** Driven from the backend's `auto_apply_adapter
 - **Tier 4** (LLM, ~$0.001-0.005 per call): gpt-4o-mini returns a
   selector + action; validated unique + not on the submit denylist.
   Bounded by `llm_picker_budget` (default 10 calls).
+- **Tier 5** (post-fill verification + drift correction):
+  - Phase 1 (deterministic, free): after every Tier 1-4 success, probe
+    the DOM via `_probe_field_state` to read the post-fill state
+    (input value / checkbox.checked / radio group selection / select
+    selectedIndex / aria-selected). Compare to `plan.value` under
+    `_normalise_for_compare` (lowercase + collapsed whitespace, with
+    substring match to handle Greenhouse-style "United States — primary"
+    decorations). Stamps `verified` + `observed_value` on the plan row.
+  - Phase 2 (LLM, on drift only): for unverified fields, fetch ONLY
+    that field's container HTML (`closest('[role=group], fieldset,
+    .form-row, .form-field, label, .application-question')`, capped
+    at 4 KB) and ask the LLM to propose a corrective Playwright action.
+    Reuses the Tier-4 `_SelectorPlan` schema + submit-denylist guard.
+    Bounded by `_MAX_CORRECTIONS_PER_FIELD=2` and
+    `_MAX_CORRECTIONS_PER_SESSION=5`.
+  - New `FillFieldOutcome` codes: `ok_corrected` (drift caught and
+    fixed) and `drift_unresolved` (drift detected, correction
+    exhausted — surfaced in the handoff package so the user knows).
 
 `tools/value_planner.py` plans the `FormFieldFillPlan` for each
 `FormField` from profile / tailored documents / tailored answers.
