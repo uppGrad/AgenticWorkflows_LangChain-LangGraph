@@ -1010,6 +1010,37 @@ async def _probe_field_state(
                     }
                 }
 
+                // ── Combobox-shaped text input (Anthropic / Greenhouse react-select) ──
+                // The input's `value` attribute is the SEARCH input's text — empty
+                // after a successful pick. The picked value lives in a sibling
+                // `.select__single-value` (single-select) or `.select__multi-value`
+                // (multi-select). MUST check this branch BEFORE the plain
+                // text branch, because `field_type` is "text" for these fields.
+                const isComboboxShape = (
+                    el.getAttribute('role') === 'combobox' ||
+                    ((el.getAttribute('aria-autocomplete') || '').toLowerCase() !== '' &&
+                     (el.getAttribute('aria-autocomplete') || '').toLowerCase() !== 'none')
+                );
+                if (isComboboxShape) {
+                    const c = el.closest('.select__container, .select-shell, [role="combobox"]') || el.parentElement;
+                    if (c) {
+                        const single = c.querySelector('.select__single-value');
+                        if (single) {
+                            const txt = t(single.textContent);
+                            if (txt) return { observed: txt, notes: 'combobox_single_value', validation_error };
+                        }
+                        const multi = c.querySelectorAll('.select__multi-value, .select__multi-value__label');
+                        if (multi.length > 0) {
+                            const labels = Array.from(multi).map(n => t(n.textContent)).filter(Boolean);
+                            if (labels.length > 0) return { observed: labels.join(', '), notes: 'combobox_multi_value', validation_error };
+                        }
+                        const ariaSel = c.querySelector('[aria-selected="true"], [data-selected="true"]');
+                        if (ariaSel) return { observed: t(ariaSel.textContent), notes: 'aria_selected_combobox', validation_error };
+                    }
+                    // Pure-pick combobox with no displayed value yet → treat as empty.
+                    return { observed: '', notes: 'combobox_empty', validation_error };
+                }
+
                 if (fieldType === 'select') {
                     if (el.tagName === 'SELECT') {
                         const opt = el.options[el.selectedIndex];
@@ -1035,7 +1066,35 @@ async def _probe_field_state(
                     return { observed: el.checked ? 'true' : 'false', notes: 'lone_radio', validation_error };
                 }
                 if (fieldType === 'file') {
-                    return { observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '', notes: 'file_count', validation_error };
+                    // Greenhouse-style: the resolved locator can be a custom
+                    // <button> ("Attach a file"), not the hidden <input type=file>.
+                    // `el.files` only exists on <input type=file>. Walk up to the
+                    // field container and find ANY hidden file input — that's
+                    // where set_input_files actually attached the file.
+                    if (el.tagName === 'INPUT' && el.type === 'file') {
+                        return {
+                            observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '',
+                            notes: 'file_count_direct',
+                            validation_error,
+                        };
+                    }
+                    const container = el.closest(
+                        '.field-wrapper, .form-field, .field, .application-question, fieldset, label'
+                    ) || el.parentElement;
+                    if (container) {
+                        const fileIn = container.querySelector('input[type="file"]');
+                        if (fileIn && fileIn.files && fileIn.files.length > 0) {
+                            return { observed: `${fileIn.files.length}_files`, notes: 'file_count_walked', validation_error };
+                        }
+                    }
+                    // Last resort: scan the whole document for any populated
+                    // file input (only ONE file input typically gets populated
+                    // per session for a single Resume/CV upload field).
+                    const anyFile = document.querySelector('input[type="file"]');
+                    if (anyFile && anyFile.files && anyFile.files.length > 0) {
+                        return { observed: `${anyFile.files.length}_files`, notes: 'file_count_doc', validation_error };
+                    }
+                    return { observed: '', notes: 'file_count_empty', validation_error };
                 }
                 return { observed: t(el.value), notes: 'value', validation_error };
             }""",
