@@ -221,6 +221,13 @@ class FormFieldFillPlan(BaseModel):
     # observed_value="") and we treat the row as needing correction.
     verified: bool = Field(default=False, description="True when DOM state matches intended value after fill")
     observed_value: str = Field(default="", description="Value read back from the DOM after the fill action")
+    # Form-validation error caught from the DOM after fill — `aria-invalid="true"`
+    # on the input, OR error-message text in a sibling/descendant element
+    # (`.error`, `.field-error`, `[role=alert]`, etc.). When present, the field
+    # is considered drifted regardless of value match — the form rejected the
+    # fill and the corrector needs the error message to fix it ("invalid email
+    # format", "phone must be 10 digits", "field is required").
+    validation_error: str = Field(default="", description="Form-validation error text observed after fill (empty when no error)")
     correction_attempts: int = Field(default=0, description="Number of LLM-driven drift corrections attempted on this field")
 
 

@@ -828,14 +828,16 @@ async def _probe_field_state(
     locator,
 ) -> str:
     """Read the post-fill DOM state of `plan.field` and return the
-    observed value.
+    observed value. Side-effect: writes any form-validation error
+    discovered (aria-invalid / sibling error text) onto
+    `plan.validation_error` so the verifier + corrector can use it
+    without changing the function signature.
 
     The sane/insane verdict is delegated to the LLM batch verifier
-    (`_llm_verify_batch`). This function ONLY reads the state. The
+    (`_llm_verify_batch`). This function ONLY reads state. The
     previous deterministic comparison was prone to false-positives
     (combobox typed without option-pick still has the typed string in
-    `el.value`) and false-negatives (autocomplete rewrites — "san fr"
-    → "San Francisco, CA" looked drifted but was correct).
+    `el.value`) and false-negatives (autocomplete rewrites).
 
     Best-effort — when the probe can't read state (element detached,
     JS error), returns "".
@@ -846,42 +848,74 @@ async def _probe_field_state(
             r"""(el, args) => {
                 const { fieldType } = args;
                 const t = (s) => (s == null ? '' : String(s).trim());
+
+                // ── Form-validation read: aria-invalid + nearest error sibling. ──
+                // ATSes mark validation errors in different ways:
+                //   - aria-invalid="true" on the input (Greenhouse, Workable)
+                //   - <span class="field-error"> sibling (Lever, SmartRecruiters)
+                //   - <div class="error"> in the closest form-row container
+                //   - [role="alert"] descendant
+                // Walk up to the field's container, then look for ANY of these
+                // shapes. Return empty string when no error is visible.
+                let validation_error = '';
+                const ariaInvalid = (el.getAttribute('aria-invalid') || '').toLowerCase();
+                if (ariaInvalid === 'true') validation_error = 'aria-invalid';
+                const container = el.closest(
+                    '.form-field, .field, .form-row, [data-qa-field], .application-question, fieldset, label'
+                ) || el.parentElement;
+                if (container) {
+                    const errSel = container.querySelector(
+                        '.field-error, .form-error, .error-message, [class*="error" i]:not(input):not(select):not(textarea):not(label), [role="alert"]'
+                    );
+                    if (errSel) {
+                        const txt = t(errSel.textContent);
+                        // Filter out generic "error" placeholders that aren't real
+                        // user-facing messages (some forms always render the slot).
+                        if (txt && txt.length > 0 && txt.length < 300) {
+                            validation_error = txt;
+                        }
+                    }
+                }
+
                 if (fieldType === 'select') {
                     if (el.tagName === 'SELECT') {
                         const opt = el.options[el.selectedIndex];
-                        return { observed: t(opt && (opt.label || opt.text || opt.value)), notes: 'native_select' };
+                        return { observed: t(opt && (opt.label || opt.text || opt.value)), notes: 'native_select', validation_error };
                     }
-                    const container = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
-                    if (container) {
-                        const sel = container.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
-                        if (sel) return { observed: t(sel.textContent), notes: 'aria_selected' };
+                    const c = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
+                    if (c) {
+                        const sel = c.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
+                        if (sel) return { observed: t(sel.textContent), notes: 'aria_selected', validation_error };
                     }
-                    return { observed: t(el.value || el.textContent), notes: 'fallback_text' };
+                    return { observed: t(el.value || el.textContent), notes: 'fallback_text', validation_error };
                 }
-                if (fieldType === 'checkbox') return { observed: el.checked ? 'true' : 'false', notes: 'checked' };
+                if (fieldType === 'checkbox') return { observed: el.checked ? 'true' : 'false', notes: 'checked', validation_error };
                 if (fieldType === 'radio') {
                     const name = el.getAttribute('name');
                     if (name) {
                         const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
                         for (const r of group) {
-                            if (r.checked) return { observed: t(r.value || r.id), notes: 'group_checked' };
+                            if (r.checked) return { observed: t(r.value || r.id), notes: 'group_checked', validation_error };
                         }
-                        return { observed: '', notes: 'group_no_check' };
+                        return { observed: '', notes: 'group_no_check', validation_error };
                     }
-                    return { observed: el.checked ? 'true' : 'false', notes: 'lone_radio' };
+                    return { observed: el.checked ? 'true' : 'false', notes: 'lone_radio', validation_error };
                 }
                 if (fieldType === 'file') {
-                    return { observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '', notes: 'file_count' };
+                    return { observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '', notes: 'file_count', validation_error };
                 }
-                return { observed: t(el.value), notes: 'value' };
+                return { observed: t(el.value), notes: 'value', validation_error };
             }""",
             {"fieldType": field_type},
         )
     except Exception as exc:
         logger.debug("_probe_field_state: probe failed for %s — %s", plan.field.label[:30], exc)
+        plan.validation_error = ""
         return ""
 
-    return (result or {}).get("observed", "") or ""
+    payload = result or {}
+    plan.validation_error = (payload.get("validation_error") or "").strip()
+    return (payload.get("observed") or "")
 
 
 # ─── Phase 2: LLM batch sanity check ─────────────────────────────────────────
@@ -892,6 +926,7 @@ _BATCH_VERIFY_SYSTEM = """You are verifying that an auto-filler set the right va
 For each row you receive, decide whether the `observed` value is a SENSIBLE answer to the question described by `label` (and the original `intended` value we tried to set).
 
 Rules:
+- If `validation_error` on a row is non-empty, the form has REJECTED the fill — that's drift regardless of value match. Use the error text to choose `suggested_value` (e.g. error "Phone must be 10 digits" + intended "+90 555 555 5555" → suggested "5555555555").
 - Treat semantic mismatch as drift. Example: label="Are you open to relocation for this role?", intended="Yes", observed="Ankara, Turkey" → drift, because a city name isn't a yes/no answer.
 - Treat autocomplete decoration as match. Example: label="Country", intended="United States", observed="United States — primary" → sane (autocomplete added a hint). Likewise "san fr" → "San Francisco, CA" is sane on a city autocomplete.
 - An empty `observed` while `intended` is non-empty → drift (the form rejected the value or the input was the wrong one).
@@ -949,15 +984,32 @@ async def _llm_verify_batch(
             continue
         intended = (p.value or "").strip()
         observed = (p.observed_value or "").strip()
-        # Deterministic drift trap for comboboxes: when ARIA says the
-        # field is a combobox AND the observed value just echoes the
-        # typed-in intended (no option was clicked from the listbox),
-        # mark drift WITHOUT consulting the LLM. This is the canonical
-        # combobox-typed-without-pick failure — cheap to flag, expensive
-        # to miss. The drift corrector then fires immediately with the
-        # intended value; the LLM picks the matching option from the
-        # rendered listbox.
-        if _is_autocomplete_field(p.field) and intended and (
+
+        # Form-validation error trap: ALWAYS drift, regardless of value
+        # match. The form told us it rejected the fill (aria-invalid /
+        # sibling error message); the corrector needs the error text
+        # to know how to fix it.
+        validation_error = (getattr(p, "validation_error", "") or "").strip()
+        if validation_error:
+            trivial_drift[i] = _FieldVerdict(
+                idx=i, sane=False,
+                reason=f"validation_error:{validation_error[:120]}",
+                suggested_value="",
+            )
+            continue
+
+        # Empty intended is always trivially sane — nothing was supposed
+        # to be set, observed is irrelevant.
+        if not intended:
+            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="empty_intended")
+            continue
+
+        # Deterministic drift trap for comboboxes: ARIA says combobox AND
+        # observed echoes intended (typed but not picked). This is the
+        # canonical combobox-typed-without-pick failure — cheap to flag,
+        # expensive to miss. Drift corrector then fires with the intended
+        # value; LLM picks the option from the rendered listbox.
+        if _is_autocomplete_field(p.field) and (
             _normalise_for_compare(intended) == _normalise_for_compare(observed)
         ):
             trivial_drift[i] = _FieldVerdict(
@@ -966,12 +1018,65 @@ async def _llm_verify_batch(
                 suggested_value=intended,
             )
             continue
-        # Cheap short-circuit: empty intended (optional textarea), or
-        # exact match → sane without LLM (only when NOT a combobox; the
-        # combobox case is handled above).
-        if not intended or _normalise_for_compare(intended) == _normalise_for_compare(observed):
-            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="exact_or_empty")
+
+        # When intended doesn't match observed at all, send to LLM —
+        # could be drift (combobox echo, wrong sibling) or could be
+        # benign (autocomplete decoration like "United States — primary",
+        # form normalisation like phone "+90 555 555 5555" → "+90 555
+        # 555 55 55"). LLM decides.
+        if _normalise_for_compare(intended) != _normalise_for_compare(observed):
+            items.append({
+                "idx": i,
+                "label": p.field.label,
+                "field_type": p.field.field_type,
+                "name": p.field.name or "",
+                "options": list(p.field.options or [])[:8],
+                "aria_autocomplete": getattr(p.field, "aria_autocomplete", "") or "",
+                "role": getattr(p.field, "role", "") or "",
+                "intended": intended,
+                "observed": observed,
+                "validation_error": validation_error,
+            })
             continue
+
+        # Exact match. For VANILLA inputs (no ARIA / role decoration,
+        # plain field_type=text/email/tel/url/number/textarea), trust
+        # the match — short-circuit. For everything else (custom roles,
+        # aria-decorated, indexed names like urls[X], file inputs, radio
+        # groups), force LLM verification because exact-string-match can
+        # still be semantically wrong:
+        #   - urls[LinkedIn] vs urls[GitHub]: both accept the same string
+        #     so we typed "https://linkedin.com/in/x" into either, then
+        #     read back the same string — exact match, but if we hit
+        #     urls[GitHub] the LinkedIn URL is now in the wrong field.
+        #   - hidden file input behind a custom <button>: set_input_files
+        #     reports success on the hidden input but the visible widget
+        #     may show a different state.
+        #   - any field with `role` set: by definition not a vanilla
+        #     control; the framework owns its semantics, deterministic
+        #     match is unreliable.
+        ftype = p.field.field_type
+        is_vanilla_text = ftype in ("text", "email", "tel", "url", "number", "textarea", "date")
+        has_aria_decoration = bool(
+            (getattr(p.field, "role", "") or "").strip()
+            or (getattr(p.field, "aria_autocomplete", "") or "").strip()
+            or (getattr(p.field, "aria_haspopup", "") or "").strip()
+            or (getattr(p.field, "aria_controls", "") or "").strip()
+            or (getattr(p.field, "list_id", "") or "").strip()
+        )
+        # Indexed-name pattern (urls[LinkedIn], candidate[first_name],
+        # etc.) → groups of similar inputs where exact-match alone
+        # doesn't prove we hit the right index.
+        name = (p.field.name or "")
+        is_indexed_group = "[" in name and "]" in name
+
+        if is_vanilla_text and not has_aria_decoration and not is_indexed_group:
+            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="vanilla_exact_match")
+            continue
+
+        # Non-vanilla exact match → still send to LLM. Cheap (one row per
+        # ambiguous field on top of a single batched call) but covers
+        # the wrong-input-but-same-value case.
         items.append({
             "idx": i,
             "label": p.field.label,
@@ -1007,12 +1112,19 @@ async def _llm_verify_batch(
 
 # ─── Drift corrector — Phase 2 (LLM, on-demand, container-scoped) ─────────────
 
-_DRIFT_CORRECTOR_SYSTEM = """You are a Playwright drift corrector for a form field that was filled but whose DOM state diverged from the intended value.
+_DRIFT_CORRECTOR_SYSTEM = """You are a Playwright drift corrector for a form field that was filled but whose DOM state diverged from the intended value, OR whose form-validation rejected the fill.
 
 You will receive:
   - the field's label and type
+  - role + aria_autocomplete (combobox indicators)
   - the value we intended to set
   - the value the DOM is currently showing
+  - validation_error: form-validation message captured from the DOM
+    (aria-invalid="true" OR error-text in a sibling). When non-empty,
+    the form has REJECTED the fill — propose a corrective action that
+    addresses the error (e.g. "Phone must be 10 digits" → reformat the
+    value; "This field is required" → re-attempt the fill; "Invalid
+    email" → check format).
   - the field's CONTAINER HTML (the element wrapping label + control —
     typically a fieldset, [role=group], .form-row, or label). This is
     NOT the whole form. Reason about it as a self-contained widget.
@@ -1078,9 +1190,12 @@ async def _correct_field_drift(
         f"label={field.label!r}\n"
         f"field_type={field.field_type!r}\n"
         f"name_or_id_extracted={field.name!r}\n"
+        f"role={getattr(field, 'role', '')!r}\n"
+        f"aria_autocomplete={getattr(field, 'aria_autocomplete', '')!r}\n"
         f"options={field.options[:8]}\n"
         f"intended_value={plan.value!r}\n"
         f"observed_value={plan.observed_value!r}\n"
+        f"validation_error={getattr(plan, 'validation_error', '')!r}\n"
     )
 
     structured = llm.with_structured_output(_SelectorPlan)
