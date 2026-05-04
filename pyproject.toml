@@ -24,6 +24,14 @@ dependencies = [
 browser = [
     "crawl4ai>=0.8.6",
 ]
+# Browser-use auto-fill backend (POC, gated behind
+# UPPGRAD_AUTO_FILL_BACKEND=browser_use). Lazy-imported in
+# tools/browser_use_filler.py. Heavy: brings its own LLM clients +
+# Playwright. Install with `uv sync --extra browser-use` then
+# `uv run playwright install chromium`.
+browser-use = [
+    "browser-use>=0.7.0",
+]
 
 [tool.uv]
 package = true
