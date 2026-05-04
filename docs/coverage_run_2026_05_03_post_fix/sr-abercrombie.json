@@ -1,0 +1,36 @@
+{
+  "label": "sr-abercrombie",
+  "opp_type": "job",
+  "opp_id": 119388,
+  "expected_ats": "smartrecruiters",
+  "title": "A&F Co. Design Sophomore Summit - Summer 2026",
+  "company_or_provider": "Abercrombie & Fitch Co.",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.smartrecruiters.com/AbercrombieAndFitchCo/744000079705525-a-f-co-design-sophomore-summit-summer-2026/apply",
+  "posting_closed": false,
+  "form_field_count": 0,
+  "form_field_breakdown": {},
+  "requirement_breakdown": {
+    "document": 2
+  },
+  "requirement_labels": [
+    "CV",
+    "Cover Letter"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Columbus, OH' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 164,
+    "Cover Letter": 1316
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (164 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 14.07,
+  "error": ""
+}

@@ -29,6 +29,7 @@ _TRACKER_QUERY_PARAMS = frozenset({
     "gh_src",        # Greenhouse source param
     "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
     "source",        # generic scraper-injected
+    "lever-source",  # Lever's own attribution param ("?lever-source=LinkedIn")
     "ref",
 })
 

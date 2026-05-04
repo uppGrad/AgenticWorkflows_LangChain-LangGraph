@@ -1,0 +1,51 @@
+{
+  "label": "lever-wypoon",
+  "opp_type": "job",
+  "opp_id": 129801,
+  "expected_ats": "lever",
+  "title": "Machine Learning Engineer \u2013 Cloud | MLOps | GenAI (Relocation provided)",
+  "company_or_provider": "Wypoon Technologies",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.eu.lever.co/wypoon/aa414308-a028-4174-a649-af7f1370ea01/apply",
+  "posting_closed": false,
+  "form_field_count": 26,
+  "form_field_breakdown": {
+    "file": 2,
+    "text": 14,
+    "email": 1,
+    "radio": 4,
+    "checkbox": 3,
+    "select": 1,
+    "textarea": 1
+  },
+  "requirement_breakdown": {
+    "document": 2,
+    "text": 4,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume/CV",
+    "Additional Documents to share",
+    "If yes, how many children do you have?",
+    "Your LinkedIn profile",
+    "What would be your salary expectation in euro? (gross income",
+    "What is your notice period?",
+    "Profile / identity fields (20)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Amsterdam, North Holland, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 167,
+    "unknown": 1158
+  },
+  "tailored_answers_count": 4,
+  "evaluation_warnings": [
+    "CV: content is short (167 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 18.79,
+  "error": ""
+}

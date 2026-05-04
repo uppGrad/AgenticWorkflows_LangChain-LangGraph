@@ -191,6 +191,22 @@ def test_workable_no_org_pattern_with_tracker_in_path():
     assert "urlHash" not in out
 
 
+def test_lever_with_lever_source_tracker_stripped():
+    """Lever's own attribution param `lever-source=LinkedIn` is also tracker
+    noise — strip it the same way as `source`/`utm_*`. Real prod URL from
+    coverage_run 2026-05-03 (TSMG Holding Mystery Shopper)."""
+    url = (
+        "https://jobs.lever.co/tsmg/761f1d35-f3f4-4c91-91f0-0eefff6706cc"
+        "/apply?lever-source=LinkedIn&urlHash=axE3"
+    )
+    out = resolve_application_form_url(url)
+    assert out == (
+        "https://jobs.lever.co/tsmg/761f1d35-f3f4-4c91-91f0-0eefff6706cc/apply"
+    )
+    assert "lever-source" not in out
+    assert "urlHash" not in out
+
+
 def test_greenhouse_url_with_gh_src_tracker_dropped():
     """Greenhouse URLs come with `?gh_src=...` from LinkedIn. Same path
     so the form_url is identical to the overview, but trackers should

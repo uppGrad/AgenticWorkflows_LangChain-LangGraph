@@ -1,0 +1,37 @@
+{
+  "label": "schol-goostree",
+  "opp_type": "scholarship",
+  "opp_id": 8361,
+  "expected_ats": "",
+  "title": "Goostree Law Group Bright Futures Scholarship",
+  "company_or_provider": "Goostree Law Group",
+  "discovery_method": "",
+  "discovered_form_url": "",
+  "posting_closed": false,
+  "form_field_count": 0,
+  "form_field_breakdown": {},
+  "requirement_breakdown": {
+    "document": 2
+  },
+  "requirement_labels": [
+    "CV",
+    "Cover Letter"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Scholarship is open to disciplines: Any. Your recorded disciplines (Python, React, Django, TypeScript) may not qualify.",
+    "Scholarship requires one of the following nationalities: Any. Your recorded nationality is ''."
+  ],
+  "tailored_documents": {
+    "CV": 180,
+    "Cover Letter": 1103
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (180 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 6.25,
+  "error": ""
+}

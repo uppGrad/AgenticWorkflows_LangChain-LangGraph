@@ -1,0 +1,41 @@
+{
+  "label": "lever-mendix",
+  "opp_type": "job",
+  "opp_id": 127838,
+  "expected_ats": "lever",
+  "title": "Technical Support Engineer",
+  "company_or_provider": "Mendix",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.lever.co/mendix/5509b41f-0854-451c-b198-a4801adc5d4d/apply",
+  "posting_closed": false,
+  "form_field_count": 14,
+  "form_field_breakdown": {
+    "text": 11,
+    "file": 1,
+    "email": 1,
+    "checkbox": 1
+  },
+  "requirement_breakdown": {
+    "document": 1,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume/CV",
+    "Profile / identity fields (13)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Rotterdam, South Holland, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 165
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (165 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 8.87,
+  "error": ""
+}
