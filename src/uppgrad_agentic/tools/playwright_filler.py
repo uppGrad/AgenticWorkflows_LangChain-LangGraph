@@ -1299,6 +1299,25 @@ async def fill_form_async(
     if headless is None:
         headless = _default_headless()
         logger.info("fill_form_async: headless resolved from env → %s", headless)
+
+    # Auto-resolve the LLM from the agentic provider factory when the
+    # caller didn't supply one. Without this, Tier 4 LLM picker, Phase 2
+    # batch verifier, and drift corrector all stay silent — and the
+    # deterministic Tier 0-3 + state probe is *known* to be insufficient
+    # for combobox-typed-without-pick / urls[X] disambiguation /
+    # form-validation-error correction. The backend's auto_apply_adapter
+    # currently passes `llm=None`; this fallback is what gives every
+    # call site automatic LLM recovery when OPENAI_API_KEY is set.
+    if llm is None:
+        try:
+            from uppgrad_agentic.common.llm import get_llm
+            llm = get_llm()
+            if llm is not None:
+                logger.info("fill_form_async: resolved LLM via common.llm.get_llm()")
+        except Exception as exc:
+            logger.debug("fill_form_async: get_llm() failed (%s) — staying llm=None", exc)
+            llm = None
+
     from playwright.async_api import async_playwright
 
     result = FormFillResult(
