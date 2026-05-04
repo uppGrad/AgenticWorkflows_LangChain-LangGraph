@@ -113,6 +113,25 @@ async def _dismiss_cookie_banners(page) -> None:
             continue
 
 
+# Caps for the post-fill drift correction loop (Tier 5).
+_MAX_CORRECTIONS_PER_FIELD = 2
+_MAX_CORRECTIONS_PER_SESSION = 5
+# Container HTML cap when sending to the LLM corrector. Field containers
+# are typically 300-1500 bytes; 4 KB covers the longest realistic case
+# (radio group with 6+ options + nested labels) without ever passing a
+# whole form's worth of HTML.
+_MAX_CONTAINER_HTML_CHARS = 4_000
+
+
+def _normalise_for_compare(s: Any) -> str:
+    """Lowercase + collapse whitespace for value comparison. Both intended
+    and observed go through this before comparing — the DOM may report
+    the canonical form ("United States") while we wrote "united states"."""
+    if s is None:
+        return ""
+    return " ".join(str(s).strip().lower().split())
+
+
 async def _force_hydrate(page) -> None:
     """Trigger lazy-mount of off-screen form sections by scrolling."""
     try:
@@ -521,6 +540,324 @@ async def _llm_pick_and_act(page, plan: FormFieldFillPlan, llm) -> tuple[FillFie
         return ("llm_exec_error", f"{sp.action}:{str(exc)[:60]}")
 
 
+# ─── Tier 5 — post-fill state verification + drift correction ─────────────────
+#
+# The deterministic tiers (1-3) and the LLM picker (Tier 4) only check
+# "did Playwright's action throw?" — not "is the form's React state
+# coherent with what we intended?". Two real failure modes that mode
+# can't catch:
+#
+#   * Combobox-with-search treated as text input. Tier 1 finds the
+#     visible <input> backing a custom dropdown and runs .fill("USA").
+#     The input's value is "USA", we declare success, but no option is
+#     selected in the React state — submit time treats the field as
+#     empty.
+#
+#   * .fill() that silently no-ops (read-only inputs, validation hooks
+#     that revert, disabled inputs that look enabled).
+#
+# Phase 1 (deterministic state probe) reads the post-fill DOM state
+# per field via a single page.evaluate. Phase 2 (LLM corrector) only
+# runs on observed mismatches and gets ONLY that field's container
+# (not the whole form, not the page) — bounded by `_MAX_CONTAINER_HTML_CHARS`.
+
+_PROBE_JS = r"""
+(args) => {
+  const { selector, fieldType } = args;
+  const el = document.querySelector(selector);
+  if (!el) return { found: false, observed: '', notes: 'no_element' };
+
+  const t = (s) => (s == null ? '' : String(s).trim());
+
+  if (fieldType === 'select') {
+    if (el.tagName === 'SELECT') {
+      const opt = el.options[el.selectedIndex];
+      return {
+        found: true,
+        observed: t(opt && (opt.label || opt.text || opt.value)),
+        notes: 'native_select',
+      };
+    }
+    // Custom widget: walk up to the nearest container that has labelled
+    // selected state, then read either an aria-selected descendant's text
+    // or the trigger's visible value.
+    const container = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
+    if (container) {
+      const sel = container.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
+      if (sel) return { found: true, observed: t(sel.textContent), notes: 'aria_selected' };
+    }
+    return { found: true, observed: t(el.value || el.textContent), notes: 'fallback_text' };
+  }
+
+  if (fieldType === 'checkbox') {
+    return { found: true, observed: el.checked ? 'true' : 'false', notes: 'checked' };
+  }
+
+  if (fieldType === 'radio') {
+    // Walk siblings in the same name-group and return the checked one's value.
+    const name = el.getAttribute('name');
+    if (name) {
+      const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
+      for (const r of group) {
+        if (r.checked) return { found: true, observed: t(r.value || r.id), notes: 'group_checked' };
+      }
+      return { found: true, observed: '', notes: 'group_no_check' };
+    }
+    return { found: true, observed: el.checked ? 'true' : 'false', notes: 'lone_radio' };
+  }
+
+  if (fieldType === 'file') {
+    return {
+      found: true,
+      observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '',
+      notes: 'file_count',
+    };
+  }
+
+  // text-like (text/email/tel/url/number/date/textarea)
+  return { found: true, observed: t(el.value), notes: 'value' };
+}
+"""
+
+
+async def _probe_field_state(
+    page,
+    plan: FormFieldFillPlan,
+    locator,
+) -> tuple[bool, str]:
+    """Read the post-fill state of `plan.field` from the DOM.
+
+    Returns (verified, observed_value). `verified` is True when the
+    observed_value matches plan.value under `_normalise_for_compare`.
+    `observed_value` is whatever the DOM holds (raw, not normalised) so
+    callers can surface it in logs / reports.
+
+    Best-effort — when the probe can't read state (e.g. element is
+    detached, JS errored), returns (False, "") and the caller treats
+    the field as drifted (which routes to the corrector).
+    """
+    intended = plan.value or ""
+    field_type = plan.field.field_type
+    # Build a JS-safe selector pointing at the same element the locator
+    # targets. We use `evaluateHandle` on the locator's element and pass
+    # a simple `(el) => ...` so we don't need a string selector at all.
+    try:
+        result = await locator.evaluate(
+            r"""(el, args) => {
+                const { fieldType } = args;
+                const t = (s) => (s == null ? '' : String(s).trim());
+                if (fieldType === 'select') {
+                    if (el.tagName === 'SELECT') {
+                        const opt = el.options[el.selectedIndex];
+                        return { observed: t(opt && (opt.label || opt.text || opt.value)), notes: 'native_select' };
+                    }
+                    const container = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
+                    if (container) {
+                        const sel = container.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
+                        if (sel) return { observed: t(sel.textContent), notes: 'aria_selected' };
+                    }
+                    return { observed: t(el.value || el.textContent), notes: 'fallback_text' };
+                }
+                if (fieldType === 'checkbox') return { observed: el.checked ? 'true' : 'false', notes: 'checked' };
+                if (fieldType === 'radio') {
+                    const name = el.getAttribute('name');
+                    if (name) {
+                        const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
+                        for (const r of group) {
+                            if (r.checked) return { observed: t(r.value || r.id), notes: 'group_checked' };
+                        }
+                        return { observed: '', notes: 'group_no_check' };
+                    }
+                    return { observed: el.checked ? 'true' : 'false', notes: 'lone_radio' };
+                }
+                if (fieldType === 'file') {
+                    return { observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '', notes: 'file_count' };
+                }
+                return { observed: t(el.value), notes: 'value' };
+            }""",
+            {"fieldType": field_type},
+        )
+    except Exception as exc:
+        logger.debug("_probe_field_state: probe failed for %s — %s", plan.field.label[:30], exc)
+        return (False, "")
+
+    observed = (result or {}).get("observed", "") or ""
+
+    # Comparison rules per field type.
+    if field_type == "checkbox":
+        intended_bool = bool(intended) and str(intended).strip().lower() not in ("false", "no", "0", "")
+        observed_bool = observed.lower() == "true"
+        return (intended_bool == observed_bool, observed)
+
+    if field_type == "file":
+        return (bool(observed), observed)
+
+    # Text / select / radio: normalise both sides and require either
+    # equality OR substring match (intended in observed) to handle
+    # cases like Greenhouse appending "(United States)" → "United States — primary".
+    n_intended = _normalise_for_compare(intended)
+    n_observed = _normalise_for_compare(observed)
+    if not n_intended:
+        # Empty intended (e.g. textarea optional) — don't claim drift.
+        return (True, observed)
+    if not n_observed:
+        # Intended a value but the DOM holds nothing — definitively drifted.
+        # Without this guard, the substring rule below would falsely accept
+        # because "" is a substring of every string in Python (""  in "yes"
+        # is True). Hits the radio-no-check + empty-payload cases.
+        return (False, observed)
+    if n_intended == n_observed:
+        return (True, observed)
+    if n_intended in n_observed or n_observed in n_intended:
+        return (True, observed)
+    return (False, observed)
+
+
+# ─── Drift corrector — Phase 2 (LLM, on-demand, container-scoped) ─────────────
+
+_DRIFT_CORRECTOR_SYSTEM = """You are a Playwright drift corrector for a form field that was filled but whose DOM state diverged from the intended value.
+
+You will receive:
+  - the field's label and type
+  - the value we intended to set
+  - the value the DOM is currently showing
+  - the field's CONTAINER HTML (the element wrapping label + control —
+    typically a fieldset, [role=group], .form-row, or label). This is
+    NOT the whole form. Reason about it as a self-contained widget.
+
+Common drift patterns and the fix shape:
+
+  1. Combobox-with-search where we typed text into the input but no
+     option is selected. Fix: action="click_then_pick_option" with
+     selector targeting the trigger / input, option_text=intended.
+
+  2. Yes/No collected as free text and stuffed into a radio group.
+     Fix: action="click" with selector input[name=GROUP][value=VALUE],
+     where VALUE is the option matching intended.
+
+  3. Hidden native <select> covered by a custom widget. Fix: target the
+     visible custom trigger with action="click_then_pick_option".
+
+  4. Checkbox that needs .check() not .click() (toggle race). Fix:
+     action="check" on the input itself.
+
+Selector rules:
+- MUST resolve to exactly one element on the page.
+- NEVER target submit / apply / send buttons.
+- Prefer #id over [name=...] over text-based locators.
+- If you can't propose a high-confidence fix, return an empty selector.
+
+Return a single SelectorPlan."""
+
+
+async def _container_html_for_field(locator) -> str:
+    """Return the smallest meaningful container around the field (label +
+    control + sibling options). Capped at `_MAX_CONTAINER_HTML_CHARS` so
+    a single drift correction call can never receive a whole form's
+    worth of HTML."""
+    try:
+        html = await locator.evaluate(
+            r"""(el) => {
+                const container = el.closest('[role="group"], fieldset, .form-row, .form-field, label, [data-qa-field], .field-container, .application-question') || el.parentElement;
+                return (container || el).outerHTML || '';
+            }"""
+        )
+    except Exception:
+        return ""
+    return (html or "")[:_MAX_CONTAINER_HTML_CHARS]
+
+
+async def _correct_field_drift(
+    page,
+    plan: FormFieldFillPlan,
+    locator,
+    llm,
+) -> tuple[FillFieldOutcome, str]:
+    """Single iteration of the drift correction loop. The outer loop
+    (`fill_form_async`) handles per-field and per-session caps."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    container_html = await _container_html_for_field(locator)
+    if not container_html:
+        return ("llm_skipped", "no_container_html")
+
+    field = plan.field
+    field_summary = (
+        f"label={field.label!r}\n"
+        f"field_type={field.field_type!r}\n"
+        f"name_or_id_extracted={field.name!r}\n"
+        f"options={field.options[:8]}\n"
+        f"intended_value={plan.value!r}\n"
+        f"observed_value={plan.observed_value!r}\n"
+    )
+
+    structured = llm.with_structured_output(_SelectorPlan)
+    try:
+        sp: _SelectorPlan = structured.invoke([
+            SystemMessage(content=_DRIFT_CORRECTOR_SYSTEM),
+            HumanMessage(content=f"Field state:\n{field_summary}\nContainer HTML:\n{container_html}"),
+        ])
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_call:{type(exc).__name__}:{str(exc)[:60]}")
+
+    if not (sp.selector or "").strip():
+        return ("llm_skipped", "corrector_no_proposal")
+
+    # Reuse the existing Tier-4 validation + execution path. The submit-
+    # button denylist + selector uniqueness check live there — we want
+    # the same guardrails for corrections.
+    try:
+        loc = page.locator(sp.selector)
+        count = await loc.count()
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_locator:{str(exc)[:60]}")
+    if count == 0:
+        return ("no_locator", "corrector_no_match")
+    if count > 1:
+        return ("no_locator", f"corrector_ambiguous:{count}")
+    target = loc.first
+
+    try:
+        text = await target.text_content(timeout=1000) or ""
+        type_attr = await target.get_attribute("type") or ""
+    except Exception:
+        text, type_attr = "", ""
+    if _is_submit_target_text(text, type_attr):
+        return ("llm_refused_submit", f"corrector_submit:text={text[:40]!r}")
+
+    try:
+        await target.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+
+    try:
+        if sp.action == "click":
+            await target.click(timeout=3000)
+        elif sp.action == "fill":
+            await target.fill(str(plan.value), timeout=3000)
+        elif sp.action == "check":
+            await target.check(timeout=3000)
+        elif sp.action == "set_input_files":
+            await target.set_input_files(plan.value, timeout=3000)
+        elif sp.action == "select_option":
+            try:
+                await target.select_option(label=str(plan.value), timeout=2000)
+            except Exception:
+                await target.select_option(value=str(plan.value), timeout=2000)
+        elif sp.action == "click_then_pick_option":
+            ok, detail = await _custom_select_pick(page, target, sp.option_text or str(plan.value))
+            if not ok:
+                return ("llm_exec_error", f"corrector_pick:{detail}")
+        elif sp.action == "click_label_for_input":
+            await target.click(timeout=3000)
+        else:
+            return ("llm_exec_error", f"corrector_unknown_action:{sp.action}")
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_exec:{sp.action}:{str(exc)[:60]}")
+
+    return ("ok_corrected", f"{sp.action}:{sp.selector[:50]}")
+
+
 # ─── Public entrypoint ───────────────────────────────────────────────────────
 
 async def fill_form_async(
@@ -572,6 +909,8 @@ async def fill_form_async(
 
                 result.captcha_detected = await _detect_captcha(page)
 
+                drift_calls = 0  # Tier 5 LLM correction calls this session
+
                 for entry in plan:
                     label = entry.field.label[:50]
                     ftype = entry.field.field_type
@@ -584,38 +923,116 @@ async def fill_form_async(
                         continue
 
                     outcome, detail = await _fill_deterministic(page, entry)
-                    if outcome == "ok":
-                        result.fields_filled_native += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype, outcome="ok", detail=detail,
-                        ))
-                        continue
+                    fill_source = "native"  # vs "llm" if Tier 4 stepped in
 
-                    # Failure on Tier 1-3. Try Tier 4 if LLM available + within budget.
-                    if llm is not None and llm_calls < llm_picker_budget:
-                        llm_calls += 1
-                        llm_outcome, llm_detail = await _llm_pick_and_act(page, entry, llm)
-                        if llm_outcome == "ok_llm":
-                            result.fields_filled_llm += 1
+                    # Failure on Tier 1-3 → fall through to Tier 4. If
+                    # Tier 4 fills successfully, we still verify post-fill
+                    # state below — same drift checks apply.
+                    if outcome != "ok":
+                        if llm is not None and llm_calls < llm_picker_budget:
+                            llm_calls += 1
+                            llm_outcome, llm_detail = await _llm_pick_and_act(page, entry, llm)
+                            if llm_outcome == "ok_llm":
+                                outcome, detail = "ok_llm", llm_detail
+                                fill_source = "llm"
+                            else:
+                                # Tier 4 didn't recover — record failure and skip verification.
+                                result.fields_failed += 1
+                                result.reports.append(FormFieldFillReport(
+                                    label=label, field_type=ftype,
+                                    outcome=llm_outcome,
+                                    detail=f"{detail} → {llm_detail}",
+                                ))
+                                continue
+                        else:
+                            result.fields_failed += 1
                             result.reports.append(FormFieldFillReport(
-                                label=label, field_type=ftype,
-                                outcome="ok_llm", detail=llm_detail,
+                                label=label, field_type=ftype, outcome=outcome, detail=detail,
                             ))
                             continue
-                        result.fields_failed += 1
+
+                    # ─── Tier 5: post-fill state probe + drift correction ──
+                    locator, _method = await _locate(page, entry.field)
+                    verified = False
+                    observed = ""
+                    if locator is not None:
+                        # Brief settle — custom dropdowns often update their
+                        # displayed value 100-300 ms after the click.
+                        try:
+                            await page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        verified, observed = await _probe_field_state(page, entry, locator)
+                        entry.verified = verified
+                        entry.observed_value = observed
+
+                    # Tally based on fill source so the existing counters
+                    # remain meaningful regardless of verification state.
+                    if fill_source == "native":
+                        result.fields_filled_native += 1
+                    else:
+                        result.fields_filled_llm += 1
+
+                    if verified or locator is None:
+                        # locator is None means we couldn't even find the
+                        # element to probe — leave verified=False but
+                        # don't try to correct (we have nothing to act on).
+                        if verified:
+                            result.fields_verified += 1
                         result.reports.append(FormFieldFillReport(
                             label=label, field_type=ftype,
-                            outcome=llm_outcome,
-                            detail=f"{detail} → {llm_detail}",
+                            outcome="ok" if fill_source == "native" else "ok_llm",
+                            detail=detail,
                         ))
                         continue
 
-                    result.fields_failed += 1
-                    result.reports.append(FormFieldFillReport(
-                        label=label, field_type=ftype, outcome=outcome, detail=detail,
-                    ))
+                    # Drift detected. Try LLM correction, bounded.
+                    correction_outcome = "drift_unresolved"
+                    correction_detail = f"observed={observed!r}"
+                    if llm is not None:
+                        for attempt in range(_MAX_CORRECTIONS_PER_FIELD):
+                            if drift_calls >= _MAX_CORRECTIONS_PER_SESSION:
+                                correction_detail = f"{correction_detail} → session_budget_exhausted"
+                                break
+                            drift_calls += 1
+                            entry.correction_attempts += 1
+                            corr_outcome, corr_detail = await _correct_field_drift(
+                                page, entry, locator, llm,
+                            )
+                            if corr_outcome != "ok_corrected":
+                                correction_detail = f"{correction_detail} → corr#{attempt+1}:{corr_outcome}:{corr_detail}"
+                                continue
+                            # Re-probe after the corrective action.
+                            try:
+                                await page.wait_for_timeout(300)
+                            except Exception:
+                                pass
+                            verified, observed = await _probe_field_state(page, entry, locator)
+                            entry.verified = verified
+                            entry.observed_value = observed
+                            if verified:
+                                correction_outcome = "ok_corrected"
+                                correction_detail = f"{detail} → {corr_detail} (verified after {attempt+1} correction)"
+                                break
+                            correction_detail = f"{correction_detail} → corr#{attempt+1} acted but still drifted (observed={observed!r})"
+
+                    if correction_outcome == "ok_corrected":
+                        result.fields_drift_corrected += 1
+                        result.fields_verified += 1
+                        result.reports.append(FormFieldFillReport(
+                            label=label, field_type=ftype,
+                            outcome="ok_corrected", detail=correction_detail,
+                        ))
+                    else:
+                        result.fields_drift_unresolved += 1
+                        result.reports.append(FormFieldFillReport(
+                            label=label, field_type=ftype,
+                            outcome="drift_unresolved",
+                            detail=f"{detail} → drift {correction_detail}",
+                        ))
 
                 result.llm_picker_calls = llm_calls
+                result.drift_correction_calls = drift_calls
                 result.success = (
                     result.fields_filled_native + result.fields_filled_llm > 0
                     and not result.submit_clicked
