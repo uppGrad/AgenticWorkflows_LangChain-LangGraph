@@ -38,6 +38,7 @@ LLM dependency at import time.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -50,6 +51,25 @@ from uppgrad_agentic.workflows.auto_apply.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Env var that lets a demo / debug session see the browser fill the form
+# instead of running headless. Falsy values: "0", "false", "no", "off"
+# (case-insensitive). Anything else, including unset, → headless. Read on
+# every call (not at import) so a server can flip the flag mid-process for
+# a one-off demo without restarting.
+_HEADLESS_ENV_VAR = "UPPGRAD_AUTO_FILL_HEADLESS"
+
+
+def _default_headless() -> bool:
+    """Resolve the default value of `headless` for `fill_form_async` from
+    the `UPPGRAD_AUTO_FILL_HEADLESS` env var. Returns True (headless) by
+    default — production should never run headed unless someone deliberately
+    sets the env var."""
+    raw = os.environ.get(_HEADLESS_ENV_VAR, "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 # Phrases on a target's text content that disqualify it as a fill target —
@@ -528,7 +548,7 @@ async def fill_form_async(
     plan: List[FormFieldFillPlan],
     *,
     llm: Any = None,
-    headless: bool = True,
+    headless: Optional[bool] = None,
     llm_picker_budget: int = 10,
     nav_timeout_ms: int = 30_000,
     dry_run: bool = True,
@@ -539,7 +559,12 @@ async def fill_form_async(
         form_url: URL of the application form to fill.
         plan: Fill plan from `compute_form_values`.
         llm: Optional langchain BaseChatModel for Tier 4. None disables Tier 4.
-        headless: Run Chromium headless. Set False for visual debugging.
+        headless: Run Chromium headless. ``None`` (default) reads the
+            ``UPPGRAD_AUTO_FILL_HEADLESS`` env var — falsy values
+            (``0|false|no|off``, case-insensitive) launch a visible
+            browser, suitable for demo recordings or visual debugging.
+            Anything else / unset → headless. Tests / scripts that pass
+            ``True`` or ``False`` explicitly bypass the env var.
         llm_picker_budget: Max Tier 4 calls per session.
         nav_timeout_ms: Page load timeout.
         dry_run: Currently informational; never clicks submit regardless.
@@ -547,6 +572,9 @@ async def fill_form_async(
     Never clicks submit/apply buttons. Closing the browser at the end is the
     only "side effect" — the form's filled state is discarded.
     """
+    if headless is None:
+        headless = _default_headless()
+        logger.info("fill_form_async: headless resolved from env → %s", headless)
     from playwright.async_api import async_playwright
 
     result = FormFillResult(
