@@ -47,6 +47,16 @@ You will receive the raw HTML of a single <form> element. Identify EVERY input o
     * "computed" — fields the system can derive without the user (today's date).
     * "unknown" — when none of the above clearly apply.
 
+ARIA / combobox-detection signals — capture these EXACTLY as they appear on the markup, empty string when absent. They are critical for the auto-fill stage to recognise comboboxes that look like text inputs but back a dropdown:
+- role: the explicit `role` attribute on the input or its closest `[role]` ancestor (commonly "combobox", "listbox"). Empty if none.
+- aria_haspopup: `aria-haspopup` attribute value.
+- aria_controls: `aria-controls` attribute value (target listbox id).
+- aria_owns: `aria-owns` attribute value.
+- aria_autocomplete: `aria-autocomplete` attribute value ("list", "both", "inline", "none").
+- list_id: `list` attribute value (datalist id) for `<input list="...">`.
+
+Capture these per-field even when field_type is "text" — a text input that ALSO has role="combobox" or aria-autocomplete="list" is the exact case the auto-filler needs to know about (Lever country picker, Greenhouse location autocomplete, etc.).
+
 Return one entry per visible field, in document order. Do NOT invent fields that are not in the markup.
 """
 

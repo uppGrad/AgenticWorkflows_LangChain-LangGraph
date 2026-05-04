@@ -83,6 +83,28 @@ class FormField(BaseModel):
             "non-file fields."
         ),
     )
+    # ─── ARIA / combobox-detection signals (Phase 1) ────────────────────────
+    # Captured at extraction time so the filler can recognise comboboxes
+    # and autocomplete-typed fields BEFORE running its tier strategy. Without
+    # these, a `<input type="text" role="combobox" aria-autocomplete="list">`
+    # backing a Lever country picker looks identical to a free-text input —
+    # Tier 1's `.fill()` succeeds, the form's React state never registers
+    # an option, submit treats the field as empty.
+    #
+    # The discriminator predicate (matching browser-use's _is_autocomplete_field):
+    #   role == "combobox"
+    #   OR aria_autocomplete in ("list", "both", "inline")
+    #   OR list_id (i.e. <input list="datalist-id">)
+    #   OR (aria_haspopup not in ("", "false") AND (aria_controls OR aria_owns))
+    role: str = Field(
+        default="",
+        description="Computed CSS role or aria-role attribute. 'combobox' is the canonical signal.",
+    )
+    aria_haspopup: str = Field(default="", description="aria-haspopup attribute value")
+    aria_controls: str = Field(default="", description="aria-controls attribute value")
+    aria_owns: str = Field(default="", description="aria-owns attribute value")
+    aria_autocomplete: str = Field(default="", description="aria-autocomplete attribute value (list/both/inline)")
+    list_id: str = Field(default="", description="`list` attribute (datalist target)")
 
 
 class FormSchema(BaseModel):

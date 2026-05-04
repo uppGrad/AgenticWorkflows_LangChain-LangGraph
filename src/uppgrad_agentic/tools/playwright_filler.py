@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -252,6 +252,143 @@ async def _locate_file_input(page, field) -> tuple[Any, str]:
     return None, "none"
 
 
+# ─── Phase 1: combobox detection + native-setter dispatch ───────────────────
+
+
+def _is_autocomplete_field(field) -> bool:
+    """Predicate: should this field be treated as a combobox/autocomplete
+    that needs click+pick instead of plain text-fill?
+
+    Mirrors `browser-use`'s `_is_autocomplete_field` rule (the discriminator
+    none of our previous tiers had access to). Without this, every
+    `<input type="text" role="combobox" aria-autocomplete="list">` looks
+    identical to a plain text input and Tier 1's `.fill()` silently
+    succeeds while the React state never registers an option pick.
+
+    Triggers when ANY of:
+      - role == "combobox"
+      - aria_autocomplete in ("list", "both", "inline")
+      - list_id (datalist target) is present
+      - aria_haspopup is set (and not "false") AND the popup is wired
+        to a controlled element (aria_controls or aria_owns)
+    """
+    role = (getattr(field, "role", "") or "").strip().lower()
+    if role == "combobox":
+        return True
+    aria_ac = (getattr(field, "aria_autocomplete", "") or "").strip().lower()
+    if aria_ac in ("list", "both", "inline"):
+        return True
+    if (getattr(field, "list_id", "") or "").strip():
+        return True
+    haspopup = (getattr(field, "aria_haspopup", "") or "").strip().lower()
+    if haspopup and haspopup != "false":
+        if (getattr(field, "aria_controls", "") or "").strip() or (
+            getattr(field, "aria_owns", "") or ""
+        ).strip():
+            return True
+    return False
+
+
+async def _native_setter_dispatch(locator, value: str) -> bool:
+    """Set an input's value via the native React/Vue setter, then dispatch
+    the input/change events the framework listens for.
+
+    Some controlled inputs (React's onChange-bound `<input>`) silently
+    discard `.fill()` writes because Playwright's keyboard simulation
+    doesn't propagate to the framework's value setter. browser-use uses
+    this exact trick (`Object.getOwnPropertyDescriptor(...).set.call(el)`)
+    as its reliability backstop.
+
+    Returns True when the value successfully landed (post-write `el.value`
+    matches), False otherwise."""
+    try:
+        ok = await locator.evaluate(
+            r"""(el, v) => {
+                const proto = el.tagName === 'TEXTAREA'
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (!desc || !desc.set) return false;
+                desc.set.call(el, v);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return el.value === v;
+            }""",
+            value,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+async def _combobox_pick(page, locator, option_text: str) -> tuple[bool, str]:
+    """Type into the combobox trigger and click the matching dropdown
+    option. Mirrors browser-use's combobox interaction:
+
+      1. Focus + clear the input.
+      2. Type the option text character-by-character (some autocomplete
+         widgets only react to keypress events, not bulk fill).
+      3. Wait briefly for the listbox/options to populate.
+      4. Click the visible option whose text matches.
+
+    Falls back to Enter-after-type when no clickable option appears
+    (datalist-style autocomplete commits on Enter)."""
+    try:
+        await locator.click(timeout=2000)
+    except Exception:
+        pass
+    try:
+        await locator.fill("", timeout=1500)
+    except Exception:
+        pass
+    try:
+        await locator.press_sequentially(str(option_text), delay=20, timeout=4000)
+    except Exception as exc:
+        return (False, f"type_failed:{str(exc)[:60]}")
+
+    # Wait briefly for the listbox to populate. Different ATSes use
+    # different markup — Lever uses [role="listbox"], Greenhouse uses
+    # `.select__menu`, Workable uses `.styles_menu__*`. Cast a wide net.
+    listbox_selectors = (
+        '[role="listbox"] [role="option"]',
+        '[role="option"]',
+        '.select__option',
+        'ul[role="listbox"] li',
+        'li[role="option"]',
+    )
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=1500, state="visible")
+            break
+        except Exception:
+            continue
+
+    # Find the option whose visible text matches the value.
+    needle = str(option_text).strip().lower()
+    for sel in listbox_selectors:
+        try:
+            opts = page.locator(sel)
+            count = await opts.count()
+            for i in range(min(count, 30)):
+                opt = opts.nth(i)
+                text = (await opt.text_content(timeout=500) or "").strip().lower()
+                if not text:
+                    continue
+                if text == needle or needle in text or text in needle:
+                    await opt.click(timeout=2000)
+                    return (True, f"picked_option:{sel}")
+        except Exception:
+            continue
+
+    # Enter-commit fallback for datalist / inline autocomplete.
+    try:
+        await locator.press("Enter", timeout=1500)
+        return (True, "enter_commit")
+    except Exception:
+        pass
+    return (False, "no_option_matched")
+
+
 async def _locate(page, field) -> tuple[Any, str]:
     """Tier 1 + 2. Returns (locator, method) or (None, "none")."""
     name = (field.name or "").strip()
@@ -333,7 +470,7 @@ async def _custom_select_pick(page, locator, option_text: str) -> tuple[bool, st
 
 
 async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldOutcome, str]:
-    """Tiers 1-3."""
+    """Tiers 0-3."""
     field = plan.field
     value = plan.value
     field_type = field.field_type
@@ -347,6 +484,21 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
         await locator.scroll_into_view_if_needed(timeout=2000)
     except Exception:
         pass
+
+    # ─── Tier 0: combobox / autocomplete predicate ────────────────────────
+    # Runs BEFORE the type-specific tiers below. When ARIA signals say
+    # "this is a combobox," skip the text-fill path entirely and go
+    # straight to type-then-pick. This is the discriminator we were
+    # missing — fixes the Lever country picker / Greenhouse location
+    # autocomplete cases without any LLM call.
+    if _is_autocomplete_field(field) and field_type in (
+        "text", "select", "url", "email", "tel"
+    ):
+        ok, detail = await _combobox_pick(page, locator, str(value))
+        if ok:
+            return ("ok", f"combobox_pick:{detail}")
+        # Fall through to standard tiers; combobox_pick may have left a
+        # value in the input even if the option click missed.
 
     if field_type == "file":
         try:
@@ -435,10 +587,16 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
             await locator.click(timeout=2000)
             await locator.press_sequentially(str(value), delay=20, timeout=5000)
             return ("ok", f"press_sequentially:{str(value)[:40]}")
-        except Exception as exc:
-            # Surface the original .fill() failure — that's the more
-            # informative error when triaging.
-            return ("fill_error", str(fill_exc)[:90])
+        except Exception:
+            pass
+        # Step 4: native-setter fallback — last-resort for React/Vue
+        # controlled inputs that swallow Playwright's fill/type entirely.
+        # `Object.getOwnPropertyDescriptor(...).set.call(el, v)` writes
+        # directly to the DOM property and dispatches input/change so the
+        # framework's onChange listener fires.
+        if await _native_setter_dispatch(locator, str(value)):
+            return ("ok", f"native_setter:{str(value)[:40]}")
+        return ("fill_error", str(fill_exc)[:90])
 
 
 # ─── Tier 4 — LLM picker ──────────────────────────────────────────────────────
@@ -644,23 +802,21 @@ async def _probe_field_state(
     page,
     plan: FormFieldFillPlan,
     locator,
-) -> tuple[bool, str]:
-    """Read the post-fill state of `plan.field` from the DOM.
+) -> str:
+    """Read the post-fill DOM state of `plan.field` and return the
+    observed value.
 
-    Returns (verified, observed_value). `verified` is True when the
-    observed_value matches plan.value under `_normalise_for_compare`.
-    `observed_value` is whatever the DOM holds (raw, not normalised) so
-    callers can surface it in logs / reports.
+    The sane/insane verdict is delegated to the LLM batch verifier
+    (`_llm_verify_batch`). This function ONLY reads the state. The
+    previous deterministic comparison was prone to false-positives
+    (combobox typed without option-pick still has the typed string in
+    `el.value`) and false-negatives (autocomplete rewrites — "san fr"
+    → "San Francisco, CA" looked drifted but was correct).
 
-    Best-effort — when the probe can't read state (e.g. element is
-    detached, JS errored), returns (False, "") and the caller treats
-    the field as drifted (which routes to the corrector).
+    Best-effort — when the probe can't read state (element detached,
+    JS error), returns "".
     """
-    intended = plan.value or ""
     field_type = plan.field.field_type
-    # Build a JS-safe selector pointing at the same element the locator
-    # targets. We use `evaluateHandle` on the locator's element and pass
-    # a simple `(el) => ...` so we don't need a string selector at all.
     try:
         result = await locator.evaluate(
             r"""(el, args) => {
@@ -699,38 +855,109 @@ async def _probe_field_state(
         )
     except Exception as exc:
         logger.debug("_probe_field_state: probe failed for %s — %s", plan.field.label[:30], exc)
-        return (False, "")
+        return ""
 
-    observed = (result or {}).get("observed", "") or ""
+    return (result or {}).get("observed", "") or ""
 
-    # Comparison rules per field type.
-    if field_type == "checkbox":
-        intended_bool = bool(intended) and str(intended).strip().lower() not in ("false", "no", "0", "")
-        observed_bool = observed.lower() == "true"
-        return (intended_bool == observed_bool, observed)
 
-    if field_type == "file":
-        return (bool(observed), observed)
+# ─── Phase 2: LLM batch sanity check ─────────────────────────────────────────
 
-    # Text / select / radio: normalise both sides and require either
-    # equality OR substring match (intended in observed) to handle
-    # cases like Greenhouse appending "(United States)" → "United States — primary".
-    n_intended = _normalise_for_compare(intended)
-    n_observed = _normalise_for_compare(observed)
-    if not n_intended:
-        # Empty intended (e.g. textarea optional) — don't claim drift.
-        return (True, observed)
-    if not n_observed:
-        # Intended a value but the DOM holds nothing — definitively drifted.
-        # Without this guard, the substring rule below would falsely accept
-        # because "" is a substring of every string in Python (""  in "yes"
-        # is True). Hits the radio-no-check + empty-payload cases.
-        return (False, observed)
-    if n_intended == n_observed:
-        return (True, observed)
-    if n_intended in n_observed or n_observed in n_intended:
-        return (True, observed)
-    return (False, observed)
+
+_BATCH_VERIFY_SYSTEM = """You are verifying that an auto-filler set the right value in each field of a job application form.
+
+For each row you receive, decide whether the `observed` value is a SENSIBLE answer to the question described by `label` (and the original `intended` value we tried to set).
+
+Rules:
+- Treat semantic mismatch as drift. Example: label="Are you open to relocation for this role?", intended="Yes", observed="Ankara, Turkey" → drift, because a city name isn't a yes/no answer.
+- Treat autocomplete decoration as match. Example: label="Country", intended="United States", observed="United States — primary" → sane (autocomplete added a hint). Likewise "san fr" → "San Francisco, CA" is sane on a city autocomplete.
+- An empty `observed` while `intended` is non-empty → drift (the form rejected the value or the input was the wrong one).
+- A combobox where the user typed text but didn't select an option (observed equals intended exactly but the field needed a pick from a list) → drift. Hint: such fields will have field_type="select" or aria_autocomplete on the metadata.
+- File uploads: observed of "1_files" or "2_files" → sane. Empty → drift.
+- For yes/no labels, accept "Yes"/"No" or any synonym (e.g. "True"/"False", "Authorized"/"Not authorized") that matches intent.
+
+When drift is detected, suggest the value the form likely expects in `suggested_value` (when obvious from context). Otherwise leave it empty.
+
+Return one verdict per row, in the same order as the input."""
+
+
+class _FieldVerdict(BaseModel):
+    """One row of `_BatchVerifyResult`. Indexed by `idx` so the caller
+    can match each verdict back to its FormFieldFillPlan."""
+    idx: int = Field(..., description="Index into the input list (matches the row sent)")
+    sane: bool = Field(..., description="True when observed is a sensible answer for label")
+    reason: str = Field(default="", description="Short explanation, ≤200 chars")
+    suggested_value: str = Field(
+        default="",
+        description="When sane=False AND a better value is obvious from the label, suggest it. Empty otherwise.",
+    )
+
+
+class _BatchVerifyResult(BaseModel):
+    verdicts: List[_FieldVerdict] = Field(default_factory=list)
+
+
+async def _llm_verify_batch(
+    plan: List[FormFieldFillPlan],
+    llm,
+) -> Dict[int, _FieldVerdict]:
+    """Single LLM call to sanity-check every filled field's observed
+    value against its label + intended value.
+
+    Returns a dict mapping plan-index → verdict. Fields whose status
+    isn't 'filled' or whose observed_value matches intended trivially
+    are short-circuited and not sent to the LLM (still returned with
+    sane=True).
+
+    Bounded cost: 1 LLM call per session regardless of field count.
+    Returns `{}` (no verdicts) when llm is None — caller treats every
+    field as sane in that case (preserves the no-LLM heuristic path).
+    """
+    if llm is None:
+        return {}
+
+    from langchain_core.messages import HumanMessage, SystemMessage  # lazy
+
+    items: List[Dict[str, Any]] = []
+    trivial_sane: Dict[int, _FieldVerdict] = {}
+    for i, p in enumerate(plan):
+        if p.status != "filled":
+            continue
+        intended = (p.value or "").strip()
+        observed = (p.observed_value or "").strip()
+        # Cheap short-circuit: empty intended (optional textarea), or
+        # exact match → sane without LLM.
+        if not intended or _normalise_for_compare(intended) == _normalise_for_compare(observed):
+            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="exact_or_empty")
+            continue
+        items.append({
+            "idx": i,
+            "label": p.field.label,
+            "field_type": p.field.field_type,
+            "name": p.field.name or "",
+            "options": list(p.field.options or [])[:8],
+            "aria_autocomplete": getattr(p.field, "aria_autocomplete", "") or "",
+            "role": getattr(p.field, "role", "") or "",
+            "intended": intended,
+            "observed": observed,
+        })
+
+    if not items:
+        return trivial_sane
+
+    structured = llm.with_structured_output(_BatchVerifyResult)
+    try:
+        result: _BatchVerifyResult = structured.invoke([
+            SystemMessage(content=_BATCH_VERIFY_SYSTEM),
+            HumanMessage(content=f"Verify these filled fields. Return one verdict per row.\n\n{items}"),
+        ])
+    except Exception as exc:
+        logger.warning("_llm_verify_batch: LLM call failed — treating all as sane (%s)", exc)
+        return trivial_sane
+
+    out = dict(trivial_sane)
+    for v in result.verdicts:
+        out[v.idx] = v
+    return out
 
 
 # ─── Drift corrector — Phase 2 (LLM, on-demand, container-scoped) ─────────────
@@ -937,25 +1164,30 @@ async def fill_form_async(
 
                 result.captcha_detected = await _detect_captcha(page)
 
-                drift_calls = 0  # Tier 5 LLM correction calls this session
+                drift_calls = 0  # LLM correction calls this session
 
-                for entry in plan:
+                # ─── Pass 1: fill every field (Tiers 0-4) + read observed
+                # state. The LLM batch verifier (Pass 2) decides sane/insane.
+                # `pending_reports[i]` holds the in-progress report for
+                # plan[i]; we mutate it post-verification.
+                pending_reports: List[Optional[FormFieldFillReport]] = [None] * len(plan)
+                fill_sources: List[str] = ["none"] * len(plan)
+                outcomes: List[str] = ["pending"] * len(plan)
+
+                for i, entry in enumerate(plan):
                     label = entry.field.label[:50]
                     ftype = entry.field.field_type
                     if entry.status != "filled":
-                        result.reports.append(FormFieldFillReport(
+                        pending_reports[i] = FormFieldFillReport(
                             label=label, field_type=ftype,
                             outcome="plan_skip", detail=entry.reason,
-                        ))
-                        result.fields_skipped += 1
+                        )
+                        outcomes[i] = "plan_skip"
                         continue
 
                     outcome, detail = await _fill_deterministic(page, entry)
-                    fill_source = "native"  # vs "llm" if Tier 4 stepped in
+                    fill_source = "native"
 
-                    # Failure on Tier 1-3 → fall through to Tier 4. If
-                    # Tier 4 fills successfully, we still verify post-fill
-                    # state below — same drift checks apply.
                     if outcome != "ok":
                         if llm is not None and llm_calls < llm_picker_budget:
                             llm_calls += 1
@@ -964,100 +1196,137 @@ async def fill_form_async(
                                 outcome, detail = "ok_llm", llm_detail
                                 fill_source = "llm"
                             else:
-                                # Tier 4 didn't recover — record failure and skip verification.
-                                result.fields_failed += 1
-                                result.reports.append(FormFieldFillReport(
+                                pending_reports[i] = FormFieldFillReport(
                                     label=label, field_type=ftype,
                                     outcome=llm_outcome,
                                     detail=f"{detail} → {llm_detail}",
-                                ))
+                                )
+                                outcomes[i] = "fail"
                                 continue
                         else:
-                            result.fields_failed += 1
-                            result.reports.append(FormFieldFillReport(
+                            pending_reports[i] = FormFieldFillReport(
                                 label=label, field_type=ftype, outcome=outcome, detail=detail,
-                            ))
+                            )
+                            outcomes[i] = "fail"
                             continue
 
-                    # ─── Tier 5: post-fill state probe + drift correction ──
+                    # Read post-fill state. The verdict comes later from
+                    # the LLM batch verifier.
                     locator, _method = await _locate(page, entry.field)
-                    verified = False
-                    observed = ""
                     if locator is not None:
-                        # Brief settle — custom dropdowns often update their
-                        # displayed value 100-300 ms after the click.
                         try:
                             await page.wait_for_timeout(300)
                         except Exception:
                             pass
-                        verified, observed = await _probe_field_state(page, entry, locator)
-                        entry.verified = verified
-                        entry.observed_value = observed
+                        entry.observed_value = await _probe_field_state(page, entry, locator)
 
-                    # Tally based on fill source so the existing counters
-                    # remain meaningful regardless of verification state.
-                    if fill_source == "native":
+                    fill_sources[i] = fill_source
+                    outcomes[i] = "filled_pending_verify"
+                    pending_reports[i] = FormFieldFillReport(
+                        label=label, field_type=ftype,
+                        outcome="ok" if fill_source == "native" else "ok_llm",
+                        detail=detail,
+                    )
+
+                # ─── Pass 2: ONE batch LLM verification across all filled
+                # fields. Catches semantic mismatches the deterministic
+                # compare can't (e.g. "Are you open to relocation?" →
+                # "Ankara, Turkey") + autocomplete-rewrite false positives
+                # (e.g. "san fr" → "San Francisco, CA") in the same call.
+                verdicts = await _llm_verify_batch(plan, llm)
+
+                # ─── Pass 3: per-insane-field drift correction. Bounded.
+                for i, entry in enumerate(plan):
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdict = verdicts.get(i)
+                    is_sane = verdict.sane if verdict is not None else True
+                    entry.verified = is_sane
+                    if fill_sources[i] == "native":
                         result.fields_filled_native += 1
                     else:
                         result.fields_filled_llm += 1
-
-                    if verified or locator is None:
-                        # locator is None means we couldn't even find the
-                        # element to probe — leave verified=False but
-                        # don't try to correct (we have nothing to act on).
-                        if verified:
-                            result.fields_verified += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype,
-                            outcome="ok" if fill_source == "native" else "ok_llm",
-                            detail=detail,
-                        ))
+                    if is_sane:
+                        result.fields_verified += 1
                         continue
 
-                    # Drift detected. Try LLM correction, bounded.
-                    correction_outcome = "drift_unresolved"
-                    correction_detail = f"observed={observed!r}"
-                    if llm is not None:
-                        for attempt in range(_MAX_CORRECTIONS_PER_FIELD):
-                            if drift_calls >= _MAX_CORRECTIONS_PER_SESSION:
-                                correction_detail = f"{correction_detail} → session_budget_exhausted"
-                                break
-                            drift_calls += 1
-                            entry.correction_attempts += 1
-                            corr_outcome, corr_detail = await _correct_field_drift(
-                                page, entry, locator, llm,
+                    # Insane → drift correction, bounded by session budget.
+                    locator, _method = await _locate(page, entry.field)
+                    if locator is None or llm is None:
+                        result.fields_drift_unresolved += 1
+                        rep = pending_reports[i]
+                        if rep is not None:
+                            rep.outcome = "drift_unresolved"
+                            rep.detail = (
+                                f"{rep.detail} → drift "
+                                f"observed={entry.observed_value!r} "
+                                f"reason={(verdict.reason if verdict else 'no_locator_or_llm')!r}"
                             )
-                            if corr_outcome != "ok_corrected":
-                                correction_detail = f"{correction_detail} → corr#{attempt+1}:{corr_outcome}:{corr_detail}"
-                                continue
-                            # Re-probe after the corrective action.
-                            try:
-                                await page.wait_for_timeout(300)
-                            except Exception:
-                                pass
-                            verified, observed = await _probe_field_state(page, entry, locator)
-                            entry.verified = verified
-                            entry.observed_value = observed
-                            if verified:
-                                correction_outcome = "ok_corrected"
-                                correction_detail = f"{detail} → {corr_detail} (verified after {attempt+1} correction)"
-                                break
-                            correction_detail = f"{correction_detail} → corr#{attempt+1} acted but still drifted (observed={observed!r})"
+                        continue
 
-                    if correction_outcome == "ok_corrected":
+                    correction_succeeded = False
+                    correction_detail = (
+                        f"observed={entry.observed_value!r} "
+                        f"reason={(verdict.reason if verdict else '')!r}"
+                    )
+                    # Use suggested_value as a hint on retry when the LLM
+                    # offered one — overrides the planner's intended value
+                    # for the correction attempt only.
+                    if verdict and verdict.suggested_value:
+                        entry.value = verdict.suggested_value
+
+                    for attempt in range(_MAX_CORRECTIONS_PER_FIELD):
+                        if drift_calls >= _MAX_CORRECTIONS_PER_SESSION:
+                            correction_detail = f"{correction_detail} → session_budget_exhausted"
+                            break
+                        drift_calls += 1
+                        entry.correction_attempts += 1
+                        corr_outcome, corr_detail = await _correct_field_drift(
+                            page, entry, locator, llm,
+                        )
+                        if corr_outcome != "ok_corrected":
+                            correction_detail = f"{correction_detail} → corr#{attempt+1}:{corr_outcome}:{corr_detail}"
+                            continue
+                        try:
+                            await page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        entry.observed_value = await _probe_field_state(page, entry, locator)
+                        # Re-verify ONLY this field with a fresh LLM call —
+                        # cheap (single-row batch).
+                        single = await _llm_verify_batch([entry], llm)
+                        if single.get(0) and single[0].sane:
+                            correction_succeeded = True
+                            correction_detail = f"{corr_detail} (verified after {attempt+1} correction)"
+                            break
+                        correction_detail = f"{correction_detail} → corr#{attempt+1} acted but still insane"
+
+                    rep = pending_reports[i]
+                    if rep is None:
+                        continue
+                    if correction_succeeded:
                         result.fields_drift_corrected += 1
                         result.fields_verified += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype,
-                            outcome="ok_corrected", detail=correction_detail,
-                        ))
+                        rep.outcome = "ok_corrected"
+                        rep.detail = correction_detail
                     else:
                         result.fields_drift_unresolved += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype,
-                            outcome="drift_unresolved",
-                            detail=f"{detail} → drift {correction_detail}",
-                        ))
+                        rep.outcome = "drift_unresolved"
+                        rep.detail = f"{rep.detail} → drift {correction_detail}"
+
+                # Flush reports + counters.
+                for rep in pending_reports:
+                    if rep is None:
+                        continue
+                    result.reports.append(rep)
+                    if rep.outcome == "plan_skip":
+                        result.fields_skipped += 1
+                    elif rep.outcome in (
+                        "fill_error", "select_error", "checkbox_error",
+                        "radio_error", "file_error", "no_locator",
+                        "llm_skipped", "llm_refused_submit", "llm_exec_error",
+                    ):
+                        result.fields_failed += 1
 
                 result.llm_picker_calls = llm_calls
                 result.drift_correction_calls = drift_calls
