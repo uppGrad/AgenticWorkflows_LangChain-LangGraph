@@ -387,32 +387,45 @@ async def _combobox_pick(page, locator, option_text: str) -> tuple[bool, str]:
     """
 
     # ─── Step 1: find the right trigger element ──────────────────────
-    # On react-select, the click receiver is .select__control. The input
-    # is buried inside .select__input-container; clicking it sometimes
-    # bubbles through but unreliably. Prefer the explicit trigger.
-    trigger = locator
+    # On react-select, the click receiver is .select__control. Live
+    # smoke test (scripts/probe_anthropic_combobox.py) confirmed that
+    # JS `el.click()` does NOT open the menu — react-select listens
+    # on `mousedown`, not the synthesized click event JS-DOM .click()
+    # fires. Use Playwright's actual locator.click() (which dispatches
+    # the full mousedown→mouseup→click chain) AND an explicit mousedown
+    # dispatch as belt-and-suspenders.
+    trigger_clicked_via = "unknown"
     try:
-        control_handle = await locator.evaluate_handle(
-            r"""(el) => el.closest('.select__control, [role="combobox"]')"""
+        # Resolve `.select__control` ancestor as a Playwright Locator
+        # so we get the real event chain (not the synthesized JS click).
+        control_locator = locator.locator(
+            'xpath=ancestor::div[contains(@class,"select__control")][1]'
         )
-        # Convert handle to a locator we can act on. Playwright doesn't
-        # have a clean ElementHandle→Locator, so we use a JS-side ref
-        # via evaluating a click on the resolved element.
-        has_control = bool(await control_handle.evaluate(
-            "el => el && el.classList && el.classList.contains('select__control')"
-        ))
-        if has_control:
-            # Click via JS so we don't lose the ancestor reference.
-            await control_handle.evaluate("el => el.click()")
-            trigger_clicked_via = "js_select_control"
+        if await control_locator.count() > 0:
+            try:
+                await control_locator.first.click(timeout=2500)
+                trigger_clicked_via = "playwright_click_select_control"
+            except Exception:
+                # Some react-selects ignore even Playwright's click;
+                # dispatch mousedown explicitly. This is what react-select's
+                # event handlers actually listen for.
+                await control_locator.first.evaluate(
+                    r"""(el) => {
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, button: 0}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, button: 0}));
+                        el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, button: 0}));
+                    }"""
+                )
+                trigger_clicked_via = "dispatched_mousedown_select_control"
         else:
+            # No .select__control ancestor — click the input directly.
             await locator.click(timeout=2000)
-            trigger_clicked_via = "locator_click"
-    except Exception:
+            trigger_clicked_via = "locator_click_no_control"
+    except Exception as exc:
         try:
             await locator.click(timeout=2000)
             trigger_clicked_via = "locator_click_fallback"
-        except Exception as exc:
+        except Exception:
             return (False, f"click_failed:{str(exc)[:60]}")
 
     # ─── Step 2: wait for listbox/options to render ──────────────────
