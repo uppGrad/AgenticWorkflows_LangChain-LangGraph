@@ -23,6 +23,9 @@ from uppgrad_agentic.workflows.document_feedback.nodes.analyze_narrative import 
 from uppgrad_agentic.workflows.document_feedback.nodes.synthesize_feedback import synthesize_feedback
 from uppgrad_agentic.workflows.document_feedback.nodes.evaluate_output import evaluate_output
 from uppgrad_agentic.workflows.document_feedback.nodes.human_gate import human_gate
+from uppgrad_agentic.workflows.document_feedback.nodes.auto_accept_proposals import (
+    auto_accept_proposals,
+)
 from uppgrad_agentic.workflows.document_feedback.nodes.finalize import finalize
 
 
@@ -212,4 +215,95 @@ def build_graph(checkpointer=None):
     # Use the provided checkpointer, or fall back to MemorySaver for
     # standalone/CLI usage. Production callers (e.g., Django) should pass
     # a PostgresSaver for durable interrupt/resume across requests.
+    return g.compile(checkpointer=checkpointer or MemorySaver())
+
+
+# ---------------------------------------------------------------------------
+# Auto-tailoring variant — used by auto_apply.application_tailoring as a
+# sub-pipeline. Same nodes as build_graph() except:
+#
+#   1. Phase 0 (load_document, detect_doc_type) is skipped. Caller pre-
+#      populates state with `raw_text`, `doc_meta`, and `doc_classification`
+#      because the source text is already extracted (uploaded by the user
+#      at gate-1) and the doc_type is known from the requirement_item.
+#
+#   2. Phase 5 (human_gate interrupt) is replaced by auto_accept_proposals.
+#      Auto-apply has no per-proposal review UI; the user already
+#      consented to "tailor this for me" at gate-1.
+#
+# `finalize` and every analysis / synthesis / evaluation node is shared
+# verbatim with the standard graph — that's the whole point: identical
+# guardrails (grounding validation, AI-tell budget, retry loop) without
+# the human-review interrupt.
+# ---------------------------------------------------------------------------
+
+
+def build_auto_tailoring_graph(checkpointer=None):
+    g = StateGraph(DocFeedbackState)
+
+    # Phase 0 is skipped — caller pre-populates raw_text + doc_classification.
+
+    # Phase 1 — context assembly
+    g.add_node("fetch_profile_snapshot", fetch_profile_snapshot)
+    g.add_node("extract_doc_sections", extract_doc_sections)
+    g.add_node("parse_user_instructions", parse_user_instructions)
+    g.add_node("get_opportunity_context", get_opportunity_context)
+    g.add_node("build_context_pack", build_context_pack)
+
+    # Phase 2 — parallel analysis (same nodes as standard graph)
+    g.add_node("analyze_structure", analyze_structure)
+    g.add_node("analyze_style", analyze_style)
+    g.add_node("analyze_content_gaps", analyze_content_gaps)
+    g.add_node("analyze_ats", analyze_ats)
+    g.add_node("analyze_opportunity_alignment", analyze_opportunity_alignment)
+    g.add_node("analyze_rhetoric", analyze_rhetoric)
+    g.add_node("analyze_narrative", analyze_narrative)
+
+    # Phase 3 — synthesis
+    g.add_node("synthesize_feedback", synthesize_feedback)
+
+    # Phase 4 — evaluator with retry loop (identical to standard graph)
+    g.add_node("evaluate_output", evaluate_output)
+
+    # Phase 5 — auto-accept (replaces human_gate)
+    g.add_node("auto_accept_proposals", auto_accept_proposals)
+
+    # Phase 6 — finalize
+    g.add_node("finalize", finalize)
+
+    # Error sink
+    g.add_node("end_with_error", end_with_error)
+
+    # ------------------- Edges -------------------
+    g.add_edge(START, "fetch_profile_snapshot")
+    g.add_edge("fetch_profile_snapshot", "extract_doc_sections")
+    g.add_edge("extract_doc_sections", "parse_user_instructions")
+    g.add_edge("parse_user_instructions", "get_opportunity_context")
+    g.add_edge("get_opportunity_context", "build_context_pack")
+
+    g.add_conditional_edges("build_context_pack", _dispatch_analysis, _ANALYSIS_NODES)
+    for node in _ANALYSIS_NODES:
+        g.add_edge(node, "synthesize_feedback")
+
+    g.add_edge("synthesize_feedback", "evaluate_output")
+
+    g.add_conditional_edges(
+        "evaluate_output",
+        # Reuse the standard router but redirect "human_gate" → "auto_accept".
+        lambda state: {
+            "human_gate": "auto_accept_proposals",
+            "synthesize_feedback": "synthesize_feedback",
+            "end_with_error": "end_with_error",
+        }[_route_after_evaluate(state)],
+        {
+            "synthesize_feedback": "synthesize_feedback",
+            "auto_accept_proposals": "auto_accept_proposals",
+            "end_with_error": "end_with_error",
+        },
+    )
+
+    g.add_edge("auto_accept_proposals", "finalize")
+    g.add_edge("finalize", END)
+    g.add_edge("end_with_error", END)
+
     return g.compile(checkpointer=checkpointer or MemorySaver())
