@@ -377,8 +377,33 @@ def _build_match_pattern(before: str) -> Optional[re.Pattern]:
 #                        explicit "reorder" action, so the synth may encode
 #                        an A+B → B+A swap as a 1-break rewrite)
 #   * action="delete"  — two adjacent paragraphs cut together
-_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+#
+# Counting paragraph breaks: pypdf "word-per-line" wrap puts \n \n between
+# every word in a wrapped paragraph, which used to trigger this guard for
+# every legitimate proposal (one user run rejected 11/12 proposals on
+# "before_text_spans_too_many_paragraphs"). We now split on \n\s*\n and
+# count only the chunks that are substantial enough to be real paragraphs
+# (≥ 30 chars) — single-word "chunks" produced by wrap collapse no longer
+# count as paragraph breaks. The doc loader normalises this for raw_text
+# upstream; this is defense in depth against the synth copying before_text
+# from a pre-normalised view of the document, or future PDF-extraction
+# quirks that bypass the normaliser.
+_NEWLINE_BLOCK = re.compile(r"\n\s*\n")
+_MIN_PARAGRAPH_CHARS = 30
 _MAX_PARAGRAPH_BREAKS_IN_BEFORE_TEXT = 1
+
+
+def _count_paragraph_breaks(before: str) -> int:
+    """Number of real paragraph breaks in `before`.
+
+    Splits on any blank-line-like separator and counts only chunks that are
+    substantial (≥ _MIN_PARAGRAPH_CHARS). Single-word chunks from pypdf
+    word-per-line wrap collapse to zero, real paragraph spans count as
+    expected.
+    """
+    chunks = _NEWLINE_BLOCK.split(before)
+    real_chunks = [c for c in chunks if len(c.strip()) >= _MIN_PARAGRAPH_CHARS]
+    return max(0, len(real_chunks) - 1)
 
 
 def _apply_proposals_to_text(
@@ -411,7 +436,7 @@ def _apply_proposals_to_text(
         if not before or before.startswith("["):
             unapplied.append({"proposal": p, "reason": "no_anchor"})
             continue
-        if len(_PARAGRAPH_BREAK.findall(before)) > _MAX_PARAGRAPH_BREAKS_IN_BEFORE_TEXT:
+        if _count_paragraph_breaks(before) > _MAX_PARAGRAPH_BREAKS_IN_BEFORE_TEXT:
             unapplied.append(
                 {"proposal": p, "reason": "before_text_spans_too_many_paragraphs"}
             )

@@ -36,22 +36,101 @@ def _strip_page_footer(page_text: str) -> str:
     return _PAGE_NUMBER_FOOTER.sub("", page_text)
 
 
-# pypdf and python-docx both emit a single "\n" between paragraphs in narrative
-# documents (LaTeX article PDFs typeset paragraphs with first-line indent and
-# no blank line, which pypdf renders as just \n). Every paragraph-aware
-# analyzer downstream — analyze_rhetoric, analyze_narrative, finalize's
-# kitchen-sink guard — splits on r"\n\s*\n" and therefore sees the whole body
-# as a single paragraph when blank lines are missing. The synth then emits one
-# whole-body rewrite because it was told there is only one paragraph to fix.
-# This heuristic restores the blank-line separator: when a line ends with
-# terminal punctuation and the next line begins with a capital letter, that
-# single \n is treated as a paragraph boundary.
-_PARAGRAPH_BOUNDARY_HEURISTIC = re.compile(r"([.!?])\n(?=[A-Z])")
+# pypdf can produce two pathological extractions on narrative documents that
+# both manifest downstream as broken paragraph boundaries:
+#
+#   (a) "Single-newline paragraph boundary" — LaTeX article PDFs typeset
+#       paragraphs with first-line indent and no blank line. pypdf renders
+#       this as a lone "\n" between paragraphs. Every paragraph-aware
+#       analyzer downstream splits on r"\n\s*\n", so the whole body looks
+#       like ONE paragraph and the synth emits one whole-body rewrite.
+#
+#   (b) "Word-per-line wrap" — Google Docs / Word "Sloppy SoP" exports break
+#       wrapped paragraphs into a sequence of single words separated by
+#       "\n \n" (newline + space-only line + newline). The synth's regex
+#       matcher uses \s+ so before_text still matches, but the finalize LLM
+#       sees each word on its own input line and (intermittently) renders
+#       them as separate LaTeX paragraphs — every word ends up as its own
+#       block in the rendered PDF.
+#
+# normalize_pdf_text() handles both: it (1) marks true paragraph boundaries
+# wherever a sentence-ender is followed by whitespace + a capital letter,
+# (2) collapses any newline run that contains intermediate horizontal
+# whitespace ("\n \n", "\n  \n") into a single space — that's the "blank
+# line with just spaces" pattern that signals pypdf wrap, never a real
+# paragraph break — and (3) restores the marked paragraph boundaries.
+# Plain single \n (e.g. between CV bullets) is left alone so bullet
+# separation survives.
+_PARA_MARKER = "\x00PARA\x00"
+_TRUE_PARAGRAPH_BOUNDARY = re.compile(r"([.!?])[ \t]*\n[ \t\n]*(?=[A-Z])")
+_WORD_WRAP_BLANK_LINE = re.compile(r"\n[ \t]+\n[ \t\n]*")
+
+
+def _collapse_mid_sentence_wrap(text: str) -> str:
+    """Collapse lone "\\n" inside a paragraph into a single space.
+
+    Conservative on purpose. We collapse when ALL of:
+      - the line preceding the "\\n" is long (≥ 40 chars) — short lines are
+        usually CV section headers ("Education", "Skills") or single bullets
+        whose line break is structural.
+      - the segment ends with a word character, comma, or semicolon — never
+        a sentence terminator (those are already paragraph breaks).
+      - the next non-whitespace character is lowercase or an opening
+        bracket — capital letters might start a new section, so we leave
+        them alone.
+
+    CV impact: bullets and headers are typically short (< 40 chars), so a
+    "\\n" preceding them is preserved. Wrapped sentence continuations in
+    SOP/CL prose are typically embedded in long lines, so they collapse.
+    """
+    out: List[str] = []
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        out.append(line)
+        if i == len(lines) - 1:
+            continue
+        # Don't touch existing paragraph markers — they look like blank lines.
+        if not line.strip() or not lines[i + 1].strip():
+            out.append("\n")
+            continue
+        if len(line) < 40:
+            out.append("\n")
+            continue
+        # Only collapse when the line ends with word/comma/semicolon and the
+        # next line begins with a lowercase letter or opening bracket.
+        if not re.search(r"[\w,;:)\]'\"]\s*$", line):
+            out.append("\n")
+            continue
+        if not re.match(r"\s*[a-z(\[]", lines[i + 1]):
+            out.append("\n")
+            continue
+        out.append(" ")
+    return "".join(out)
 
 
 def normalize_paragraph_breaks(text: str) -> str:
-    """Convert single-newline paragraph boundaries into blank-line separators."""
-    return _PARAGRAPH_BOUNDARY_HEURISTIC.sub(r"\1\n\n", text)
+    """Normalize PDF/DOCX-extracted text into clean paragraphs.
+
+    Robust to two pypdf failure modes (single-newline-only paragraph breaks
+    and word-per-line wrap with "\\n \\n" between every word). See module
+    block comment above for the full failure-mode map.
+    """
+    # Step 1: protect true paragraph boundaries (sentence-ender + newline +
+    # capital letter). Consume the surrounding whitespace so we don't end up
+    # with stray spaces around the marker.
+    text = _TRUE_PARAGRAPH_BOUNDARY.sub(r"\1" + _PARA_MARKER, text)
+    # Step 2: collapse word-per-line wrap. Any newline run that contains a
+    # space-only intermediate line is the pypdf wrap signature; replace with
+    # a single space so the words rejoin into one paragraph.
+    text = _WORD_WRAP_BLANK_LINE.sub(" ", text)
+    # Step 3: collapse mid-sentence soft wraps inside long prose lines.
+    # CV bullets and section headers are short and survive untouched.
+    text = _collapse_mid_sentence_wrap(text)
+    # Step 4: restore true paragraph boundaries.
+    text = text.replace(_PARA_MARKER, "\n\n")
+    # Step 5: collapse runs of horizontal whitespace inserted by earlier steps.
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
 
 
 def extract_text_from_file(path: str) -> ExtractResult:

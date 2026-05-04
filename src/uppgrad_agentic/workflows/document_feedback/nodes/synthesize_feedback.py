@@ -237,7 +237,19 @@ E. **Opportunity-alignment proposals** — for every missing company \
    weak — the alignment finding is a different angle.
 
 F. **Structure proposals** — for any `structure.ordering_issues` or \
-   `structure.layout_issues`, emit a corresponding proposal.
+   `structure.layout_issues`, emit a corresponding proposal. \
+   **before_text** must be the verbatim quote of the paragraph the \
+   structural change applies to, and **after_text** must be the LITERAL \
+   replacement prose the candidate would put in their document — never \
+   meta-advice describing what to do. If the finding has no clear span \
+   to attach to (e.g. "add a new opening section that doesn't yet exist"), \
+   set before_text to "" so the proposal is treated as a structural hint \
+   rather than a deterministic substitution. Never produce after_text \
+   like "Open the SOP with a sentence that names X" or "Begin by mentioning \
+   Y" or "This will make the document read as Z" — those are instructions, \
+   not prose. The deterministic applier substitutes after_text verbatim \
+   into the document, so meta-instructions land in the rendered PDF as \
+   if they were content.
 
 ═══════════════════════ DIVERSITY GUARD (HARD RULE) ═══════════════════════
 
@@ -683,32 +695,94 @@ def _before_text_is_grounded(before_text: str, full_doc_text: str) -> bool:
     return best_ratio >= _MIN_MATCH_RATIO
 
 
+# Meta-instruction detector. The synth occasionally emits structure or
+# style proposals whose `after_text` is advice ("Open the SOP with a
+# sentence that names X", "This will make the document read as Y") rather
+# than literal replacement prose. Because the deterministic applier
+# substitutes after_text verbatim, these end up in the rendered PDF as if
+# they were content — one user run had the entire opening replaced with
+# "Open the SOP with a sentence that names Dream Games and the Software
+# Engineer role in the first line, then move into the Bilkent University
+# and project evidence."
+#
+# Detection patterns target the most common shapes:
+#   - meta-talk about the doc itself ("the SOP", "the cover letter", ...)
+#   - imperative openers describing what to write ("Open ... with", "Begin
+#     with", "Add a sentence that")
+#   - explanatory tails ("This will make the document ...")
+#
+# A match is enough — the cost of dropping a real-prose proposal that
+# happens to mention "the SOP" once is much smaller than the cost of
+# leaking advice text into the rendered PDF.
+_META_INSTRUCTION_PATTERNS: List[re.Pattern] = [
+    re.compile(
+        r"\bthe\s+(SOP|cover\s+letter|document|resume|CV|statement|essay|letter|paragraph)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(open|begin|start|add|include|use|ensure|make\s+sure|replace|move|put|place|tell|consider|rewrite)\s+(the|with|by|a|your)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bthis\s+will\s+(make|help|allow|enable|result)\b", re.IGNORECASE),
+    re.compile(
+        r"\bnames?\s+\w+\s+and\s+the\s+\w+\s+role\b", re.IGNORECASE
+    ),
+    re.compile(r"\b(rewrite|rephrase|reword)\s+(this|the|that)\b", re.IGNORECASE),
+]
+
+
+def _looks_like_meta_instruction(after_text: str) -> bool:
+    if not after_text or len(after_text) < 20:
+        return False
+    return any(p.search(after_text) for p in _META_INSTRUCTION_PATTERNS)
+
+
 def _validate_proposals(
     proposals: List[dict],
     doc_sections: dict,
 ) -> List[dict]:
-    """Filter out proposals with hallucinated before_text."""
+    """Filter out proposals with hallucinated before_text or meta-instruction after_text."""
     full_text = " ".join(doc_sections.values())
     validated = []
-    dropped = 0
+    dropped_ungrounded = 0
+    dropped_meta = 0
 
     for p in proposals:
         before = p.get("before_text", "")
-        if _before_text_is_grounded(before, full_text):
-            validated.append(p)
-        else:
-            dropped += 1
+        after = p.get("after_text", "") or ""
+        action = (p.get("action") or "rewrite").lower()
+
+        if not _before_text_is_grounded(before, full_text):
+            dropped_ungrounded += 1
             logger.warning(
                 "Dropped hallucinated proposal (before_text not found in document): "
                 "section=%s, before_text=%.80s…",
                 p.get("section", "?"),
                 before,
             )
+            continue
 
+        # Skip meta-instruction check for delete proposals (after_text is
+        # empty by spec) and for proposals with an empty before_text (those
+        # already flow as hints to the LLM, not as deterministic substitutions).
+        if action != "delete" and (before or "").strip() and _looks_like_meta_instruction(after):
+            dropped_meta += 1
+            logger.warning(
+                "Dropped meta-instruction proposal (after_text reads as advice, "
+                "not prose): section=%s, after_text=%.120s…",
+                p.get("section", "?"),
+                after,
+            )
+            continue
+
+        validated.append(p)
+
+    dropped = dropped_ungrounded + dropped_meta
     if dropped:
         logger.info(
-            "Validation: kept %d / %d proposals (%d dropped as ungrounded)",
-            len(validated), len(proposals), dropped,
+            "Validation: kept %d / %d proposals "
+            "(%d dropped as ungrounded, %d dropped as meta-instruction)",
+            len(validated), len(proposals), dropped_ungrounded, dropped_meta,
         )
 
     return validated
