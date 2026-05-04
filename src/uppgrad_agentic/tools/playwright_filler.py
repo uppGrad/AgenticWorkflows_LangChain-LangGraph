@@ -336,67 +336,200 @@ async def _native_setter_dispatch(locator, value: str) -> bool:
 
 
 async def _combobox_pick(page, locator, option_text: str) -> tuple[bool, str]:
-    """Type into the combobox trigger and click the matching dropdown
-    option. Mirrors browser-use's combobox interaction:
+    """Open a react-select-style combobox and click the matching option.
 
-      1. Focus + clear the input.
-      2. Type the option text character-by-character (some autocomplete
-         widgets only react to keypress events, not bulk fill).
-      3. Wait briefly for the listbox/options to populate.
-      4. Click the visible option whose text matches.
+    Reference DOM (Anthropic Greenhouse — covers most react-select usage):
 
-    Falls back to Enter-after-type when no clickable option appears
-    (datalist-style autocomplete commits on Enter)."""
+        <div class="select__container">
+          <label for="question_X" class="select__label">…</label>
+          <div class="select-shell">
+            <div class="select__control">
+              <div class="select__value-container">
+                <div class="select__placeholder">Select…</div>
+                <div class="select__input-container">
+                  <input id="question_X" role="combobox"
+                         aria-autocomplete="list"
+                         aria-haspopup="true"
+                         aria-expanded="false">
+                </div>
+              </div>
+              <div class="select__indicators">
+                <button aria-label="Toggle flyout">▾</button>
+              </div>
+            </div>
+            <!-- listbox appears HERE after click: -->
+            <div class="select__menu">
+              <div class="select__menu-list" role="listbox">
+                <div class="select__option" role="option">Yes</div>
+                <div class="select__option" role="option">No</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+    Click handler is on `.select__control` (the parent), not the `<input>`.
+    Options ONLY render after that click — typing into the input doesn't
+    reliably open the menu for short pure-pick selects (only filters
+    when typed-into in autocomplete mode).
+
+    Strategy:
+      1. Resolve the trigger element — `.select__control` ancestor of
+         the input when present, else the input/locator itself.
+      2. Click trigger + verify `aria-expanded="true"` (with fallback
+         to clicking the toggle button if click on control didn't open).
+      3. Wait for `[role=option]` / `.select__option` to be visible.
+      4. Click the option whose visible text matches. Case-insensitive
+         exact match preferred; substring fallback (matches "Yes, I am
+         authorized" against intended "Yes").
+      5. If listbox didn't open after click (some react-selects DO
+         require typing to open), fall back to: type → wait → click.
+      6. Final fallback: Enter-commit (datalist / inline autocomplete).
+    """
+
+    # ─── Step 1: find the right trigger element ──────────────────────
+    # On react-select, the click receiver is .select__control. The input
+    # is buried inside .select__input-container; clicking it sometimes
+    # bubbles through but unreliably. Prefer the explicit trigger.
+    trigger = locator
     try:
-        await locator.click(timeout=2000)
+        control_handle = await locator.evaluate_handle(
+            r"""(el) => el.closest('.select__control, [role="combobox"]')"""
+        )
+        # Convert handle to a locator we can act on. Playwright doesn't
+        # have a clean ElementHandle→Locator, so we use a JS-side ref
+        # via evaluating a click on the resolved element.
+        has_control = bool(await control_handle.evaluate(
+            "el => el && el.classList && el.classList.contains('select__control')"
+        ))
+        if has_control:
+            # Click via JS so we don't lose the ancestor reference.
+            await control_handle.evaluate("el => el.click()")
+            trigger_clicked_via = "js_select_control"
+        else:
+            await locator.click(timeout=2000)
+            trigger_clicked_via = "locator_click"
     except Exception:
-        pass
-    try:
-        await locator.fill("", timeout=1500)
-    except Exception:
-        pass
-    try:
-        await locator.press_sequentially(str(option_text), delay=20, timeout=4000)
-    except Exception as exc:
-        return (False, f"type_failed:{str(exc)[:60]}")
+        try:
+            await locator.click(timeout=2000)
+            trigger_clicked_via = "locator_click_fallback"
+        except Exception as exc:
+            return (False, f"click_failed:{str(exc)[:60]}")
 
-    # Wait briefly for the listbox to populate. Different ATSes use
-    # different markup — Lever uses [role="listbox"], Greenhouse uses
-    # `.select__menu`, Workable uses `.styles_menu__*`. Cast a wide net.
+    # ─── Step 2: wait for listbox/options to render ──────────────────
+    # react-select's menu animation is ~200-400ms. Wider wait + multi-
+    # selector probe so we don't miss vendor-specific class names.
     listbox_selectors = (
-        '[role="listbox"] [role="option"]',
-        '[role="option"]',
-        '.select__option',
-        'ul[role="listbox"] li',
-        'li[role="option"]',
+        '.select__option',                         # Greenhouse / Anthropic
+        '[role="listbox"] [role="option"]',        # Lever / generic ARIA
+        '[role="option"]',                         # bare role
+        '.select__menu [role="option"]',           # explicit react-select scope
+        '.styles_menu__option__*',                 # Workable
+        'ul[role="listbox"] li',                   # SmartRecruiters
+        'li[role="option"]',                       # Ashby
     )
+    listbox_open = False
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=2500, state="visible")
+            listbox_open = True
+            break
+        except Exception:
+            continue
+
+    # If the click didn't open the menu, try the toggle-flyout button
+    # (the chevron `<button aria-label="Toggle flyout">` next to the
+    # input on Anthropic / Greenhouse). Some react-selects only listen
+    # to the chevron click event.
+    if not listbox_open:
+        try:
+            toggle = locator.locator(
+                'xpath=ancestor::*[contains(@class,"select__control") '
+                'or contains(@class,"select-shell")][1]'
+                '//button[@aria-label="Toggle flyout" or '
+                '@aria-label="Open menu" or contains(@class,"select__indicator")]'
+            ).first
+            if await toggle.count() > 0:
+                await toggle.click(timeout=2000)
+                for sel in listbox_selectors:
+                    try:
+                        await page.wait_for_selector(sel, timeout=2000, state="visible")
+                        listbox_open = True
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # ─── Step 3: click the option whose text matches ─────────────────
+    needle = str(option_text).strip().lower()
+    if listbox_open:
+        for sel in listbox_selectors:
+            try:
+                opts = page.locator(sel)
+                count = await opts.count()
+                # Two passes: exact match first, then substring. Avoids
+                # picking "Yes, with sponsorship" when intended is "No".
+                exact_matches = []
+                substring_matches = []
+                for i in range(min(count, 30)):
+                    opt = opts.nth(i)
+                    text = (await opt.text_content(timeout=500) or "").strip().lower()
+                    if not text:
+                        continue
+                    if text == needle:
+                        exact_matches.append(opt)
+                    elif needle in text or text in needle:
+                        substring_matches.append(opt)
+                if exact_matches:
+                    await exact_matches[0].click(timeout=2000)
+                    return (True, f"exact_match:{sel}:{trigger_clicked_via}")
+                if substring_matches:
+                    await substring_matches[0].click(timeout=2000)
+                    return (True, f"substring_match:{sel}:{trigger_clicked_via}")
+            except Exception:
+                continue
+
+    # ─── Step 4: type-to-filter fallback ─────────────────────────────
+    # Some autocompletes (city pickers) only show options after typing.
+    # Keep this as a fallback; typing into already-open Greenhouse
+    # selects also works for option lists with > 5 items.
+    try:
+        await locator.click(timeout=1500)
+    except Exception:
+        pass
+    try:
+        await locator.fill("", timeout=1000)
+    except Exception:
+        pass
+    try:
+        await locator.press_sequentially(str(option_text), delay=20, timeout=3000)
+    except Exception:
+        pass
+    # Re-wait + re-click after typing.
     for sel in listbox_selectors:
         try:
             await page.wait_for_selector(sel, timeout=1500, state="visible")
             break
         except Exception:
             continue
-
-    # Find the option whose visible text matches the value.
-    needle = str(option_text).strip().lower()
     for sel in listbox_selectors:
         try:
             opts = page.locator(sel)
             count = await opts.count()
-            for i in range(min(count, 30)):
+            for i in range(min(count, 20)):
                 opt = opts.nth(i)
                 text = (await opt.text_content(timeout=500) or "").strip().lower()
                 if not text:
                     continue
                 if text == needle or needle in text or text in needle:
                     await opt.click(timeout=2000)
-                    return (True, f"picked_option:{sel}")
+                    return (True, f"picked_after_type:{sel}")
         except Exception:
             continue
 
-    # Enter-commit fallback for datalist / inline autocomplete.
+    # ─── Step 5: Enter-commit fallback ───────────────────────────────
     try:
-        await locator.press("Enter", timeout=1500)
+        await locator.press("Enter", timeout=1000)
         return (True, "enter_commit")
     except Exception:
         pass
