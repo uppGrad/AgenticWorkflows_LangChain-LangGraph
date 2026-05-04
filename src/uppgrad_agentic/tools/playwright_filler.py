@@ -1012,28 +1012,51 @@ async def _probe_field_state(
 
                 // ── Combobox-shaped text input (Anthropic / Greenhouse react-select) ──
                 // The input's `value` attribute is the SEARCH input's text — empty
-                // after a successful pick. The picked value lives in a sibling
+                // after a successful pick. The picked value lives in a SIBLING
                 // `.select__single-value` (single-select) or `.select__multi-value`
-                // (multi-select). MUST check this branch BEFORE the plain
-                // text branch, because `field_type` is "text" for these fields.
+                // (multi-select), at the .select__value-container or .select__control
+                // level — NOT inside the input itself.
+                //
+                // Crucially: `el.closest()` matches the input ITSELF when we
+                // include `[role="combobox"]` in the selector, because react-select
+                // sets that on the input. We must walk to the WRAPPER (not match
+                // on role=combobox) so the displayed value's sibling is in scope.
                 const isComboboxShape = (
                     el.getAttribute('role') === 'combobox' ||
                     ((el.getAttribute('aria-autocomplete') || '').toLowerCase() !== '' &&
                      (el.getAttribute('aria-autocomplete') || '').toLowerCase() !== 'none')
                 );
                 if (isComboboxShape) {
-                    const c = el.closest('.select__container, .select-shell, [role="combobox"]') || el.parentElement;
+                    // Walk to the react-select wrapper. Try in order:
+                    //   1. .select__container — the outermost react-select wrapper
+                    //   2. .select-shell — Greenhouse-specific intermediate
+                    //   3. .select__control — the inner clickable container
+                    //   4. fieldset / .field-wrapper — backup for non-vendor markup
+                    // NEVER match on role=combobox (would return the input itself).
+                    const c = (
+                        el.closest('.select__container') ||
+                        el.closest('.select-shell') ||
+                        el.closest('.select__control') ||
+                        el.closest('.field-wrapper, .field, .form-field, fieldset, .application-question') ||
+                        el.parentElement && el.parentElement.parentElement
+                    );
                     if (c) {
+                        // .select__single-value is the standard react-select displayed
+                        // value AFTER an option pick. Lives at .select__value-container
+                        // level, sibling of .select__placeholder / .select__input-container.
                         const single = c.querySelector('.select__single-value');
                         if (single) {
                             const txt = t(single.textContent);
                             if (txt) return { observed: txt, notes: 'combobox_single_value', validation_error };
                         }
+                        // Multi-select picks land in .select__multi-value chips.
                         const multi = c.querySelectorAll('.select__multi-value, .select__multi-value__label');
                         if (multi.length > 0) {
                             const labels = Array.from(multi).map(n => t(n.textContent)).filter(Boolean);
                             if (labels.length > 0) return { observed: labels.join(', '), notes: 'combobox_multi_value', validation_error };
                         }
+                        // ARIA-only fallback (some custom widgets don't use the
+                        // react-select class names).
                         const ariaSel = c.querySelector('[aria-selected="true"], [data-selected="true"]');
                         if (ariaSel) return { observed: t(ariaSel.textContent), notes: 'aria_selected_combobox', validation_error };
                     }
