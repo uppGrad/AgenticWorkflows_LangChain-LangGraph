@@ -84,9 +84,19 @@ _LLM_PICKER_SYSTEM = """You are a Playwright selector finder. Given the rendered
 
 Rules:
 - Prefer #id over [name=...] over text-based locators.
-- For React-based custom dropdowns (Greenhouse, Ashby), return the trigger
-  button or div selector with action="click_then_pick_option" and put the
-  option's visible text in `option_text`.
+- For React-based custom dropdowns (Greenhouse, Ashby, Anthropic careers,
+  Workable, Lever country/location pickers): the input element has typically
+  ALREADY had the value typed into it. The LISTBOX is currently open and
+  showing options. Your job is to find the option element (NOT the input)
+  whose visible text matches the intended value, return its selector, and
+  set action="click". Class names vary across vendors (Greenhouse uses
+  `.select__option`, `[role="option"]`; Workable uses `.styles_menu_option_*`;
+  Anthropic uses `.select__menu` descendants). Read the ACTUAL HTML you
+  receive — don't guess class names.
+  - If the listbox is NOT open in the HTML you see (no visible options),
+    return action="click_then_pick_option" with the trigger element's
+    selector + the option's visible text in `option_text`. The fill
+    layer will then re-open and pick.
 - For hidden file inputs, return the actual <input type=file> selector with
   action="set_input_files".
 - For radio groups, prefer input[name=X][value=Y] — never the group container.
@@ -134,8 +144,12 @@ async def _dismiss_cookie_banners(page) -> None:
 
 
 # Caps for the post-fill drift correction loop (Tier 5).
+# Per-session bumped from 5 → 15 because Anthropic / Greenhouse forms
+# routinely have 5+ combobox fields (visa Q, AI policy, in-person Q,
+# etc.) that all fail combobox_pick's deterministic listbox match and
+# legitimately need LLM correction.
 _MAX_CORRECTIONS_PER_FIELD = 2
-_MAX_CORRECTIONS_PER_SESSION = 5
+_MAX_CORRECTIONS_PER_SESSION = 15
 # Container HTML cap when sending to the LLM corrector. Field containers
 # are typically 300-1500 bytes; 4 KB covers the longest realistic case
 # (radio group with 6+ options + nested labels) without ever passing a
@@ -491,14 +505,24 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
     # straight to type-then-pick. This is the discriminator we were
     # missing — fixes the Lever country picker / Greenhouse location
     # autocomplete cases without any LLM call.
+    #
+    # Crucially: when combobox_pick FAILS (selector miss on the option
+    # listbox; vendor uses class names we don't hardcode — Greenhouse
+    # `.select__option`, Workable `.styles_menu_option_*`, etc.), we
+    # return a non-"ok" outcome to escalate to the Tier-4 LLM picker
+    # rather than falling through to plain text-fill. The LLM sees the
+    # freshly-rendered DOM (listbox is open after typing) and picks the
+    # matching option by visible text — no hardcoded class names
+    # needed. Without this escalation, the typed text stays in the
+    # input, .fill() returns "ok", and the bad fill is invisible to
+    # every downstream tier.
     if _is_autocomplete_field(field) and field_type in (
         "text", "select", "url", "email", "tel"
     ):
         ok, detail = await _combobox_pick(page, locator, str(value))
         if ok:
             return ("ok", f"combobox_pick:{detail}")
-        # Fall through to standard tiers; combobox_pick may have left a
-        # value in the input even if the option click missed.
+        return ("select_error", f"combobox_pick_failed:{detail}")
 
     if field_type == "file":
         try:
@@ -919,13 +943,32 @@ async def _llm_verify_batch(
 
     items: List[Dict[str, Any]] = []
     trivial_sane: Dict[int, _FieldVerdict] = {}
+    trivial_drift: Dict[int, _FieldVerdict] = {}
     for i, p in enumerate(plan):
         if p.status != "filled":
             continue
         intended = (p.value or "").strip()
         observed = (p.observed_value or "").strip()
+        # Deterministic drift trap for comboboxes: when ARIA says the
+        # field is a combobox AND the observed value just echoes the
+        # typed-in intended (no option was clicked from the listbox),
+        # mark drift WITHOUT consulting the LLM. This is the canonical
+        # combobox-typed-without-pick failure — cheap to flag, expensive
+        # to miss. The drift corrector then fires immediately with the
+        # intended value; the LLM picks the matching option from the
+        # rendered listbox.
+        if _is_autocomplete_field(p.field) and intended and (
+            _normalise_for_compare(intended) == _normalise_for_compare(observed)
+        ):
+            trivial_drift[i] = _FieldVerdict(
+                idx=i, sane=False,
+                reason="combobox_typed_without_option_pick",
+                suggested_value=intended,
+            )
+            continue
         # Cheap short-circuit: empty intended (optional textarea), or
-        # exact match → sane without LLM.
+        # exact match → sane without LLM (only when NOT a combobox; the
+        # combobox case is handled above).
         if not intended or _normalise_for_compare(intended) == _normalise_for_compare(observed):
             trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="exact_or_empty")
             continue
@@ -942,7 +985,9 @@ async def _llm_verify_batch(
         })
 
     if not items:
-        return trivial_sane
+        # Even with no LLM-bound items, the deterministic combobox drift
+        # traps still apply.
+        return {**trivial_sane, **trivial_drift}
 
     structured = llm.with_structured_output(_BatchVerifyResult)
     try:
@@ -951,10 +996,10 @@ async def _llm_verify_batch(
             HumanMessage(content=f"Verify these filled fields. Return one verdict per row.\n\n{items}"),
         ])
     except Exception as exc:
-        logger.warning("_llm_verify_batch: LLM call failed — treating all as sane (%s)", exc)
-        return trivial_sane
+        logger.warning("_llm_verify_batch: LLM call failed — treating all non-trapped as sane (%s)", exc)
+        return {**trivial_sane, **trivial_drift}
 
-    out = dict(trivial_sane)
+    out = {**trivial_sane, **trivial_drift}
     for v in result.verdicts:
         out[v.idx] = v
     return out
