@@ -638,6 +638,12 @@ Bad (NEVER):
 _MAX_ANALYSIS_CHARS = 12000
 _MAX_DOC_CHARS = 8000
 
+# Final post-dedupe cap on proposals. The synth prompt asks for 8-15; this is
+# a hard ceiling applied AFTER overlap-dedupe so the user-facing review list
+# stays focused. Order is preserved (LLM's prioritisation = earlier first), so
+# the trim drops the lowest-priority tail.
+_MAX_PROPOSAL_COUNT = 12
+
 # Minimum fuzzy-match ratio for before_text to be considered "grounded"
 _MIN_MATCH_RATIO = 0.55
 
@@ -737,15 +743,48 @@ def _looks_like_meta_instruction(after_text: str) -> bool:
     return any(p.search(after_text) for p in _META_INSTRUCTION_PATTERNS)
 
 
+# PII-placeholder detector. The synth occasionally emits proposals with
+# personal-info placeholders ("[Your Name]", "[Date]", "[Hiring Manager Name]")
+# instead of pulling actual values from the document. These leak into the
+# rendered PDF as if they were content. Drop them — the document already
+# contains the user's name and contact info, so the proposal was redundant
+# anyway, and substituting from the profile risks the wrong variant.
+#
+# Numeric quantification placeholders ("[X]", "[Y]%", "[X] requests/day")
+# are intentionally NOT matched: those are valid CV-bullet hints the
+# candidate fills in. Lowercase instruction-style placeholders
+# ("[a specific project where you did X]") are also not matched.
+_PII_PLACEHOLDER = re.compile(
+    r"\[\s*"
+    r"(?:your\s+|full\s+|today'?s?\s+)*"
+    r"(?:"
+    r"name|address|phone(?:\s+number)?|email(?:\s+address)?|"
+    r"date|today|signature|company(?:\s+name)?|position|role|"
+    r"(?:hiring\s+manager|recruiter|recipient|sender|applicant)"
+    r"(?:'?s?\s+name)?"
+    r")"
+    r"\s*\]",
+    re.IGNORECASE,
+)
+
+
+def _contains_pii_placeholder(after_text: str) -> bool:
+    if not after_text:
+        return False
+    return bool(_PII_PLACEHOLDER.search(after_text))
+
+
 def _validate_proposals(
     proposals: List[dict],
     doc_sections: dict,
 ) -> List[dict]:
-    """Filter out proposals with hallucinated before_text or meta-instruction after_text."""
+    """Filter out proposals with hallucinated before_text, meta-instruction
+    after_text, or PII placeholders ([Your Name]/[Date]) in after_text."""
     full_text = " ".join(doc_sections.values())
     validated = []
     dropped_ungrounded = 0
     dropped_meta = 0
+    dropped_placeholder = 0
 
     for p in proposals:
         before = p.get("before_text", "")
@@ -775,17 +814,98 @@ def _validate_proposals(
             )
             continue
 
+        # PII placeholders ("[Your Name]", "[Date]", "[Hiring Manager Name]")
+        # leak into the rendered PDF verbatim. Delete proposals are exempt
+        # because their after_text is empty by spec.
+        if action != "delete" and _contains_pii_placeholder(after):
+            dropped_placeholder += 1
+            logger.warning(
+                "Dropped PII-placeholder proposal (after_text contains "
+                "[Your Name]/[Date]-style placeholder): section=%s, after_text=%.120s…",
+                p.get("section", "?"),
+                after,
+            )
+            continue
+
         validated.append(p)
 
-    dropped = dropped_ungrounded + dropped_meta
+    dropped = dropped_ungrounded + dropped_meta + dropped_placeholder
     if dropped:
         logger.info(
             "Validation: kept %d / %d proposals "
-            "(%d dropped as ungrounded, %d dropped as meta-instruction)",
+            "(%d ungrounded, %d meta-instruction, %d placeholder dropped)",
             len(validated), len(proposals), dropped_ungrounded, dropped_meta,
+            dropped_placeholder,
         )
 
     return validated
+
+
+# ---------------------------------------------------------------------------
+# Overlap-dedupe: one proposal per paragraph target
+# ---------------------------------------------------------------------------
+#
+# The synth occasionally emits proposals whose `before_text` overlaps another
+# proposal's — e.g. a paragraph-level rewrite plus a sentence-level polish on
+# a sentence inside that same paragraph, or a `delete` plus a `rewrite` on
+# the same paragraph. The deterministic applier already rejects overlapping
+# spans at apply time, but only AFTER they reach the user's review list.
+# That produces the symptom the user reported: many proposals applied, but
+# the resulting document feels patchwork because some proposals contradict
+# each other (delete + rewrite on same paragraph) and others repeat the same
+# edit at different granularities.
+#
+# Subtractive post-pass: when two proposals overlap (one's normalized
+# before_text contains the other's), keep the most decisive one. Priority
+# order, most decisive first:
+#   1. action="delete"   — removes the paragraph entirely
+#   2. action="merge"    — combines two paragraphs into one
+#   3. action="rewrite" with longer before_text  — paragraph-level
+#   4. action="rewrite" with shorter before_text — sentence-level polish
+# Within same action+length: higher confidence wins.
+#
+# Empty before_text (new-addition hints) is always kept — those flow as LLM
+# hints rather than deterministic substitutions, so they cannot collide with
+# any paragraph rewrite.
+
+def _dedupe_overlapping_proposals(proposals: List[dict]) -> List[dict]:
+    def priority_key(p: dict) -> tuple:
+        action = (p.get("action") or "rewrite").lower()
+        action_rank = {"delete": 0, "merge": 1}.get(action, 2)
+        before_len = len(p.get("before_text", "") or "")
+        confidence = float(p.get("confidence") or 0.0)
+        return (action_rank, -before_len, -confidence)
+
+    indexed_sorted = sorted(enumerate(proposals), key=lambda ip: priority_key(ip[1]))
+    kept_indices: set[int] = set()
+    kept_norms: List[str] = []
+    dropped = 0
+
+    for i, p in indexed_sorted:
+        norm = _normalize(p.get("before_text", "") or "")
+        if not norm:
+            kept_indices.add(i)
+            continue
+        if any(norm in k or k in norm for k in kept_norms):
+            dropped += 1
+            logger.info(
+                "Dedupe: dropped overlapping proposal section=%s action=%s before_text=%.60s…",
+                p.get("section", "?"),
+                p.get("action") or "rewrite",
+                p.get("before_text", ""),
+            )
+            continue
+        kept_indices.add(i)
+        kept_norms.append(norm)
+
+    if dropped:
+        logger.info(
+            "Dedupe: kept %d / %d proposals (%d overlapping dropped)",
+            len(kept_indices), len(proposals), dropped,
+        )
+
+    # Preserve original input order so the LLM's prioritisation is intact.
+    return [p for i, p in enumerate(proposals) if i in kept_indices]
 
 
 # ---------------------------------------------------------------------------
@@ -1096,9 +1216,19 @@ def synthesize_feedback(state: DocFeedbackState) -> dict:
         output: SynthesisOutput = structured.invoke(msgs)
         raw_proposals = [p.model_dump() for p in output.proposals]
 
-        # Post-process: drop proposals with hallucinated before_text
+        # Post-process pipeline (all subtractive — never adds or transforms,
+        # so cannot regress the deterministic apply path):
+        #   1. validate: drop ungrounded / meta-instruction / PII-placeholder
+        #   2. dedupe: one proposal per overlapping paragraph target
+        #   3. cap: hard ceiling so the user-facing review list stays focused
         validated = _validate_proposals(raw_proposals, doc_sections)
-        return {**updates, "proposals": validated}
+        deduped = _dedupe_overlapping_proposals(validated)
+        if len(deduped) > _MAX_PROPOSAL_COUNT:
+            logger.info(
+                "Cap: trimmed %d → %d proposals", len(deduped), _MAX_PROPOSAL_COUNT,
+            )
+        capped = deduped[:_MAX_PROPOSAL_COUNT]
+        return {**updates, "proposals": capped}
     except Exception as e:
         proposals = _heuristic_proposals(analysis_results, doc_sections)
         result = [p.model_dump() for p in proposals]
