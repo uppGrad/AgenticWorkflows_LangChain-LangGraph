@@ -152,6 +152,52 @@ def normalize_paragraph_breaks(text: str) -> str:
     return text
 
 
+def _extract_pdf_pypdf(path: str) -> Tuple[str, int, List[str]]:
+    """pypdf path. Returns (text, page_count, warnings)."""
+    from pypdf import PdfReader
+    warnings: List[str] = []
+    reader = PdfReader(path)
+    page_count = len(reader.pages)
+    texts: List[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+            warnings.append(f"pypdf failed on page {i+1}.")
+        if t.strip():
+            texts.append(_strip_page_footer(t))
+    return "\n".join(texts), page_count, warnings
+
+
+def _extract_pdf_pdfminer(path: str) -> Tuple[str, List[str]]:
+    """pdfminer.six path. Returns (text, warnings)."""
+    from pdfminer.high_level import extract_text as _pm_extract
+    warnings: List[str] = []
+    try:
+        text = _pm_extract(path) or ""
+    except Exception as e:
+        warnings.append(f"pdfminer extraction failed: {e}")
+        text = ""
+    return text, warnings
+
+
+def _avg_paragraph_length(text: str) -> float:
+    """Average paragraph length after splitting on blank lines.
+
+    Used as the scoring signal for picking between pypdf and pdfminer.
+    Higher avg = fewer fragmentary paragraphs = better extraction. The
+    failure mode this protects against is word-per-line wrap, which both
+    extractors hit on different PDFs (pypdf on standard Word/Google Docs
+    PDFs, pdfminer on PDFs with unusual character-spacing encoding) and
+    which produces 100+ tiny "paragraphs" of one word each.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    if not paragraphs:
+        return 0.0
+    return sum(len(p) for p in paragraphs) / len(paragraphs)
+
+
 def extract_text_from_file(path: str) -> ExtractResult:
     """
     Best-effort extraction from TXT, DOCX, PDF.
@@ -182,25 +228,42 @@ def extract_text_from_file(path: str) -> ExtractResult:
         return ExtractResult(text=text, page_count=None, warnings=warnings)
 
     if ext == ".pdf":
-        # prefer pypdf (lightweight)
+        # Two-extractor strategy. Neither pypdf nor pdfminer.six is universally
+        # better at preserving paragraph structure: pypdf often produces
+        # word-per-line wrap on standard Word/Google Docs PDFs (pdfminer reads
+        # those cleanly), while pdfminer falls into word-per-line on PDFs with
+        # unusual character-spacing encoding (pypdf reads those better, with
+        # `normalize_paragraph_breaks` recovering paragraph boundaries from
+        # the heuristic). Run both and pick the one whose paragraph-length
+        # distribution looks healthier.
         try:
-            from pypdf import PdfReader
+            text_pypdf, page_count, w_pypdf = _extract_pdf_pypdf(path)
         except Exception as e:
-            raise RuntimeError("pypdf is not installed (required for .pdf).") from e
+            raise RuntimeError(f"pypdf is not installed or failed: {e}") from e
+        warnings.extend(w_pypdf)
 
-        reader = PdfReader(path)
-        page_count = len(reader.pages)
-        texts = []
-        for i, page in enumerate(reader.pages):
-            try:
-                t = page.extract_text() or ""
-            except Exception:
-                t = ""
-                warnings.append(f"Failed to extract text from page {i+1}.")
-            if t.strip():
-                texts.append(_strip_page_footer(t))
+        try:
+            text_pdfminer, w_pdfminer = _extract_pdf_pdfminer(path)
+        except Exception as e:
+            text_pdfminer = ""
+            warnings.append(f"pdfminer fallback unavailable: {e}")
 
-        text = "\n".join(texts)
+        warnings.extend(w_pdfminer if text_pdfminer else [])
+
+        # Score after normalization (pypdf needs it; pdfminer's blank-line
+        # structure passes through and the line-wrap collapsing in step 3
+        # cleans up internal soft wraps).
+        norm_pypdf = normalize_paragraph_breaks(text_pypdf) if text_pypdf else ""
+        norm_pdfminer = normalize_paragraph_breaks(text_pdfminer) if text_pdfminer else ""
+
+        score_pypdf = _avg_paragraph_length(norm_pypdf) if norm_pypdf else 0.0
+        score_pdfminer = _avg_paragraph_length(norm_pdfminer) if norm_pdfminer else 0.0
+
+        if score_pdfminer > score_pypdf and norm_pdfminer:
+            text = text_pdfminer
+        else:
+            text = text_pypdf
+
         if not text.strip():
             warnings.append("PDF text extraction returned empty. File may be scanned or image-based.")
         return ExtractResult(text=text, page_count=page_count, warnings=warnings)
