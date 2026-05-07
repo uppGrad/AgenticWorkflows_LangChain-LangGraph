@@ -114,11 +114,29 @@ def normalize_paragraph_breaks(text: str) -> str:
     Robust to two pypdf failure modes (single-newline-only paragraph breaks
     and word-per-line wrap with "\\n \\n" between every word). See module
     block comment above for the full failure-mode map.
+
+    Guards against a third failure mode introduced by step 1 itself: in a
+    document that ALREADY has well-formed blank-line paragraph structure
+    (regular Word/Google Docs PDF with page-width line wraps), step 1's
+    "sentence-end + newline + capital" pattern over-fires inside paragraphs.
+    Any in-paragraph line wrap that happens to land at a sentence boundary
+    looks identical to a paragraph break, so the heuristic injects "\\n\\n"
+    between sentences within a paragraph. Downstream effect: every sentence
+    renders as its own paragraph, narrative analysis sees 15+
+    pseudo-paragraphs and flags them as redundant, synth emits one anchor
+    per pseudo-paragraph and the same anchor lands in three "paragraphs".
+    Skip step 1 when blank-line structure already exists. Word-per-line
+    case still triggers it (its blank lines contain horizontal whitespace
+    and don't match `\\n\\n`); LaTeX article PDFs still trigger it (no
+    blank lines at all).
     """
-    # Step 1: protect true paragraph boundaries (sentence-ender + newline +
-    # capital letter). Consume the surrounding whitespace so we don't end up
-    # with stray spaces around the marker.
-    text = _TRUE_PARAGRAPH_BOUNDARY.sub(r"\1" + _PARA_MARKER, text)
+    has_blank_paragraphs = len(re.findall(r"\n\n", text)) >= 2
+
+    if not has_blank_paragraphs:
+        # Step 1: protect true paragraph boundaries (sentence-ender + newline
+        # + capital letter). Consume the surrounding whitespace so we don't
+        # end up with stray spaces around the marker.
+        text = _TRUE_PARAGRAPH_BOUNDARY.sub(r"\1" + _PARA_MARKER, text)
     # Step 2: collapse word-per-line wrap. Any newline run that contains a
     # space-only intermediate line is the pypdf wrap signature; replace with
     # a single space so the words rejoin into one paragraph.
@@ -126,7 +144,8 @@ def normalize_paragraph_breaks(text: str) -> str:
     # Step 3: collapse mid-sentence soft wraps inside long prose lines.
     # CV bullets and section headers are short and survive untouched.
     text = _collapse_mid_sentence_wrap(text)
-    # Step 4: restore true paragraph boundaries.
+    # Step 4: restore true paragraph boundaries (no-op when step 1 was
+    # skipped — no markers were ever inserted).
     text = text.replace(_PARA_MARKER, "\n\n")
     # Step 5: collapse runs of horizontal whitespace inserted by earlier steps.
     text = re.sub(r"[ \t]{2,}", " ", text)
