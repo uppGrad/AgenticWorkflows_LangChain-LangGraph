@@ -1,0 +1,45 @@
+{
+  "label": "ashby-robinradar",
+  "opp_type": "job",
+  "opp_id": 127874,
+  "expected_ats": "ashby",
+  "title": "Top Engineers",
+  "company_or_provider": "Robin Radar Systems",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.ashbyhq.com/robin-radar/58df24e7-2b6d-4229-8c85-4fee9087ca33/application",
+  "posting_closed": false,
+  "form_field_count": 8,
+  "form_field_breakdown": {
+    "file": 3,
+    "text": 2,
+    "email": 1,
+    "tel": 1,
+    "textarea": 1
+  },
+  "requirement_breakdown": {
+    "document": 2,
+    "text": 1,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume",
+    "Motivational Letter",
+    "g-recaptcha-response",
+    "Profile / identity fields (4)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {
+    "CV": 193,
+    "Cover Letter": 1121
+  },
+  "tailored_answers_count": 1,
+  "evaluation_warnings": [
+    "CV: content is short (193 chars, expected \u2265200).",
+    "Cover Letter: no opportunity-specific keywords detected (expected at least one of: data, agile)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 45.18,
+  "error": ""
+}

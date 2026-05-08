@@ -1,0 +1,42 @@
+{
+  "label": "lever-tsmg",
+  "opp_type": "job",
+  "opp_id": 130560,
+  "expected_ats": "lever",
+  "title": "Mystery Shopper",
+  "company_or_provider": "TSMG Holding",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://jobs.lever.co/tsmg/761f1d35-f3f4-4c91-91f0-0eefff6706cc/apply?lever-source=LinkedIn",
+  "posting_closed": false,
+  "form_field_count": 17,
+  "form_field_breakdown": {
+    "file": 1,
+    "text": 9,
+    "email": 1,
+    "select": 5,
+    "checkbox": 1
+  },
+  "requirement_breakdown": {
+    "document": 1,
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Resume/CV",
+    "Profile / identity fields (16)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Amsterdam, North Holland, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 136
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (136 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 9.89,
+  "error": ""
+}

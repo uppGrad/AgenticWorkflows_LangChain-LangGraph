@@ -1,0 +1,36 @@
+{
+  "label": "wday-prysmian",
+  "opp_type": "job",
+  "opp_id": 129969,
+  "expected_ats": "workday",
+  "title": "Process Sr Engineer - Hollow Core Fiber",
+  "company_or_provider": "Prysmian",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "",
+  "posting_closed": false,
+  "form_field_count": 0,
+  "form_field_breakdown": {},
+  "requirement_breakdown": {
+    "document": 2
+  },
+  "requirement_labels": [
+    "CV",
+    "Cover Letter"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Eindhoven, North Brabant, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {
+    "CV": 143,
+    "Cover Letter": 1226
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "CV: content is short (143 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 7.27,
+  "error": ""
+}

@@ -28,6 +28,7 @@ from uppgrad_agentic.workflows.auto_apply.nodes.upload_light_post_analysis impor
     analyze_upload_light_post,
 )
 from uppgrad_agentic.workflows.auto_apply.state import AutoApplyState
+from uppgrad_agentic.workflows.document_feedback.graph import build_auto_tailoring_graph
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +479,138 @@ def _split_latex_and_plain(raw: str, doc_type: str) -> tuple[str, str]:
     return _truncate_to_cap(plain, doc_type), latex_source
 
 
+# Auto-apply canonical doc types → doc-feedback DocType literals. Anything
+# not in this map (e.g. "Motivation Letter" — no doc-feedback analog) falls
+# back to the legacy T1→T2 path.
+_DOC_FEEDBACK_TYPE_MAP = {
+    "CV": "CV",
+    "Cover Letter": "COVER_LETTER",
+    "Motivation Letter": "COVER_LETTER",
+    "SOP": "SOP",
+    "Personal Statement": "SOP",
+}
+
+
+def _tailor_via_doc_feedback(
+    doc_type: str,
+    uploaded_text: str,
+    user_prompt: Optional[str],
+    opportunity_data: Dict[str, Any],
+    opportunity_type: str,
+    profile: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Drive the doc-feedback graph in auto-tailoring mode against the
+    user's uploaded document. Returns a tailored_documents entry on
+    success, None on any failure (caller falls back to T1→T2)."""
+    df_doc_type = _DOC_FEEDBACK_TYPE_MAP.get(doc_type)
+    if df_doc_type is None:
+        logger.info(
+            "application_tailoring: %s has no doc-feedback analog — using T1→T2",
+            doc_type,
+        )
+        return None
+
+    # Pre-populate the doc-feedback state. We skip Phase 0 (load_document /
+    # detect_doc_type) entirely because the source text is already
+    # extracted and we know the doc_type from the requirement_item.
+    df_state = {
+        "raw_text": uploaded_text,
+        "doc_meta": {
+            "file_name": f"{doc_type}.txt",
+            "mime": "text/plain",
+            "char_count": len(uploaded_text),
+            "page_count": None,
+            "extraction_warnings": [],
+        },
+        "doc_classification": {
+            "doc_type": df_doc_type,
+            "relevant": True,
+            "confidence": 1.0,
+            "reasons": ["pre-classified by auto_apply requirement_item"],
+            "language": None,
+        },
+        "user_instructions": (user_prompt or "").strip(),
+        "profile_snapshot": profile,
+        "opportunity_context": _opportunity_context_for_doc_feedback(
+            opportunity_data, opportunity_type
+        ),
+        "iteration_count": 0,
+    }
+
+    try:
+        graph = build_auto_tailoring_graph()
+        # Sub-graph runs to completion (no interrupt). thread_id is per-doc
+        # so concurrent docs (CV + CL in same session) don't share state.
+        config = {"configurable": {"thread_id": f"auto-tailor-{doc_type}"}}
+        result = graph.invoke(df_state, config=config)
+    except Exception as exc:
+        logger.warning(
+            "application_tailoring: doc-feedback graph crashed for %s — falling back to T1→T2 (%s)",
+            doc_type, exc,
+        )
+        return None
+
+    if (result.get("result") or {}).get("status") == "error":
+        logger.info(
+            "application_tailoring: doc-feedback ended with error for %s — falling back to T1→T2",
+            doc_type,
+        )
+        return None
+
+    latex_source = (result.get("final_document") or "").strip()
+    if not latex_source:
+        return None
+
+    plain = _latex_to_plain(latex_source)
+    diff = result.get("diff") or {}
+    accepted = len((result.get("human_review") or {}).get("approved_proposals") or [])
+
+    return {
+        "content": _truncate_to_cap(plain, doc_type),
+        "latex_source": latex_source,
+        "tailoring_depth": "doc_feedback",
+        "source": "upload",
+        "llm_used": True,
+        "passes": int(result.get("iteration_count") or 0),
+        "doc_feedback_diff": diff,
+        "doc_feedback_accepted_proposals": accepted,
+    }
+
+
+def _opportunity_context_for_doc_feedback(
+    opportunity_data: Dict[str, Any], opportunity_type: str
+) -> Dict[str, Any]:
+    """Map auto_apply's opportunity_data dict to the shape doc-feedback's
+    analyze_opportunity_alignment node expects. Best-effort — every field
+    is optional on the doc-feedback side; missing fields just degrade the
+    quality of the alignment analysis."""
+    if not opportunity_data:
+        return {}
+    title = (
+        opportunity_data.get("title")
+        or opportunity_data.get("name")
+        or ""
+    )
+    org = (
+        opportunity_data.get("company")
+        or opportunity_data.get("university")
+        or opportunity_data.get("provider_name")
+        or ""
+    )
+    description = (
+        opportunity_data.get("description")
+        or opportunity_data.get("eligibility_text")
+        or ""
+    )
+    return {
+        "opportunity_type": opportunity_type,
+        "title": title,
+        "organisation": org,
+        "location": opportunity_data.get("location") or "",
+        "description": description[:_MAX_OPP_CHARS],
+    }
+
+
 def _process_document(
     item: Dict[str, Any],
     choice: str,
@@ -508,6 +641,23 @@ def _process_document(
                 "llm_used": False,
                 "passes": 0,
             }
+
+        # Try the doc-feedback graph first — it produces grounded edits
+        # (proposals must fuzzy-match source text → no hallucination) plus
+        # a deterministic evaluator with retry. Falls back to the legacy
+        # T1→T2 path on any failure.
+        df_result = _tailor_via_doc_feedback(
+            doc_type, uploaded_text, user_prompt,
+            opportunity_data, opportunity_type, profile,
+        )
+        if df_result is not None:
+            logger.info(
+                "application_tailoring: %s tailored via doc-feedback graph "
+                "(accepted=%s, content_chars=%d)",
+                doc_type, df_result.get("doc_feedback_accepted_proposals"),
+                len(df_result.get("content") or ""),
+            )
+            return df_result
 
         # PreA
         pre = analyze_upload_pre(opportunity_data, profile, uploaded_text, doc_type, user_prompt)
@@ -592,6 +742,221 @@ def _process_document(
 
     # ignore_for_now / skip → nothing to produce
     return None
+
+
+# ---------------------------------------------------------------------------
+# Misc-bucket LLM derivation (Yes/No comboboxes, profile fields, short
+# free-form questions). Replaces value_planner here because:
+#   - value_planner's profile_lookup keyword-matches "country" anywhere
+#     in the label, which fires incorrectly on "visa sponsorship to
+#     work in the country" → returns Country=Turkey.
+#   - value_planner returns "[Mock answer — …]" for short text fields
+#     without options, which is useless to the user.
+#   - value_planner can't reason about Yes/No questions where the
+#     correct answer depends on the user's profile vs the opportunity
+#     (e.g. visa sponsorship → Turkish user applying to US → Yes).
+#
+# value_planner is still the fill-time fallback in
+# auto_apply_adapter.attempt_auto_fill — only the gate-1→gate-2 stage
+# uses this LLM batch.
+# ---------------------------------------------------------------------------
+
+_MISC_DERIVE_SYSTEM = """You are filling out a job application form on behalf of a user. The user wants the form auto-filled. For each question, produce a concise answer.
+
+You will receive:
+- The user's profile (name, contact, location, education, skills, work history, etc.)
+- The opportunity (title, company, location, description excerpt)
+- A list of form fields, each with: form_field_index (int), label (str), field_type (str), required (bool), options (list of strings — empty if free-form).
+
+Rules — apply per field:
+
+1. If `options` is non-empty, your answer MUST be one of the option strings exactly. Reason about the user's profile and the opportunity to pick the right one.
+   - Yes/No questions: think before answering. Examples:
+     - "Do you require visa sponsorship?" — Yes if the user's nationality differs from the opportunity's country and they aren't already authorised to work there.
+     - "Are you open to relocation?" — usually Yes unless the user's profile clearly indicates otherwise.
+     - "Are you open to working in-person 25% of the time?" — usually Yes; only No if profile makes hybrid impossible.
+     - "Have you ever interviewed at Anthropic before?" — No unless profile or CV mentions it.
+     - "Have you built or owned X infrastructure?" — Yes only when the CV / profile clearly demonstrates it; otherwise No.
+
+2. Profile-attribute questions (Country, City, Email, Phone, LinkedIn, GitHub, Website, Address) — echo the user's profile value verbatim.
+
+3. Short open-ended questions ("When can you start?", "Do you have any deadlines?") — draft a 1–2 sentence concise honest answer based on profile and CV. Don't invent specifics.
+
+4. If a field is hard to answer confidently, return an empty string for `answer` — leave the field blank rather than guessing.
+
+5. Never write a paragraph. Keep answers SHORT. Single line for profile attributes, ≤2 sentences for short open-ended.
+
+Return ONE entry per input field, in the same order. Use the field's form_field_index value verbatim."""
+
+
+from pydantic import BaseModel as _BaseModel  # local alias to avoid top-of-file shuffle
+
+
+class _MiscAnswer(_BaseModel):
+    form_field_index: int
+    answer: str = ""
+    reason: str = ""
+
+
+class _MiscAnswerList(_BaseModel):
+    answers: List[_MiscAnswer] = []
+
+
+def _build_profile_summary(profile: Dict[str, Any]) -> str:
+    """Compact profile summary for the misc-derivation prompt. Mirrors
+    the same shape `_generate_text_prompt` builds — keep them similar so
+    the LLM treats both surfaces the same way."""
+    if not profile:
+        return "(profile unavailable)"
+    fields = [
+        ("Name", profile.get("full_name") or
+            f"{profile.get('first_name','')} {profile.get('last_name','')}".strip()),
+        ("Email", profile.get("email", "")),
+        ("Phone", profile.get("phone", "")),
+        ("Country", profile.get("country", "")),
+        ("City", profile.get("city", "")),
+        ("Location", profile.get("location", "")),
+        ("Nationality", profile.get("nationality", "")),
+        ("Work authorisation", profile.get("work_authorization", "") or profile.get("work_auth", "")),
+        ("LinkedIn", profile.get("linkedin", "")),
+        ("GitHub", profile.get("github", "")),
+        ("Website", profile.get("website", "")),
+        ("Education", profile.get("degree", "") or profile.get("education", "")),
+        ("Bio", (profile.get("bio") or "")[:400]),
+    ]
+    rendered = "\n".join(f"- {k}: {v}" for k, v in fields if v)
+    return rendered or "(profile fields not populated)"
+
+
+def _build_opportunity_summary(
+    opportunity_data: Dict[str, Any], opportunity_type: str
+) -> str:
+    if not opportunity_data:
+        return "(opportunity unavailable)"
+    title = opportunity_data.get("title") or opportunity_data.get("name") or ""
+    company = (
+        opportunity_data.get("company")
+        or opportunity_data.get("university")
+        or opportunity_data.get("provider_name")
+        or ""
+    )
+    location = opportunity_data.get("location", "")
+    description = (opportunity_data.get("description") or "")[:1500]
+    parts = [
+        ("Type", opportunity_type),
+        ("Title", title),
+        ("Organization", company),
+        ("Location", location),
+        ("Description (excerpt)", description),
+    ]
+    return "\n".join(f"- {k}: {v}" for k, v in parts if v)
+
+
+def _derive_misc_answers_via_llm(
+    *,
+    misc_indices: List[int],
+    form_fields: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+    opportunity_data: Dict[str, Any],
+    opportunity_type: str,
+    tailored_documents: Dict[str, Any],
+    tailored_answers: Dict[str, Dict[str, Any]],
+    llm,
+) -> int:
+    """Single LLM batch call to derive answers for every misc-bucketed
+    form field. Mutates `tailored_answers` in place; returns the count
+    of fields that received a non-empty answer.
+
+    Defensive: returns 0 silently if LLM is unavailable or the call
+    fails. Defaults-fallback path (no form_fields, CV+Cover Letter
+    only) never reaches here — `application_tailoring` gates this on
+    `has_misc_item AND form_fields`.
+    """
+    if not misc_indices or llm is None:
+        return 0
+
+    # Build per-field input list. Cap to 30 fields per call to keep
+    # token cost bounded; rare on real ATSes (Anthropic Greenhouse has
+    # ~22 fields total, of which ~15 are misc).
+    items: List[Dict[str, Any]] = []
+    for idx in misc_indices[:30]:
+        f = form_fields[idx]
+        items.append({
+            "form_field_index": idx,
+            "label": (f.get("label") or "").strip(),
+            "field_type": f.get("field_type") or "text",
+            "required": bool(f.get("required")),
+            "options": list(f.get("options") or [])[:20],
+        })
+
+    profile_summary = _build_profile_summary(profile)
+    opp_summary = _build_opportunity_summary(opportunity_data, opportunity_type)
+
+    user_msg = (
+        f"=== PROFILE ===\n{profile_summary}\n\n"
+        f"=== OPPORTUNITY ===\n{opp_summary}\n\n"
+        f"=== FORM FIELDS ===\n{items!r}\n\n"
+        "Return one MiscAnswer per field, in the same order, with form_field_index matching the input."
+    )
+
+    try:
+        structured = llm.with_structured_output(_MiscAnswerList)
+        result = structured.invoke([
+            SystemMessage(content=_MISC_DERIVE_SYSTEM),
+            HumanMessage(content=user_msg),
+        ])
+    except Exception as exc:
+        logger.warning(
+            "application_tailoring: misc LLM derivation call failed — %s", exc,
+        )
+        return 0
+
+    answers_by_idx: Dict[int, str] = {}
+    for entry in (result.answers or []):
+        try:
+            ffi = int(entry.form_field_index)
+        except (TypeError, ValueError):
+            continue
+        ans = (entry.answer or "").strip()
+        if ans:
+            answers_by_idx[ffi] = ans
+
+    misc_count = 0
+    for idx in misc_indices:
+        ans = answers_by_idx.get(idx)
+        if not ans:
+            continue
+        f = form_fields[idx]
+        # If options is non-empty, sanity-check that the LLM picked a
+        # valid one. If not, normalise to the closest option (case-
+        # insensitive exact match preferred). Bail out (skip writing)
+        # when no option matches — better to leave it for gate-2 review
+        # than to ship a bad value.
+        opts = list(f.get("options") or [])
+        if opts:
+            lc = ans.lower()
+            picked: Optional[str] = None
+            for o in opts:
+                if o.lower() == lc:
+                    picked = o
+                    break
+            if picked is None:
+                for o in opts:
+                    if o.lower() in lc or lc in o.lower():
+                        picked = o
+                        break
+            if picked is None:
+                continue
+            ans = picked
+        tailored_answers[str(idx)] = {
+            "content": ans,
+            "question": f.get("label", "") or "",
+            "form_field_index": idx,
+            "llm_used": True,
+            "source": "llm_misc_derivation",
+        }
+        misc_count += 1
+    return misc_count
 
 
 def _process_text(
@@ -700,10 +1065,63 @@ def application_tailoring(state: AutoApplyState) -> dict:
                 ffi = item.get("form_field_index")
                 key = str(ffi) if ffi is not None else idx_str
                 tailored_answers[key] = result
-        # misc → covered by misc_strategy at submission time, not by tailoring
+        # misc → handled below in the misc-derivation pass
+
+    # ─── Misc auto-fill derivation ──────────────────────────────────────
+    # Spec: short-input fields (Yes/No comboboxes, country pickers,
+    # sponsorship dropdowns, profile attributes) are collapsed into the
+    # misc bucket at gate-1. When the user picked misc_strategy="auto_fill",
+    # the agent derives an answer for each *now*, before gate-2 — so
+    # gate-2 can show the auto-derived values for review/edit alongside
+    # tailored documents and textarea answers.
+    #
+    # Defensive: only fires when (a) misc items exist, (b) form_fields
+    # is non-empty, (c) misc_strategy="auto_fill". The defaults-fallback
+    # path (no form_fields, just CV+Cover Letter from _build_default)
+    # never reaches this branch.
+    misc_strategy = (human_review_1.get("misc_strategy") or "ignore").strip()
+    has_misc_item = any(
+        (it.get("category") == "misc") for it in requirement_items
+    )
+    form_fields: List[Dict[str, Any]] = list(state.get("form_fields") or [])
+    if has_misc_item and misc_strategy == "auto_fill" and form_fields:
+        # Determine which form_field indices are misc-bucketed. Same
+        # logic as asset_mapping._build_from_form_fields: every field
+        # that isn't a file (handled as document) AND isn't a true
+        # textarea-with-user-answer (handled as text).
+        misc_indices: List[int] = []
+        already_answered_keys = set(tailored_answers.keys())
+        for idx, field in enumerate(form_fields):
+            ftype = field.get("field_type")
+            if ftype == "file":
+                continue
+            if ftype == "textarea":
+                continue
+            # Skip if this form field already has an answer from a text
+            # category item (defensive — shouldn't overlap, but a
+            # malformed metadata mix shouldn't double-populate).
+            if str(idx) in already_answered_keys:
+                continue
+            misc_indices.append(idx)
+
+        if misc_indices:
+            misc_count = _derive_misc_answers_via_llm(
+                misc_indices=misc_indices,
+                form_fields=form_fields,
+                profile=profile,
+                opportunity_data=opportunity_data,
+                opportunity_type=opportunity_type,
+                tailored_documents=tailored_documents,
+                tailored_answers=tailored_answers,
+                llm=llm,
+            )
+            logger.info(
+                "application_tailoring: derived %d misc answer(s) (auto_fill)",
+                misc_count,
+            )
 
     logger.info(
-        "application_tailoring: produced %d documents, %d text answers",
+        "application_tailoring: produced %d documents, %d text/misc answers",
         len(tailored_documents), len(tailored_answers),
     )
 

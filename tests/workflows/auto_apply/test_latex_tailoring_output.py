@@ -325,8 +325,9 @@ def test_process_document_upload_no_llm_passthrough_has_empty_latex():
 
 
 def test_process_document_upload_path_extracts_latex_from_t2_output():
-    """Upload path runs T1 → LA → T2; the LaTeX in the FINAL (T2) output
-    is what lives on the entry."""
+    """Upload path tries doc-feedback first; on its failure, falls back to
+    T1 → LA → T2. This test pins the legacy fallback by forcing
+    `_tailor_via_doc_feedback` to return None."""
     item = {"id": 0, "category": "document", "label": "CV",
             "document_type": "CV"}
     t1_latex = (
@@ -339,6 +340,9 @@ def test_process_document_upload_path_extracts_latex_from_t2_output():
     )
     seq = [t1_latex, t2_latex]
     with patch(
+        "uppgrad_agentic.workflows.auto_apply.nodes.application_tailoring._tailor_via_doc_feedback",
+        return_value=None,  # force legacy T1→T2 path
+    ), patch(
         "uppgrad_agentic.workflows.auto_apply.nodes.application_tailoring._llm_call",
         side_effect=lambda *a, **k: seq.pop(0),
     ), patch(

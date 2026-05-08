@@ -1,0 +1,34 @@
+{
+  "label": "gh-sofico",
+  "opp_type": "job",
+  "opp_id": 130136,
+  "expected_ats": "greenhouse",
+  "title": "Business Analyst (m/f/d)",
+  "company_or_provider": "SOFICO",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://job-boards.eu.greenhouse.io/soficonv/jobs/4691376101?gh_src=5180eed2teu&urlHash=X9DT",
+  "posting_closed": false,
+  "form_field_count": 1,
+  "form_field_breakdown": {
+    "text": 1
+  },
+  "requirement_breakdown": {
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Profile / identity fields (1)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [
+    "Job is on-site in 'Houten, Utrecht, Netherlands' but your location is 'Ankara, Turkey'. Remote work is not offered."
+  ],
+  "tailored_documents": {},
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "No tailored documents or answers were produced."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 7.02,
+  "error": ""
+}

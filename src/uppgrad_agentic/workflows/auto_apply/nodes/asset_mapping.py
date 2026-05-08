@@ -92,14 +92,23 @@ def _build_from_form_fields(
     item_id = 0
 
     # ── Documents: dedupe on canonical_document_type ────────────────────
-    # Keyed by canonical_document_type (or label as fallback when classifier
-    # produced no canonical type).
+    # Keyed by canonical_document_type (or label+name as fallback when
+    # classifier produced no canonical type). The name fallback is what
+    # keeps Greenhouse Resume vs Cover Letter distinct when both file
+    # inputs share the visible button caption "Attach": their `name`
+    # attributes are still unique (resume / cover_letter).
     doc_groups: Dict[str, Dict[str, Any]] = {}
     for idx, field in enumerate(form_fields):
         if field.get("field_type") != "file":
             continue
         canonical = (field.get("canonical_document_type") or "").strip()
-        key = canonical or (field.get("label") or "").strip().lower() or f"_unkeyed_{idx}"
+        label_key = (field.get("label") or "").strip().lower()
+        name_key = (field.get("name") or "").strip().lower()
+        key = (
+            canonical
+            or (f"{label_key}|{name_key}" if name_key else label_key)
+            or f"_unkeyed_{idx}"
+        )
         existing = doc_groups.get(key)
         if existing is None:
             doc_groups[key] = {"index": idx, "field": field, "canonical": canonical}
@@ -127,11 +136,23 @@ def _build_from_form_fields(
         )
         item_id += 1
 
-    # ── Text: textareas + free-form questions ───────────────────────────
+    # ── Text: TRUE textareas only ──────────────────────────────────────
+    # Spec: gate-1 surfaces individual cards ONLY for items that need an
+    # upload-vs-generate-vs-skip decision. That means real essay-style
+    # questions (Why us?, Additional Information). Everything else —
+    # short text inputs, Yes/No comboboxes (`field_type="text"` +
+    # `role="combobox"`), country pickers, sponsorship dropdowns, etc.
+    # — collapses into the misc bucket and gets auto-derived in
+    # application_tailoring's misc auto-fill pass for review at gate-2.
+    #
+    # We don't filter on expected_source here: a `<textarea>` is by
+    # definition free-form prose input. If the extractor mislabels it
+    # (e.g. "unknown" because the label was ambiguous), losing it to
+    # misc — where the planner returns a useless mock answer — is
+    # worse than treating every textarea as a text-category item.
     for idx, field in enumerate(form_fields):
         ftype = field.get("field_type")
-        source = field.get("expected_source")
-        if ftype != "textarea" and not (ftype == "text" and source == "user_answer"):
+        if ftype != "textarea":
             continue
         label = (field.get("label") or "").strip() or "Free-form question"
         items.append(
@@ -149,15 +170,13 @@ def _build_from_form_fields(
         )
         item_id += 1
 
-    # ── Misc: one collapsed line covering everything else ───────────────
+    # ── Misc: everything that isn't a file or a textarea ───────────────
     misc_field_indices: List[int] = []
     for idx, field in enumerate(form_fields):
         ftype = field.get("field_type")
         if ftype == "file":
             continue
         if ftype == "textarea":
-            continue
-        if ftype == "text" and field.get("expected_source") == "user_answer":
             continue
         misc_field_indices.append(idx)
 

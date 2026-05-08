@@ -38,7 +38,8 @@ LLM dependency at import time.
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Literal, Optional
+import os
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -50,6 +51,25 @@ from uppgrad_agentic.workflows.auto_apply.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Env var that lets a demo / debug session see the browser fill the form
+# instead of running headless. Falsy values: "0", "false", "no", "off"
+# (case-insensitive). Anything else, including unset, → headless. Read on
+# every call (not at import) so a server can flip the flag mid-process for
+# a one-off demo without restarting.
+_HEADLESS_ENV_VAR = "UPPGRAD_AUTO_FILL_HEADLESS"
+
+
+def _default_headless() -> bool:
+    """Resolve the default value of `headless` for `fill_form_async` from
+    the `UPPGRAD_AUTO_FILL_HEADLESS` env var. Returns True (headless) by
+    default — production should never run headed unless someone deliberately
+    sets the env var."""
+    raw = os.environ.get(_HEADLESS_ENV_VAR, "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
 
 
 # Phrases on a target's text content that disqualify it as a fill target —
@@ -64,9 +84,19 @@ _LLM_PICKER_SYSTEM = """You are a Playwright selector finder. Given the rendered
 
 Rules:
 - Prefer #id over [name=...] over text-based locators.
-- For React-based custom dropdowns (Greenhouse, Ashby), return the trigger
-  button or div selector with action="click_then_pick_option" and put the
-  option's visible text in `option_text`.
+- For React-based custom dropdowns (Greenhouse, Ashby, Anthropic careers,
+  Workable, Lever country/location pickers): the input element has typically
+  ALREADY had the value typed into it. The LISTBOX is currently open and
+  showing options. Your job is to find the option element (NOT the input)
+  whose visible text matches the intended value, return its selector, and
+  set action="click". Class names vary across vendors (Greenhouse uses
+  `.select__option`, `[role="option"]`; Workable uses `.styles_menu_option_*`;
+  Anthropic uses `.select__menu` descendants). Read the ACTUAL HTML you
+  receive — don't guess class names.
+  - If the listbox is NOT open in the HTML you see (no visible options),
+    return action="click_then_pick_option" with the trigger element's
+    selector + the option's visible text in `option_text`. The fill
+    layer will then re-open and pick.
 - For hidden file inputs, return the actual <input type=file> selector with
   action="set_input_files".
 - For radio groups, prefer input[name=X][value=Y] — never the group container.
@@ -111,6 +141,29 @@ async def _dismiss_cookie_banners(page) -> None:
                 return
         except Exception:
             continue
+
+
+# Caps for the post-fill drift correction loop (Tier 5).
+# Per-session bumped from 5 → 15 because Anthropic / Greenhouse forms
+# routinely have 5+ combobox fields (visa Q, AI policy, in-person Q,
+# etc.) that all fail combobox_pick's deterministic listbox match and
+# legitimately need LLM correction.
+_MAX_CORRECTIONS_PER_FIELD = 2
+_MAX_CORRECTIONS_PER_SESSION = 15
+# Container HTML cap when sending to the LLM corrector. Field containers
+# are typically 300-1500 bytes; 4 KB covers the longest realistic case
+# (radio group with 6+ options + nested labels) without ever passing a
+# whole form's worth of HTML.
+_MAX_CONTAINER_HTML_CHARS = 4_000
+
+
+def _normalise_for_compare(s: Any) -> str:
+    """Lowercase + collapse whitespace for value comparison. Both intended
+    and observed go through this before comparing — the DOM may report
+    the canonical form ("United States") while we wrote "united states"."""
+    if s is None:
+        return ""
+    return " ".join(str(s).strip().lower().split())
 
 
 async def _force_hydrate(page) -> None:
@@ -213,6 +266,345 @@ async def _locate_file_input(page, field) -> tuple[Any, str]:
     return None, "none"
 
 
+# ─── Phase 1: combobox detection + native-setter dispatch ───────────────────
+
+
+def _is_autocomplete_field(field) -> bool:
+    """Predicate: should this field be treated as a combobox/autocomplete
+    that needs click+pick instead of plain text-fill?
+
+    Mirrors `browser-use`'s `_is_autocomplete_field` rule (the discriminator
+    none of our previous tiers had access to). Without this, every
+    `<input type="text" role="combobox" aria-autocomplete="list">` looks
+    identical to a plain text input and Tier 1's `.fill()` silently
+    succeeds while the React state never registers an option pick.
+
+    Triggers when ANY of:
+      - role == "combobox"
+      - aria_autocomplete in ("list", "both", "inline")
+      - list_id (datalist target) is present
+      - aria_haspopup is set (and not "false") AND the popup is wired
+        to a controlled element (aria_controls or aria_owns)
+    """
+    role = (getattr(field, "role", "") or "").strip().lower()
+    if role == "combobox":
+        return True
+    aria_ac = (getattr(field, "aria_autocomplete", "") or "").strip().lower()
+    if aria_ac in ("list", "both", "inline"):
+        return True
+    if (getattr(field, "list_id", "") or "").strip():
+        return True
+    haspopup = (getattr(field, "aria_haspopup", "") or "").strip().lower()
+    if haspopup and haspopup != "false":
+        if (getattr(field, "aria_controls", "") or "").strip() or (
+            getattr(field, "aria_owns", "") or ""
+        ).strip():
+            return True
+    return False
+
+
+async def _native_setter_dispatch(locator, value: str) -> bool:
+    """Set an input's value via the native React/Vue setter, then dispatch
+    the input/change events the framework listens for.
+
+    Some controlled inputs (React's onChange-bound `<input>`) silently
+    discard `.fill()` writes because Playwright's keyboard simulation
+    doesn't propagate to the framework's value setter. browser-use uses
+    this exact trick (`Object.getOwnPropertyDescriptor(...).set.call(el)`)
+    as its reliability backstop.
+
+    Returns True when the value successfully landed (post-write `el.value`
+    matches), False otherwise."""
+    try:
+        ok = await locator.evaluate(
+            r"""(el, v) => {
+                const proto = el.tagName === 'TEXTAREA'
+                    ? HTMLTextAreaElement.prototype
+                    : HTMLInputElement.prototype;
+                const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (!desc || !desc.set) return false;
+                desc.set.call(el, v);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return el.value === v;
+            }""",
+            value,
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+async def _combobox_pick(page, locator, option_text: str) -> tuple[bool, str]:
+    """Open a react-select-style combobox and click the matching option.
+
+    Reference DOM (Anthropic Greenhouse — covers most react-select usage):
+
+        <div class="select__container">
+          <label for="question_X" class="select__label">…</label>
+          <div class="select-shell">
+            <div class="select__control">
+              <div class="select__value-container">
+                <div class="select__placeholder">Select…</div>
+                <div class="select__input-container">
+                  <input id="question_X" role="combobox"
+                         aria-autocomplete="list"
+                         aria-haspopup="true"
+                         aria-expanded="false">
+                </div>
+              </div>
+              <div class="select__indicators">
+                <button aria-label="Toggle flyout">▾</button>
+              </div>
+            </div>
+            <!-- listbox appears HERE after click: -->
+            <div class="select__menu">
+              <div class="select__menu-list" role="listbox">
+                <div class="select__option" role="option">Yes</div>
+                <div class="select__option" role="option">No</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+    Click handler is on `.select__control` (the parent), not the `<input>`.
+    Options ONLY render after that click — typing into the input doesn't
+    reliably open the menu for short pure-pick selects (only filters
+    when typed-into in autocomplete mode).
+
+    Strategy:
+      1. Resolve the trigger element — `.select__control` ancestor of
+         the input when present, else the input/locator itself.
+      2. Click trigger + verify `aria-expanded="true"` (with fallback
+         to clicking the toggle button if click on control didn't open).
+      3. Wait for `[role=option]` / `.select__option` to be visible.
+      4. Click the option whose visible text matches. Case-insensitive
+         exact match preferred; substring fallback (matches "Yes, I am
+         authorized" against intended "Yes").
+      5. If listbox didn't open after click (some react-selects DO
+         require typing to open), fall back to: type → wait → click.
+      6. Final fallback: Enter-commit (datalist / inline autocomplete).
+    """
+
+    # ─── Step 1: find the right trigger element ──────────────────────
+    # On react-select, the click receiver is .select__control. Live
+    # smoke test (scripts/probe_anthropic_combobox.py) confirmed that
+    # JS `el.click()` does NOT open the menu — react-select listens
+    # on `mousedown`, not the synthesized click event JS-DOM .click()
+    # fires. Use Playwright's actual locator.click() (which dispatches
+    # the full mousedown→mouseup→click chain) AND an explicit mousedown
+    # dispatch as belt-and-suspenders.
+    trigger_clicked_via = "unknown"
+    try:
+        # Resolve `.select__control` ancestor as a Playwright Locator
+        # so we get the real event chain (not the synthesized JS click).
+        control_locator = locator.locator(
+            'xpath=ancestor::div[contains(@class,"select__control")][1]'
+        )
+        if await control_locator.count() > 0:
+            try:
+                await control_locator.first.click(timeout=2500)
+                trigger_clicked_via = "playwright_click_select_control"
+            except Exception:
+                # Some react-selects ignore even Playwright's click;
+                # dispatch mousedown explicitly. This is what react-select's
+                # event handlers actually listen for.
+                await control_locator.first.evaluate(
+                    r"""(el) => {
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, button: 0}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, button: 0}));
+                        el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, button: 0}));
+                    }"""
+                )
+                trigger_clicked_via = "dispatched_mousedown_select_control"
+        else:
+            # No .select__control ancestor — click the input directly.
+            await locator.click(timeout=2000)
+            trigger_clicked_via = "locator_click_no_control"
+    except Exception as exc:
+        try:
+            await locator.click(timeout=2000)
+            trigger_clicked_via = "locator_click_fallback"
+        except Exception:
+            return (False, f"click_failed:{str(exc)[:60]}")
+
+    # ─── Step 2: wait for listbox/options to render ──────────────────
+    # react-select's menu animation is ~200-400ms. Wider wait + multi-
+    # selector probe so we don't miss vendor-specific class names.
+    listbox_selectors = (
+        '.select__option',                         # Greenhouse / Anthropic
+        '[role="listbox"] [role="option"]',        # Lever / generic ARIA
+        '[role="option"]',                         # bare role
+        '.select__menu [role="option"]',           # explicit react-select scope
+        '.styles_menu__option__*',                 # Workable
+        'ul[role="listbox"] li',                   # SmartRecruiters
+        'li[role="option"]',                       # Ashby
+    )
+    listbox_open = False
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=2500, state="visible")
+            listbox_open = True
+            break
+        except Exception:
+            continue
+
+    # If the click didn't open the menu, try the toggle-flyout button
+    # (the chevron `<button aria-label="Toggle flyout">` next to the
+    # input on Anthropic / Greenhouse). Some react-selects only listen
+    # to the chevron click event.
+    if not listbox_open:
+        try:
+            toggle = locator.locator(
+                'xpath=ancestor::*[contains(@class,"select__control") '
+                'or contains(@class,"select-shell")][1]'
+                '//button[@aria-label="Toggle flyout" or '
+                '@aria-label="Open menu" or contains(@class,"select__indicator")]'
+            ).first
+            if await toggle.count() > 0:
+                await toggle.click(timeout=2000)
+                for sel in listbox_selectors:
+                    try:
+                        await page.wait_for_selector(sel, timeout=2000, state="visible")
+                        listbox_open = True
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # ─── Step 3: click the option whose text matches ─────────────────
+    needle = str(option_text).strip().lower()
+    if listbox_open:
+        for sel in listbox_selectors:
+            try:
+                opts = page.locator(sel)
+                count = await opts.count()
+                # Two passes: exact match first, then substring. Avoids
+                # picking "Yes, with sponsorship" when intended is "No".
+                exact_matches = []
+                substring_matches = []
+                for i in range(min(count, 30)):
+                    opt = opts.nth(i)
+                    text = (await opt.text_content(timeout=500) or "").strip().lower()
+                    if not text:
+                        continue
+                    if text == needle:
+                        exact_matches.append(opt)
+                    elif needle in text or text in needle:
+                        substring_matches.append(opt)
+                if exact_matches:
+                    await exact_matches[0].click(timeout=2000)
+                    return (True, f"exact_match:{sel}:{trigger_clicked_via}")
+                if substring_matches:
+                    await substring_matches[0].click(timeout=2000)
+                    return (True, f"substring_match:{sel}:{trigger_clicked_via}")
+            except Exception:
+                continue
+
+    # ─── Step 4: type-to-filter fallback ─────────────────────────────
+    # Some autocompletes (city pickers) only show options after typing.
+    # Keep this as a fallback; typing into already-open Greenhouse
+    # selects also works for option lists with > 5 items.
+    try:
+        await locator.click(timeout=1500)
+    except Exception:
+        pass
+    try:
+        await locator.fill("", timeout=1000)
+    except Exception:
+        pass
+    try:
+        await locator.press_sequentially(str(option_text), delay=20, timeout=3000)
+    except Exception:
+        pass
+    # Re-wait + re-click after typing.
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=1500, state="visible")
+            break
+        except Exception:
+            continue
+    for sel in listbox_selectors:
+        try:
+            opts = page.locator(sel)
+            count = await opts.count()
+            for i in range(min(count, 20)):
+                opt = opts.nth(i)
+                text = (await opt.text_content(timeout=500) or "").strip().lower()
+                if not text:
+                    continue
+                if text == needle or needle in text or text in needle:
+                    await opt.click(timeout=2000)
+                    return (True, f"picked_after_type:{sel}")
+        except Exception:
+            continue
+
+    # ─── Step 5: Enter-commit fallback ───────────────────────────────
+    try:
+        await locator.press("Enter", timeout=1000)
+        return (True, "enter_commit")
+    except Exception:
+        pass
+    return (False, "no_option_matched")
+
+
+async def _enumerate_combobox_options(page, locator) -> list[str]:
+    """Open a combobox listbox, read every visible option's text,
+    close via Escape. Used by the post-verify option-aware override
+    to compare `observed` against the live option universe (catches
+    Anthropic-style display quirks where a Country combobox renders
+    just '+90' for an option whose actual text is '+90 Turkey'.)
+    """
+    try:
+        control = locator.locator(
+            'xpath=ancestor::div[contains(@class,"select__control")][1]'
+        )
+        if await control.count() > 0:
+            try:
+                await control.first.click(timeout=1500)
+            except Exception:
+                pass
+        else:
+            try:
+                await locator.click(timeout=1500)
+            except Exception:
+                return []
+    except Exception:
+        return []
+
+    listbox_selectors = (
+        '.select__option',
+        '[role="listbox"] [role="option"]',
+        '[role="option"]',
+        'li[role="option"]',
+    )
+    options: list[str] = []
+    seen: set = set()
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=1500, state="visible")
+            opts = page.locator(sel)
+            count = await opts.count()
+            for i in range(min(count, 100)):
+                try:
+                    txt = (await opts.nth(i).text_content(timeout=300) or "").strip()
+                except Exception:
+                    continue
+                if txt and txt not in seen:
+                    seen.add(txt)
+                    options.append(txt)
+            break
+        except Exception:
+            continue
+
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return options
+
+
 async def _locate(page, field) -> tuple[Any, str]:
     """Tier 1 + 2. Returns (locator, method) or (None, "none")."""
     name = (field.name or "").strip()
@@ -294,7 +686,7 @@ async def _custom_select_pick(page, locator, option_text: str) -> tuple[bool, st
 
 
 async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldOutcome, str]:
-    """Tiers 1-3."""
+    """Tiers 0-3."""
     field = plan.field
     value = plan.value
     field_type = field.field_type
@@ -309,7 +701,43 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
     except Exception:
         pass
 
+    # ─── Tier 0: combobox / autocomplete predicate ────────────────────────
+    # Runs BEFORE the type-specific tiers below. When ARIA signals say
+    # "this is a combobox," skip the text-fill path entirely and go
+    # straight to type-then-pick. This is the discriminator we were
+    # missing — fixes the Lever country picker / Greenhouse location
+    # autocomplete cases without any LLM call.
+    #
+    # Crucially: when combobox_pick FAILS (selector miss on the option
+    # listbox; vendor uses class names we don't hardcode — Greenhouse
+    # `.select__option`, Workable `.styles_menu_option_*`, etc.), we
+    # return a non-"ok" outcome to escalate to the Tier-4 LLM picker
+    # rather than falling through to plain text-fill. The LLM sees the
+    # freshly-rendered DOM (listbox is open after typing) and picks the
+    # matching option by visible text — no hardcoded class names
+    # needed. Without this escalation, the typed text stays in the
+    # input, .fill() returns "ok", and the bad fill is invisible to
+    # every downstream tier.
+    if _is_autocomplete_field(field) and field_type in (
+        "text", "select", "url", "email", "tel"
+    ):
+        ok, detail = await _combobox_pick(page, locator, str(value))
+        if ok:
+            return ("ok", f"combobox_pick:{detail}")
+        return ("select_error", f"combobox_pick_failed:{detail}")
+
     if field_type == "file":
+        # Stamp the filename onto `plan.observed_value` BEFORE we try
+        # the upload — the post-fill probe reads `el.files.length` which
+        # Greenhouse/Workable widgets reset to 0 after their async
+        # upload-to-CDN handshake. Without this stamp, the probe sees
+        # an empty file list and the verifier flags drift even though
+        # set_input_files reported success and the form has the file.
+        try:
+            from os.path import basename as _basename
+            plan.observed_value = _basename(str(value))
+        except Exception:
+            pass
         try:
             await locator.set_input_files(value, timeout=3000)
             return ("ok", "set_input_files")
@@ -330,6 +758,12 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
                         return ("ok", "set_input_files:sibling_recovery")
                 except Exception:
                     pass
+            # Upload genuinely failed — clear the optimistic stamp so
+            # downstream sees the real empty state.
+            try:
+                plan.observed_value = ""
+            except Exception:
+                pass
             return ("file_error", err[:90])
 
     if field_type == "select":
@@ -396,10 +830,16 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
             await locator.click(timeout=2000)
             await locator.press_sequentially(str(value), delay=20, timeout=5000)
             return ("ok", f"press_sequentially:{str(value)[:40]}")
-        except Exception as exc:
-            # Surface the original .fill() failure — that's the more
-            # informative error when triaging.
-            return ("fill_error", str(fill_exc)[:90])
+        except Exception:
+            pass
+        # Step 4: native-setter fallback — last-resort for React/Vue
+        # controlled inputs that swallow Playwright's fill/type entirely.
+        # `Object.getOwnPropertyDescriptor(...).set.call(el, v)` writes
+        # directly to the DOM property and dispatches input/change so the
+        # framework's onChange listener fires.
+        if await _native_setter_dispatch(locator, str(value)):
+            return ("ok", f"native_setter:{str(value)[:40]}")
+        return ("fill_error", str(fill_exc)[:90])
 
 
 # ─── Tier 4 — LLM picker ──────────────────────────────────────────────────────
@@ -521,6 +961,619 @@ async def _llm_pick_and_act(page, plan: FormFieldFillPlan, llm) -> tuple[FillFie
         return ("llm_exec_error", f"{sp.action}:{str(exc)[:60]}")
 
 
+# ─── Tier 5 — post-fill state verification + drift correction ─────────────────
+#
+# The deterministic tiers (1-3) and the LLM picker (Tier 4) only check
+# "did Playwright's action throw?" — not "is the form's React state
+# coherent with what we intended?". Two real failure modes that mode
+# can't catch:
+#
+#   * Combobox-with-search treated as text input. Tier 1 finds the
+#     visible <input> backing a custom dropdown and runs .fill("USA").
+#     The input's value is "USA", we declare success, but no option is
+#     selected in the React state — submit time treats the field as
+#     empty.
+#
+#   * .fill() that silently no-ops (read-only inputs, validation hooks
+#     that revert, disabled inputs that look enabled).
+#
+# Phase 1 (deterministic state probe) reads the post-fill DOM state
+# per field via a single page.evaluate. Phase 2 (LLM corrector) only
+# runs on observed mismatches and gets ONLY that field's container
+# (not the whole form, not the page) — bounded by `_MAX_CONTAINER_HTML_CHARS`.
+
+_PROBE_JS = r"""
+(args) => {
+  const { selector, fieldType } = args;
+  const el = document.querySelector(selector);
+  if (!el) return { found: false, observed: '', notes: 'no_element' };
+
+  const t = (s) => (s == null ? '' : String(s).trim());
+
+  if (fieldType === 'select') {
+    if (el.tagName === 'SELECT') {
+      const opt = el.options[el.selectedIndex];
+      return {
+        found: true,
+        observed: t(opt && (opt.label || opt.text || opt.value)),
+        notes: 'native_select',
+      };
+    }
+    // Custom widget: walk up to the nearest container that has labelled
+    // selected state, then read either an aria-selected descendant's text
+    // or the trigger's visible value.
+    const container = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
+    if (container) {
+      const sel = container.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
+      if (sel) return { found: true, observed: t(sel.textContent), notes: 'aria_selected' };
+    }
+    return { found: true, observed: t(el.value || el.textContent), notes: 'fallback_text' };
+  }
+
+  if (fieldType === 'checkbox') {
+    return { found: true, observed: el.checked ? 'true' : 'false', notes: 'checked' };
+  }
+
+  if (fieldType === 'radio') {
+    // Walk siblings in the same name-group and return the checked one's value.
+    const name = el.getAttribute('name');
+    if (name) {
+      const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
+      for (const r of group) {
+        if (r.checked) return { found: true, observed: t(r.value || r.id), notes: 'group_checked' };
+      }
+      return { found: true, observed: '', notes: 'group_no_check' };
+    }
+    return { found: true, observed: el.checked ? 'true' : 'false', notes: 'lone_radio' };
+  }
+
+  if (fieldType === 'file') {
+    return {
+      found: true,
+      observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '',
+      notes: 'file_count',
+    };
+  }
+
+  // text-like (text/email/tel/url/number/date/textarea)
+  return { found: true, observed: t(el.value), notes: 'value' };
+}
+"""
+
+
+async def _probe_field_state(
+    page,
+    plan: FormFieldFillPlan,
+    locator,
+) -> str:
+    """Read the post-fill DOM state of `plan.field` and return the
+    observed value. Side-effect: writes any form-validation error
+    discovered (aria-invalid / sibling error text) onto
+    `plan.validation_error` so the verifier + corrector can use it
+    without changing the function signature.
+
+    The sane/insane verdict is delegated to the LLM batch verifier
+    (`_llm_verify_batch`). This function ONLY reads state. The
+    previous deterministic comparison was prone to false-positives
+    (combobox typed without option-pick still has the typed string in
+    `el.value`) and false-negatives (autocomplete rewrites).
+
+    Best-effort — when the probe can't read state (element detached,
+    JS error), returns "".
+    """
+    field_type = plan.field.field_type
+    try:
+        result = await locator.evaluate(
+            r"""(el, args) => {
+                const { fieldType } = args;
+                const t = (s) => (s == null ? '' : String(s).trim());
+
+                // ── Form-validation read: aria-invalid + nearest error sibling. ──
+                // ATSes mark validation errors in different ways:
+                //   - aria-invalid="true" on the input (Greenhouse, Workable)
+                //   - <span class="field-error"> sibling (Lever, SmartRecruiters)
+                //   - <div class="error"> in the closest form-row container
+                //   - [role="alert"] descendant
+                // Walk up to the field's container, then look for ANY of these
+                // shapes. Return empty string when no error is visible.
+                let validation_error = '';
+                const ariaInvalid = (el.getAttribute('aria-invalid') || '').toLowerCase();
+                if (ariaInvalid === 'true') validation_error = 'aria-invalid';
+                const container = el.closest(
+                    '.form-field, .field, .form-row, [data-qa-field], .application-question, fieldset, label'
+                ) || el.parentElement;
+                if (container) {
+                    const errSel = container.querySelector(
+                        '.field-error, .form-error, .error-message, [class*="error" i]:not(input):not(select):not(textarea):not(label), [role="alert"]'
+                    );
+                    if (errSel) {
+                        const txt = t(errSel.textContent);
+                        // Filter out generic "error" placeholders that aren't real
+                        // user-facing messages (some forms always render the slot).
+                        if (txt && txt.length > 0 && txt.length < 300) {
+                            validation_error = txt;
+                        }
+                    }
+                }
+
+                // ── Combobox-shaped text input (Anthropic / Greenhouse react-select) ──
+                // The input's `value` attribute is the SEARCH input's text — empty
+                // after a successful pick. The picked value lives in a SIBLING
+                // `.select__single-value` (single-select) or `.select__multi-value`
+                // (multi-select), at the .select__value-container or .select__control
+                // level — NOT inside the input itself.
+                //
+                // Crucially: `el.closest()` matches the input ITSELF when we
+                // include `[role="combobox"]` in the selector, because react-select
+                // sets that on the input. We must walk to the WRAPPER (not match
+                // on role=combobox) so the displayed value's sibling is in scope.
+                const isComboboxShape = (
+                    el.getAttribute('role') === 'combobox' ||
+                    ((el.getAttribute('aria-autocomplete') || '').toLowerCase() !== '' &&
+                     (el.getAttribute('aria-autocomplete') || '').toLowerCase() !== 'none')
+                );
+                if (isComboboxShape) {
+                    // Walk to the react-select wrapper. Try in order:
+                    //   1. .select__container — the outermost react-select wrapper
+                    //   2. .select-shell — Greenhouse-specific intermediate
+                    //   3. .select__control — the inner clickable container
+                    //   4. fieldset / .field-wrapper — backup for non-vendor markup
+                    // NEVER match on role=combobox (would return the input itself).
+                    const c = (
+                        el.closest('.select__container') ||
+                        el.closest('.select-shell') ||
+                        el.closest('.select__control') ||
+                        el.closest('.field-wrapper, .field, .form-field, fieldset, .application-question') ||
+                        el.parentElement && el.parentElement.parentElement
+                    );
+                    if (c) {
+                        // .select__single-value is the standard react-select displayed
+                        // value AFTER an option pick. Lives at .select__value-container
+                        // level, sibling of .select__placeholder / .select__input-container.
+                        const single = c.querySelector('.select__single-value');
+                        if (single) {
+                            const txt = t(single.textContent);
+                            if (txt) return { observed: txt, notes: 'combobox_single_value', validation_error };
+                        }
+                        // Multi-select picks land in .select__multi-value chips.
+                        const multi = c.querySelectorAll('.select__multi-value, .select__multi-value__label');
+                        if (multi.length > 0) {
+                            const labels = Array.from(multi).map(n => t(n.textContent)).filter(Boolean);
+                            if (labels.length > 0) return { observed: labels.join(', '), notes: 'combobox_multi_value', validation_error };
+                        }
+                        // ARIA-only fallback (some custom widgets don't use the
+                        // react-select class names).
+                        const ariaSel = c.querySelector('[aria-selected="true"], [data-selected="true"]');
+                        if (ariaSel) return { observed: t(ariaSel.textContent), notes: 'aria_selected_combobox', validation_error };
+                    }
+                    // Pure-pick combobox with no displayed value yet → treat as empty.
+                    return { observed: '', notes: 'combobox_empty', validation_error };
+                }
+
+                if (fieldType === 'select') {
+                    if (el.tagName === 'SELECT') {
+                        const opt = el.options[el.selectedIndex];
+                        return { observed: t(opt && (opt.label || opt.text || opt.value)), notes: 'native_select', validation_error };
+                    }
+                    const c = el.closest('[role="combobox"], [role="listbox"], .select__container, .select-shell') || el.parentElement;
+                    if (c) {
+                        const sel = c.querySelector('[aria-selected="true"], [data-selected="true"], .select__single-value, .select__multi-value');
+                        if (sel) return { observed: t(sel.textContent), notes: 'aria_selected', validation_error };
+                    }
+                    return { observed: t(el.value || el.textContent), notes: 'fallback_text', validation_error };
+                }
+                if (fieldType === 'checkbox') return { observed: el.checked ? 'true' : 'false', notes: 'checked', validation_error };
+                if (fieldType === 'radio') {
+                    const name = el.getAttribute('name');
+                    if (name) {
+                        const group = document.querySelectorAll(`input[type="radio"][name="${CSS.escape(name)}"]`);
+                        for (const r of group) {
+                            if (r.checked) return { observed: t(r.value || r.id), notes: 'group_checked', validation_error };
+                        }
+                        return { observed: '', notes: 'group_no_check', validation_error };
+                    }
+                    return { observed: el.checked ? 'true' : 'false', notes: 'lone_radio', validation_error };
+                }
+                if (fieldType === 'file') {
+                    // Greenhouse-style: the resolved locator can be a custom
+                    // <button> ("Attach a file"), not the hidden <input type=file>.
+                    // `el.files` only exists on <input type=file>. Walk up to the
+                    // field container and find ANY hidden file input — that's
+                    // where set_input_files actually attached the file.
+                    if (el.tagName === 'INPUT' && el.type === 'file') {
+                        return {
+                            observed: el.files && el.files.length > 0 ? `${el.files.length}_files` : '',
+                            notes: 'file_count_direct',
+                            validation_error,
+                        };
+                    }
+                    const container = el.closest(
+                        '.field-wrapper, .form-field, .field, .application-question, fieldset, label'
+                    ) || el.parentElement;
+                    if (container) {
+                        const fileIn = container.querySelector('input[type="file"]');
+                        if (fileIn && fileIn.files && fileIn.files.length > 0) {
+                            return { observed: `${fileIn.files.length}_files`, notes: 'file_count_walked', validation_error };
+                        }
+                    }
+                    // Last resort: scan the whole document for any populated
+                    // file input (only ONE file input typically gets populated
+                    // per session for a single Resume/CV upload field).
+                    const anyFile = document.querySelector('input[type="file"]');
+                    if (anyFile && anyFile.files && anyFile.files.length > 0) {
+                        return { observed: `${anyFile.files.length}_files`, notes: 'file_count_doc', validation_error };
+                    }
+                    return { observed: '', notes: 'file_count_empty', validation_error };
+                }
+                return { observed: t(el.value), notes: 'value', validation_error };
+            }""",
+            {"fieldType": field_type},
+        )
+    except Exception as exc:
+        logger.debug("_probe_field_state: probe failed for %s — %s", plan.field.label[:30], exc)
+        plan.validation_error = ""
+        return ""
+
+    payload = result or {}
+    plan.validation_error = (payload.get("validation_error") or "").strip()
+    return (payload.get("observed") or "")
+
+
+# ─── Phase 2: LLM batch sanity check ─────────────────────────────────────────
+
+
+_BATCH_VERIFY_SYSTEM = """You are verifying that an auto-filler set the right value in each field of a job application form.
+
+For each row you receive, decide whether the `observed` value is a SENSIBLE answer to the question described by `label` (and the original `intended` value we tried to set).
+
+How `observed` is read by the probe:
+- For combobox/select fields, `observed` is read from the rendered picked-value element (`.select__single-value`, `<option selected>`, etc.) — it's the option the user effectively SELECTED, not raw input text. If the user typed something but didn't pick an option, observed is empty (the picked-value element isn't set).
+- For radio groups, observed is the selected member's value.
+- For checkboxes, "true"/"false".
+- For files, observed is the filename or "N_files" when the upload landed.
+- For text/textarea, observed is `el.value`.
+
+Rules:
+- If `validation_error` on a row is non-empty, the form has REJECTED the fill — drift regardless of value match. Use the error text to choose `suggested_value` (e.g. error "Phone must be 10 digits" + intended "+90 555 555 5555" → suggested "5555555555").
+- Combobox / select: when `observed` matches `intended` exactly (case-insensitive), the option pick SUCCEEDED — return sane. Do NOT flag this as "typed without picking"; the probe reads from the picked-value element, equality means selection landed.
+- Combobox / select display quirks: a Country combobox may render the option's phone code prefix (e.g. observed="+90" for option "+90 Turkey" when intended was "Turkey") — if observed could plausibly be a substring of a real option matching the user's intent, treat as sane. The fill chose an option; only the visible decoration differs.
+- Treat semantic mismatch as drift. Example: label="Are you open to relocation?", intended="Yes", observed="Ankara, Turkey" → drift, because a city name isn't a yes/no answer.
+- Treat autocomplete text-input decoration as match. Example: label="City", intended="san fr", observed="San Francisco, CA" → sane.
+- An empty `observed` while `intended` is non-empty → drift, EXCEPT for files: if the intended payload was a file path and the system fills via set_input_files, the upload may complete async and the probe can read empty even when the file landed. Treat empty observed for `field_type="file"` with a non-empty intended as SANE — the auto-filler reports file outcomes separately and a false drift here just creates wasted correction calls.
+- For yes/no labels, accept "Yes"/"No" or any synonym ("True"/"False", "Authorized"/"Not authorized") that matches intent.
+
+When drift is detected, suggest the value the form likely expects in `suggested_value` (when obvious from context). Otherwise leave it empty.
+
+Return one verdict per row, in the same order as the input."""
+
+
+class _FieldVerdict(BaseModel):
+    """One row of `_BatchVerifyResult`. Indexed by `idx` so the caller
+    can match each verdict back to its FormFieldFillPlan."""
+    idx: int = Field(..., description="Index into the input list (matches the row sent)")
+    sane: bool = Field(..., description="True when observed is a sensible answer for label")
+    reason: str = Field(default="", description="Short explanation, ≤200 chars")
+    suggested_value: str = Field(
+        default="",
+        description="When sane=False AND a better value is obvious from the label, suggest it. Empty otherwise.",
+    )
+
+
+class _BatchVerifyResult(BaseModel):
+    verdicts: List[_FieldVerdict] = Field(default_factory=list)
+
+
+async def _llm_verify_batch(
+    plan: List[FormFieldFillPlan],
+    llm,
+) -> Dict[int, _FieldVerdict]:
+    """Single LLM call to sanity-check every filled field's observed
+    value against its label + intended value.
+
+    Returns a dict mapping plan-index → verdict. Fields whose status
+    isn't 'filled' or whose observed_value matches intended trivially
+    are short-circuited and not sent to the LLM (still returned with
+    sane=True).
+
+    Bounded cost: 1 LLM call per session regardless of field count.
+    Returns `{}` (no verdicts) when llm is None — caller treats every
+    field as sane in that case (preserves the no-LLM heuristic path).
+    """
+    if llm is None:
+        return {}
+
+    from langchain_core.messages import HumanMessage, SystemMessage  # lazy
+
+    items: List[Dict[str, Any]] = []
+    trivial_sane: Dict[int, _FieldVerdict] = {}
+    trivial_drift: Dict[int, _FieldVerdict] = {}
+    for i, p in enumerate(plan):
+        if p.status != "filled":
+            continue
+        intended = (p.value or "").strip()
+        observed = (p.observed_value or "").strip()
+
+        # Form-validation error trap: ALWAYS drift, regardless of value
+        # match. The form told us it rejected the fill (aria-invalid /
+        # sibling error message); the corrector needs the error text
+        # to know how to fix it.
+        validation_error = (getattr(p, "validation_error", "") or "").strip()
+        if validation_error:
+            trivial_drift[i] = _FieldVerdict(
+                idx=i, sane=False,
+                reason=f"validation_error:{validation_error[:120]}",
+                suggested_value="",
+            )
+            continue
+
+        # Empty intended is always trivially sane — nothing was supposed
+        # to be set, observed is irrelevant.
+        if not intended:
+            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="empty_intended")
+            continue
+
+        # NOTE on combobox `intended == observed`: the post-fill probe
+        # reads from `.select__single-value` for combobox-shape fields,
+        # which is the rendered picked-value element. If observed
+        # matches intended exactly, the option pick succeeded — that's
+        # SUCCESS, not "typed without picking". (When the user types
+        # but doesn't pick, the probe returns "" because
+        # .select__single-value isn't set.) The previous deterministic
+        # trap that flagged equality-as-drift was stale post-probe-
+        # rewrite and false-flagged every successful Yes/No pick.
+
+        # When intended doesn't match observed at all, send to LLM —
+        # could be drift (combobox echo, wrong sibling) or could be
+        # benign (autocomplete decoration like "United States — primary",
+        # form normalisation like phone "+90 555 555 5555" → "+90 555
+        # 555 55 55"). LLM decides.
+        if _normalise_for_compare(intended) != _normalise_for_compare(observed):
+            items.append({
+                "idx": i,
+                "label": p.field.label,
+                "field_type": p.field.field_type,
+                "name": p.field.name or "",
+                "options": list(p.field.options or [])[:8],
+                "aria_autocomplete": getattr(p.field, "aria_autocomplete", "") or "",
+                "role": getattr(p.field, "role", "") or "",
+                "intended": intended,
+                "observed": observed,
+                "validation_error": validation_error,
+            })
+            continue
+
+        # Exact match. For VANILLA inputs (no ARIA / role decoration,
+        # plain field_type=text/email/tel/url/number/textarea), trust
+        # the match — short-circuit. For everything else (custom roles,
+        # aria-decorated, indexed names like urls[X], file inputs, radio
+        # groups), force LLM verification because exact-string-match can
+        # still be semantically wrong:
+        #   - urls[LinkedIn] vs urls[GitHub]: both accept the same string
+        #     so we typed "https://linkedin.com/in/x" into either, then
+        #     read back the same string — exact match, but if we hit
+        #     urls[GitHub] the LinkedIn URL is now in the wrong field.
+        #   - hidden file input behind a custom <button>: set_input_files
+        #     reports success on the hidden input but the visible widget
+        #     may show a different state.
+        #   - any field with `role` set: by definition not a vanilla
+        #     control; the framework owns its semantics, deterministic
+        #     match is unreliable.
+        ftype = p.field.field_type
+        is_vanilla_text = ftype in ("text", "email", "tel", "url", "number", "textarea", "date")
+        has_aria_decoration = bool(
+            (getattr(p.field, "role", "") or "").strip()
+            or (getattr(p.field, "aria_autocomplete", "") or "").strip()
+            or (getattr(p.field, "aria_haspopup", "") or "").strip()
+            or (getattr(p.field, "aria_controls", "") or "").strip()
+            or (getattr(p.field, "list_id", "") or "").strip()
+        )
+        # Indexed-name pattern (urls[LinkedIn], candidate[first_name],
+        # etc.) → groups of similar inputs where exact-match alone
+        # doesn't prove we hit the right index.
+        name = (p.field.name or "")
+        is_indexed_group = "[" in name and "]" in name
+
+        if is_vanilla_text and not has_aria_decoration and not is_indexed_group:
+            trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="vanilla_exact_match")
+            continue
+
+        # Non-vanilla exact match → still send to LLM. Cheap (one row per
+        # ambiguous field on top of a single batched call) but covers
+        # the wrong-input-but-same-value case.
+        items.append({
+            "idx": i,
+            "label": p.field.label,
+            "field_type": p.field.field_type,
+            "name": p.field.name or "",
+            "options": list(p.field.options or [])[:8],
+            "aria_autocomplete": getattr(p.field, "aria_autocomplete", "") or "",
+            "role": getattr(p.field, "role", "") or "",
+            "intended": intended,
+            "observed": observed,
+        })
+
+    if not items:
+        # Even with no LLM-bound items, the deterministic combobox drift
+        # traps still apply.
+        return {**trivial_sane, **trivial_drift}
+
+    structured = llm.with_structured_output(_BatchVerifyResult)
+    try:
+        result: _BatchVerifyResult = structured.invoke([
+            SystemMessage(content=_BATCH_VERIFY_SYSTEM),
+            HumanMessage(content=f"Verify these filled fields. Return one verdict per row.\n\n{items}"),
+        ])
+    except Exception as exc:
+        logger.warning("_llm_verify_batch: LLM call failed — treating all non-trapped as sane (%s)", exc)
+        return {**trivial_sane, **trivial_drift}
+
+    out = {**trivial_sane, **trivial_drift}
+    for v in result.verdicts:
+        out[v.idx] = v
+    return out
+
+
+# ─── Drift corrector — Phase 2 (LLM, on-demand, container-scoped) ─────────────
+
+_DRIFT_CORRECTOR_SYSTEM = """You are a Playwright drift corrector for a form field that was filled but whose DOM state diverged from the intended value, OR whose form-validation rejected the fill.
+
+You will receive:
+  - the field's label and type
+  - role + aria_autocomplete (combobox indicators)
+  - the value we intended to set
+  - the value the DOM is currently showing
+  - validation_error: form-validation message captured from the DOM
+    (aria-invalid="true" OR error-text in a sibling). When non-empty,
+    the form has REJECTED the fill — propose a corrective action that
+    addresses the error (e.g. "Phone must be 10 digits" → reformat the
+    value; "This field is required" → re-attempt the fill; "Invalid
+    email" → check format).
+  - the field's CONTAINER HTML (the element wrapping label + control —
+    typically a fieldset, [role=group], .form-row, or label). This is
+    NOT the whole form. Reason about it as a self-contained widget.
+
+Common drift patterns and the fix shape:
+
+  1. Combobox-with-search where we typed text into the input but no
+     option is selected. Fix: action="click_then_pick_option" with
+     selector targeting the trigger / input, option_text=intended.
+
+  2. Yes/No collected as free text and stuffed into a radio group.
+     Fix: action="click" with selector input[name=GROUP][value=VALUE],
+     where VALUE is the option matching intended.
+
+  3. Hidden native <select> covered by a custom widget. Fix: target the
+     visible custom trigger with action="click_then_pick_option".
+
+  4. Checkbox that needs .check() not .click() (toggle race). Fix:
+     action="check" on the input itself.
+
+Selector rules:
+- MUST resolve to exactly one element on the page.
+- NEVER target submit / apply / send buttons.
+- Prefer #id over [name=...] over text-based locators.
+- If you can't propose a high-confidence fix, return an empty selector.
+
+Return a single SelectorPlan."""
+
+
+async def _container_html_for_field(locator) -> str:
+    """Return the smallest meaningful container around the field (label +
+    control + sibling options). Capped at `_MAX_CONTAINER_HTML_CHARS` so
+    a single drift correction call can never receive a whole form's
+    worth of HTML."""
+    try:
+        html = await locator.evaluate(
+            r"""(el) => {
+                const container = el.closest('[role="group"], fieldset, .form-row, .form-field, label, [data-qa-field], .field-container, .application-question') || el.parentElement;
+                return (container || el).outerHTML || '';
+            }"""
+        )
+    except Exception:
+        return ""
+    return (html or "")[:_MAX_CONTAINER_HTML_CHARS]
+
+
+async def _correct_field_drift(
+    page,
+    plan: FormFieldFillPlan,
+    locator,
+    llm,
+) -> tuple[FillFieldOutcome, str]:
+    """Single iteration of the drift correction loop. The outer loop
+    (`fill_form_async`) handles per-field and per-session caps."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    container_html = await _container_html_for_field(locator)
+    if not container_html:
+        return ("llm_skipped", "no_container_html")
+
+    field = plan.field
+    field_summary = (
+        f"label={field.label!r}\n"
+        f"field_type={field.field_type!r}\n"
+        f"name_or_id_extracted={field.name!r}\n"
+        f"role={getattr(field, 'role', '')!r}\n"
+        f"aria_autocomplete={getattr(field, 'aria_autocomplete', '')!r}\n"
+        f"options={field.options[:8]}\n"
+        f"intended_value={plan.value!r}\n"
+        f"observed_value={plan.observed_value!r}\n"
+        f"validation_error={getattr(plan, 'validation_error', '')!r}\n"
+    )
+
+    structured = llm.with_structured_output(_SelectorPlan)
+    try:
+        sp: _SelectorPlan = structured.invoke([
+            SystemMessage(content=_DRIFT_CORRECTOR_SYSTEM),
+            HumanMessage(content=f"Field state:\n{field_summary}\nContainer HTML:\n{container_html}"),
+        ])
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_call:{type(exc).__name__}:{str(exc)[:60]}")
+
+    if not (sp.selector or "").strip():
+        return ("llm_skipped", "corrector_no_proposal")
+
+    # Reuse the existing Tier-4 validation + execution path. The submit-
+    # button denylist + selector uniqueness check live there — we want
+    # the same guardrails for corrections.
+    try:
+        loc = page.locator(sp.selector)
+        count = await loc.count()
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_locator:{str(exc)[:60]}")
+    if count == 0:
+        return ("no_locator", "corrector_no_match")
+    if count > 1:
+        return ("no_locator", f"corrector_ambiguous:{count}")
+    target = loc.first
+
+    try:
+        text = await target.text_content(timeout=1000) or ""
+        type_attr = await target.get_attribute("type") or ""
+    except Exception:
+        text, type_attr = "", ""
+    if _is_submit_target_text(text, type_attr):
+        return ("llm_refused_submit", f"corrector_submit:text={text[:40]!r}")
+
+    try:
+        await target.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+
+    try:
+        if sp.action == "click":
+            await target.click(timeout=3000)
+        elif sp.action == "fill":
+            await target.fill(str(plan.value), timeout=3000)
+        elif sp.action == "check":
+            await target.check(timeout=3000)
+        elif sp.action == "set_input_files":
+            await target.set_input_files(plan.value, timeout=3000)
+        elif sp.action == "select_option":
+            try:
+                await target.select_option(label=str(plan.value), timeout=2000)
+            except Exception:
+                await target.select_option(value=str(plan.value), timeout=2000)
+        elif sp.action == "click_then_pick_option":
+            # Use _combobox_pick (not _custom_select_pick) — the latter
+            # falls back to JS-style `locator.click()` which doesn't
+            # fire the mousedown event react-select listens for. The
+            # corrector hits this path on every drift correction
+            # attempt for Anthropic Greenhouse comboboxes; without the
+            # right click chain it always reports trigger_click_failed.
+            ok, detail = await _combobox_pick(page, target, sp.option_text or str(plan.value))
+            if not ok:
+                return ("llm_exec_error", f"corrector_pick:{detail}")
+        elif sp.action == "click_label_for_input":
+            await target.click(timeout=3000)
+        else:
+            return ("llm_exec_error", f"corrector_unknown_action:{sp.action}")
+    except Exception as exc:
+        return ("llm_exec_error", f"corrector_exec:{sp.action}:{str(exc)[:60]}")
+
+    return ("ok_corrected", f"{sp.action}:{sp.selector[:50]}")
+
+
 # ─── Public entrypoint ───────────────────────────────────────────────────────
 
 async def fill_form_async(
@@ -528,7 +1581,7 @@ async def fill_form_async(
     plan: List[FormFieldFillPlan],
     *,
     llm: Any = None,
-    headless: bool = True,
+    headless: Optional[bool] = None,
     llm_picker_budget: int = 10,
     nav_timeout_ms: int = 30_000,
     dry_run: bool = True,
@@ -539,7 +1592,12 @@ async def fill_form_async(
         form_url: URL of the application form to fill.
         plan: Fill plan from `compute_form_values`.
         llm: Optional langchain BaseChatModel for Tier 4. None disables Tier 4.
-        headless: Run Chromium headless. Set False for visual debugging.
+        headless: Run Chromium headless. ``None`` (default) reads the
+            ``UPPGRAD_AUTO_FILL_HEADLESS`` env var — falsy values
+            (``0|false|no|off``, case-insensitive) launch a visible
+            browser, suitable for demo recordings or visual debugging.
+            Anything else / unset → headless. Tests / scripts that pass
+            ``True`` or ``False`` explicitly bypass the env var.
         llm_picker_budget: Max Tier 4 calls per session.
         nav_timeout_ms: Page load timeout.
         dry_run: Currently informational; never clicks submit regardless.
@@ -547,6 +1605,28 @@ async def fill_form_async(
     Never clicks submit/apply buttons. Closing the browser at the end is the
     only "side effect" — the form's filled state is discarded.
     """
+    if headless is None:
+        headless = _default_headless()
+        logger.info("fill_form_async: headless resolved from env → %s", headless)
+
+    # Auto-resolve the LLM from the agentic provider factory when the
+    # caller didn't supply one. Without this, Tier 4 LLM picker, Phase 2
+    # batch verifier, and drift corrector all stay silent — and the
+    # deterministic Tier 0-3 + state probe is *known* to be insufficient
+    # for combobox-typed-without-pick / urls[X] disambiguation /
+    # form-validation-error correction. The backend's auto_apply_adapter
+    # currently passes `llm=None`; this fallback is what gives every
+    # call site automatic LLM recovery when OPENAI_API_KEY is set.
+    if llm is None:
+        try:
+            from uppgrad_agentic.common.llm import get_llm
+            llm = get_llm()
+            if llm is not None:
+                logger.info("fill_form_async: resolved LLM via common.llm.get_llm()")
+        except Exception as exc:
+            logger.debug("fill_form_async: get_llm() failed (%s) — staying llm=None", exc)
+            llm = None
+
     from playwright.async_api import async_playwright
 
     result = FormFillResult(
@@ -558,7 +1638,19 @@ async def fill_form_async(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
-            ctx = await browser.new_context(viewport={"width": 1280, "height": 1800})
+            # Headless: keep the tall viewport so off-screen form
+            # sections (Greenhouse lazy-mounts EEOC questions, etc.)
+            # are mounted by the time the walker hits them.
+            # Headed (demo): match a typical screen so the user can
+            # scroll the browser window normally — a 1800px viewport
+            # is taller than most screens, which clips the bottom of
+            # the form behind the OS taskbar and prevents scrolling.
+            viewport = (
+                {"width": 1280, "height": 900}
+                if not headless
+                else {"width": 1280, "height": 1800}
+            )
+            ctx = await browser.new_context(viewport=viewport)
             page = await ctx.new_page()
 
             try:
@@ -572,57 +1664,307 @@ async def fill_form_async(
 
                 result.captcha_detected = await _detect_captcha(page)
 
-                for entry in plan:
+                drift_calls = 0  # LLM correction calls this session
+
+                # ─── Pass 1: fill every field (Tiers 0-4) + read observed
+                # state. The LLM batch verifier (Pass 2) decides sane/insane.
+                # `pending_reports[i]` holds the in-progress report for
+                # plan[i]; we mutate it post-verification.
+                pending_reports: List[Optional[FormFieldFillReport]] = [None] * len(plan)
+                fill_sources: List[str] = ["none"] * len(plan)
+                outcomes: List[str] = ["pending"] * len(plan)
+                # Indices where _combobox_pick clicked a real listbox
+                # option (exact/substring/after_type/exact-after-type).
+                # The form HAS the value selected — verifier should NOT
+                # second-guess these. Pass-2.5 below short-circuits them
+                # to trivially sane regardless of value comparison.
+                combobox_picked: set = set()
+
+                for i, entry in enumerate(plan):
                     label = entry.field.label[:50]
                     ftype = entry.field.field_type
                     if entry.status != "filled":
-                        result.reports.append(FormFieldFillReport(
+                        pending_reports[i] = FormFieldFillReport(
                             label=label, field_type=ftype,
                             outcome="plan_skip", detail=entry.reason,
-                        ))
-                        result.fields_skipped += 1
+                        )
+                        outcomes[i] = "plan_skip"
                         continue
 
                     outcome, detail = await _fill_deterministic(page, entry)
-                    if outcome == "ok":
-                        result.fields_filled_native += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype, outcome="ok", detail=detail,
-                        ))
-                        continue
+                    fill_source = "native"
 
-                    # Failure on Tier 1-3. Try Tier 4 if LLM available + within budget.
-                    if llm is not None and llm_calls < llm_picker_budget:
-                        llm_calls += 1
-                        llm_outcome, llm_detail = await _llm_pick_and_act(page, entry, llm)
-                        if llm_outcome == "ok_llm":
-                            result.fields_filled_llm += 1
-                            result.reports.append(FormFieldFillReport(
-                                label=label, field_type=ftype,
-                                outcome="ok_llm", detail=llm_detail,
-                            ))
+                    # Track confirmed combobox option clicks. `_combobox_pick`
+                    # encodes the click flavour in `detail`:
+                    #   exact_match / substring_match — Step 3, listbox open
+                    #   picked_after_type / picked_after_type_exact — Step 4
+                    # All four mean an actual `.select__option` click landed.
+                    # `enter_commit` (Step 5) is NOT tracked — it presses
+                    # Enter without confirming a click on a listbox row.
+                    if outcome == "ok" and isinstance(detail, str):
+                        if (
+                            detail.startswith("combobox_pick:exact_match:")
+                            or detail.startswith("combobox_pick:substring_match:")
+                            or detail.startswith("combobox_pick:picked_after_type:")
+                            or detail.startswith("combobox_pick:picked_after_type_exact:")
+                        ):
+                            combobox_picked.add(i)
+
+                    if outcome != "ok":
+                        if llm is not None and llm_calls < llm_picker_budget:
+                            llm_calls += 1
+                            llm_outcome, llm_detail = await _llm_pick_and_act(page, entry, llm)
+                            if llm_outcome == "ok_llm":
+                                outcome, detail = "ok_llm", llm_detail
+                                fill_source = "llm"
+                            else:
+                                pending_reports[i] = FormFieldFillReport(
+                                    label=label, field_type=ftype,
+                                    outcome=llm_outcome,
+                                    detail=f"{detail} → {llm_detail}",
+                                )
+                                outcomes[i] = "fail"
+                                continue
+                        else:
+                            pending_reports[i] = FormFieldFillReport(
+                                label=label, field_type=ftype, outcome=outcome, detail=detail,
+                            )
+                            outcomes[i] = "fail"
                             continue
-                        result.fields_failed += 1
-                        result.reports.append(FormFieldFillReport(
-                            label=label, field_type=ftype,
-                            outcome=llm_outcome,
-                            detail=f"{detail} → {llm_detail}",
-                        ))
+
+                    # Read post-fill state. The verdict comes later from
+                    # the LLM batch verifier.
+                    # File fields stamped a filename onto observed_value
+                    # at fill time (Greenhouse-style async uploaders
+                    # reset el.files after POSTing to their CDN, so the
+                    # probe reads 0 files even on a successful upload).
+                    # Don't let the probe clobber the stamped filename
+                    # with an empty read.
+                    locator, _method = await _locate(page, entry.field)
+                    if locator is not None:
+                        try:
+                            await page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        probed = await _probe_field_state(page, entry, locator)
+                        if entry.field.field_type == "file" and not probed:
+                            pass  # keep the stamped filename
+                        else:
+                            entry.observed_value = probed
+
+                    fill_sources[i] = fill_source
+                    outcomes[i] = "filled_pending_verify"
+                    pending_reports[i] = FormFieldFillReport(
+                        label=label, field_type=ftype,
+                        outcome="ok" if fill_source == "native" else "ok_llm",
+                        detail=detail,
+                    )
+
+                # ─── Pass 2: ONE batch LLM verification across all filled
+                # fields. Catches semantic mismatches the deterministic
+                # compare can't (e.g. "Are you open to relocation?" →
+                # "Ankara, Turkey") + autocomplete-rewrite false positives
+                # (e.g. "san fr" → "San Francisco, CA") in the same call.
+                verdicts = await _llm_verify_batch(plan, llm)
+
+                # ─── Pass 2.4: deterministic short-circuit for confirmed
+                # combobox option clicks. `_combobox_pick` exact_match /
+                # substring_match / picked_after_type all clicked a
+                # real `.select__option` from the open listbox — the
+                # form HAS the picked value selected. Override any
+                # drift verdict to sane regardless of how the LLM
+                # interpreted observed (Anthropic Country renders just
+                # "+90" for "+90 Turkey", which the LLM can't
+                # disambiguate without seeing the listbox; this
+                # short-circuit handles it without an extra probe).
+                for i in combobox_picked:
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdicts[i] = _FieldVerdict(
+                        idx=i, sane=True,
+                        reason="combobox_pick_clicked_listbox_option",
+                    )
+
+                # ─── Pass 2.5: option-aware override for combobox display
+                # quirks. Anthropic's Country combobox renders just the
+                # picked option's phone code ('+90') while the actual
+                # option text is '+90 Turkey'. The verifier reasoning
+                # from observed='+90' alone concludes "phone code, not
+                # a country" — false drift. Cheap deterministic fix:
+                # for each drifted combobox-shape field, open the
+                # listbox, read live options, and if observed is a
+                # strict substring of any real option (observed != opt
+                # but observed is contained in opt's text), accept as
+                # sane. We DO NOT override when observed equals an
+                # option exactly — that's a successful pick whose
+                # semantic correctness (e.g. AI Policy: prose intent
+                # vs picked 'No') still needs the verifier.
+                for i, entry in enumerate(plan):
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdict = verdicts.get(i)
+                    if verdict is None or verdict.sane:
+                        continue
+                    if entry.field.field_type not in ("text", "select", "url", "email", "tel"):
+                        continue
+                    if not _is_autocomplete_field(entry.field):
+                        continue
+                    obs_norm = _normalise_for_compare(entry.observed_value)
+                    if not obs_norm or len(obs_norm) > 30:
+                        continue
+                    locator, _method = await _locate(page, entry.field)
+                    if locator is None:
+                        continue
+                    try:
+                        live_opts = await _enumerate_combobox_options(page, locator)
+                    except Exception:
+                        live_opts = []
+                    if not live_opts:
+                        continue
+                    for opt in live_opts:
+                        opt_norm = _normalise_for_compare(opt)
+                        if not opt_norm or opt_norm == obs_norm:
+                            continue
+                        if obs_norm in opt_norm and len(obs_norm) < len(opt_norm):
+                            verdicts[i] = _FieldVerdict(
+                                idx=i, sane=True,
+                                reason=f"observed_is_prefix_of_option:{opt[:60]}",
+                            )
+                            break
+
+                # ─── Pass 3: per-insane-field drift correction. Bounded.
+                for i, entry in enumerate(plan):
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdict = verdicts.get(i)
+                    is_sane = verdict.sane if verdict is not None else True
+                    entry.verified = is_sane
+                    if fill_sources[i] == "native":
+                        result.fields_filled_native += 1
+                    else:
+                        result.fields_filled_llm += 1
+                    if is_sane:
+                        result.fields_verified += 1
                         continue
 
-                    result.fields_failed += 1
-                    result.reports.append(FormFieldFillReport(
-                        label=label, field_type=ftype, outcome=outcome, detail=detail,
-                    ))
+                    # Insane → drift correction, bounded by session budget.
+                    locator, _method = await _locate(page, entry.field)
+                    if locator is None or llm is None:
+                        result.fields_drift_unresolved += 1
+                        rep = pending_reports[i]
+                        if rep is not None:
+                            rep.outcome = "drift_unresolved"
+                            rep.detail = (
+                                f"{rep.detail} → drift "
+                                f"observed={entry.observed_value!r} "
+                                f"reason={(verdict.reason if verdict else 'no_locator_or_llm')!r}"
+                            )
+                        continue
+
+                    correction_succeeded = False
+                    correction_detail = (
+                        f"observed={entry.observed_value!r} "
+                        f"reason={(verdict.reason if verdict else '')!r}"
+                    )
+                    # Use suggested_value as a hint on retry when the LLM
+                    # offered one — overrides the planner's intended value
+                    # for the correction attempt only.
+                    if verdict and verdict.suggested_value:
+                        entry.value = verdict.suggested_value
+
+                    for attempt in range(_MAX_CORRECTIONS_PER_FIELD):
+                        if drift_calls >= _MAX_CORRECTIONS_PER_SESSION:
+                            correction_detail = f"{correction_detail} → session_budget_exhausted"
+                            break
+                        drift_calls += 1
+                        entry.correction_attempts += 1
+                        corr_outcome, corr_detail = await _correct_field_drift(
+                            page, entry, locator, llm,
+                        )
+                        if corr_outcome != "ok_corrected":
+                            correction_detail = f"{correction_detail} → corr#{attempt+1}:{corr_outcome}:{corr_detail}"
+                            continue
+                        try:
+                            await page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        entry.observed_value = await _probe_field_state(page, entry, locator)
+                        # Re-verify ONLY this field with a fresh LLM call —
+                        # cheap (single-row batch).
+                        single = await _llm_verify_batch([entry], llm)
+                        if single.get(0) and single[0].sane:
+                            correction_succeeded = True
+                            correction_detail = f"{corr_detail} (verified after {attempt+1} correction)"
+                            break
+                        correction_detail = f"{correction_detail} → corr#{attempt+1} acted but still insane"
+
+                    rep = pending_reports[i]
+                    if rep is None:
+                        continue
+                    if correction_succeeded:
+                        result.fields_drift_corrected += 1
+                        result.fields_verified += 1
+                        rep.outcome = "ok_corrected"
+                        rep.detail = correction_detail
+                    else:
+                        result.fields_drift_unresolved += 1
+                        rep.outcome = "drift_unresolved"
+                        rep.detail = f"{rep.detail} → drift {correction_detail}"
+
+                # Flush reports + counters.
+                for rep in pending_reports:
+                    if rep is None:
+                        continue
+                    result.reports.append(rep)
+                    if rep.outcome == "plan_skip":
+                        result.fields_skipped += 1
+                    elif rep.outcome in (
+                        "fill_error", "select_error", "checkbox_error",
+                        "radio_error", "file_error", "no_locator",
+                        "llm_skipped", "llm_refused_submit", "llm_exec_error",
+                    ):
+                        result.fields_failed += 1
 
                 result.llm_picker_calls = llm_calls
+                result.drift_correction_calls = drift_calls
                 result.success = (
                     result.fields_filled_native + result.fields_filled_llm > 0
                     and not result.submit_clicked
                 )
             finally:
-                await ctx.close()
-                await browser.close()
+                # Demo / debug mode (headless=False): keep the browser
+                # open after auto-fill so the user can inspect the
+                # filled form, scroll, and verify visually before the
+                # session tears down. Default 5-minute window;
+                # overridable via UPPGRAD_AUTO_FILL_KEEP_OPEN_SECS.
+                # Headless: close immediately as before.
+                if not headless:
+                    try:
+                        keep_open = int(
+                            os.environ.get("UPPGRAD_AUTO_FILL_KEEP_OPEN_SECS", "300")
+                        )
+                    except (TypeError, ValueError):
+                        keep_open = 300
+                    keep_open = max(0, min(keep_open, 1800))  # clamp 0–30 min
+                    if keep_open > 0:
+                        logger.info(
+                            "fill_form_async: keeping browser open for %ds — "
+                            "close it manually or wait for the timeout.",
+                            keep_open,
+                        )
+                        try:
+                            await page.wait_for_timeout(keep_open * 1000)
+                        except Exception:
+                            # Browser closed manually by user — that's fine.
+                            pass
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
     except Exception as exc:
         logger.exception("fill_form_async: top-level error")
         result.error = f"{type(exc).__name__}: {str(exc)[:200]}"

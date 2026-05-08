@@ -83,6 +83,28 @@ class FormField(BaseModel):
             "non-file fields."
         ),
     )
+    # ─── ARIA / combobox-detection signals (Phase 1) ────────────────────────
+    # Captured at extraction time so the filler can recognise comboboxes
+    # and autocomplete-typed fields BEFORE running its tier strategy. Without
+    # these, a `<input type="text" role="combobox" aria-autocomplete="list">`
+    # backing a Lever country picker looks identical to a free-text input —
+    # Tier 1's `.fill()` succeeds, the form's React state never registers
+    # an option, submit treats the field as empty.
+    #
+    # The discriminator predicate (matching browser-use's _is_autocomplete_field):
+    #   role == "combobox"
+    #   OR aria_autocomplete in ("list", "both", "inline")
+    #   OR list_id (i.e. <input list="datalist-id">)
+    #   OR (aria_haspopup not in ("", "false") AND (aria_controls OR aria_owns))
+    role: str = Field(
+        default="",
+        description="Computed CSS role or aria-role attribute. 'combobox' is the canonical signal.",
+    )
+    aria_haspopup: str = Field(default="", description="aria-haspopup attribute value")
+    aria_controls: str = Field(default="", description="aria-controls attribute value")
+    aria_owns: str = Field(default="", description="aria-owns attribute value")
+    aria_autocomplete: str = Field(default="", description="aria-autocomplete attribute value (list/both/inline)")
+    list_id: str = Field(default="", description="`list` attribute (datalist target)")
 
 
 class FormSchema(BaseModel):
@@ -189,11 +211,31 @@ class FormFieldFillPlan(BaseModel):
     status: FormFieldFillStatus = Field(default="filled")
     source: FormFieldFillSource = Field(default="no_value")
     reason: str = Field(default="", description="Short note on why this value was chosen (or why skipped)")
+    # Post-fill state probe results — populated by `_probe_field_state` after
+    # tier 1-4 actions run. `verified` distinguishes "filled and DOM agrees"
+    # from "filled but DOM state diverged" (e.g. text typed into a combobox
+    # with no option selected, or value swallowed by a read-only field).
+    # `observed_value` is the string we read back from the DOM after the fill
+    # action, normalised per field_type (see `_probe_field_state`). When the
+    # probe couldn't read state at all, both stay defaults (verified=False,
+    # observed_value="") and we treat the row as needing correction.
+    verified: bool = Field(default=False, description="True when DOM state matches intended value after fill")
+    observed_value: str = Field(default="", description="Value read back from the DOM after the fill action")
+    # Form-validation error caught from the DOM after fill — `aria-invalid="true"`
+    # on the input, OR error-message text in a sibling/descendant element
+    # (`.error`, `.field-error`, `[role=alert]`, etc.). When present, the field
+    # is considered drifted regardless of value match — the form rejected the
+    # fill and the corrector needs the error message to fix it ("invalid email
+    # format", "phone must be 10 digits", "field is required").
+    validation_error: str = Field(default="", description="Form-validation error text observed after fill (empty when no error)")
+    correction_attempts: int = Field(default=0, description="Number of LLM-driven drift corrections attempted on this field")
 
 
 FillFieldOutcome = Literal[
-    "ok",                  # filled deterministically (Tier 1-3)
-    "ok_llm",              # filled via Tier 4 LLM-picked selector
+    "ok",                  # filled deterministically (Tier 1-3) AND DOM state verified
+    "ok_llm",              # filled via Tier 4 LLM-picked selector AND DOM state verified
+    "ok_corrected",        # filled, DOM drifted, drift-corrector recovered (Tier 5)
+    "drift_unresolved",    # filled but DOM diverged AND correction attempts exhausted
     "plan_skip",           # planner produced status=skipped; nothing attempted
     "no_locator",          # all tiers (incl. LLM) couldn't locate the input
     "fill_error",          # locator found but action failed (timeout, etc.)
@@ -225,6 +267,19 @@ class FormFillResult(BaseModel):
     fields_skipped: int = 0
     fields_failed: int = 0
     llm_picker_calls: int = 0
+    # Post-fill verification counters (Tier 5 — added 2026-05). The
+    # original counters above only count "the action executed without
+    # exception"; these distinguish "the DOM actually reflects the
+    # intended value" from "we set it but observed state diverged".
+    # `fields_verified` ⊆ `fields_filled_native + fields_filled_llm`.
+    # `fields_drift_corrected` is the subset that needed an LLM-driven
+    # correction. `fields_drift_unresolved` is "filled, drifted,
+    # correction couldn't recover" — the user-visible failure mode this
+    # tier was added to surface.
+    fields_verified: int = 0
+    fields_drift_corrected: int = 0
+    fields_drift_unresolved: int = 0
+    drift_correction_calls: int = 0
     captcha_detected: bool = False
     submit_clicked: bool = Field(default=False, description="MUST be False unless explicit submission is authorized in a future feature")
     reports: List[FormFieldFillReport] = Field(default_factory=list)

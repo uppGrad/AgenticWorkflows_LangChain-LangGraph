@@ -1,0 +1,33 @@
+{
+  "label": "wkbl-phoenix",
+  "opp_type": "job",
+  "opp_id": 107732,
+  "expected_ats": "workable",
+  "title": "Business Development Manager - Healthcare",
+  "company_or_provider": "Phoenix Software",
+  "discovery_method": "url_direct",
+  "discovered_form_url": "https://apply.workable.com/j/41ED129B39/apply/",
+  "posting_closed": false,
+  "form_field_count": 3,
+  "form_field_breakdown": {
+    "email": 1,
+    "text": 2
+  },
+  "requirement_breakdown": {
+    "misc": 1
+  },
+  "requirement_labels": [
+    "Profile / identity fields (3)"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {},
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "No tailored documents or answers were produced."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 36.73,
+  "error": ""
+}
