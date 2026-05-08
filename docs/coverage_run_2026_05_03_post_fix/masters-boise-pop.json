@@ -1,0 +1,34 @@
+{
+  "label": "masters-boise-pop",
+  "opp_type": "masters",
+  "opp_id": 71091,
+  "expected_ats": "",
+  "title": "Population and Health Systems Management",
+  "company_or_provider": "Boise State University",
+  "discovery_method": "",
+  "discovered_form_url": "",
+  "posting_closed": false,
+  "form_field_count": 0,
+  "form_field_breakdown": {},
+  "requirement_breakdown": {
+    "document": 2
+  },
+  "requirement_labels": [
+    "CV",
+    "References"
+  ],
+  "eligibility_status": "",
+  "compatibility_warnings": [],
+  "tailored_documents": {
+    "CV": 218,
+    "References": 34
+  },
+  "tailored_answers_count": 0,
+  "evaluation_warnings": [
+    "References: content is short (34 chars, expected \u2265200)."
+  ],
+  "final_status": "ok",
+  "submission_type": "handoff",
+  "duration_seconds": 5.33,
+  "error": ""
+}

@@ -131,11 +131,66 @@ def human_gate_2(state: AutoApplyState) -> dict:
     if not isinstance(feedback, dict):
         feedback = {}
 
+    # ─── Apply user overrides from field_answers ────────────────────────
+    # The frontend sends `field_answers` keyed by form_field_index for
+    # (a) "Quick questions" the user filled in, and (b) edits to
+    # auto-derived misc answers (Yes/No / Country / sponsorship the user
+    # changed before approving). Each entry is either:
+    #   {answer: "<text>"}        — explicit override
+    #   {choice: "skip"}          — drop the answer entirely
+    #   {choice: "ignore_for_now"} — surface as kill-switch (handled at
+    #                                fill-time)
+    # We merge into tailored_answers so downstream (auto-fill +
+    # package_and_handoff) sees a single source of truth.
+    field_answers: Dict[str, Any] = payload.get("field_answers") or {}
+    if not isinstance(field_answers, dict):
+        field_answers = {}
+    answers_updated = dict(tailored_answers)
+    form_fields_state: List[Dict[str, Any]] = list(state.get("form_fields") or [])
+    for raw_idx, fa in field_answers.items():
+        if not isinstance(fa, dict):
+            continue
+        try:
+            ffi = int(raw_idx)
+        except (ValueError, TypeError):
+            continue
+        key = str(ffi)
+        choice = fa.get("choice")
+        if choice == "skip":
+            # User explicitly skipped — drop any auto-derived answer.
+            answers_updated.pop(key, None)
+            continue
+        if choice == "ignore_for_now":
+            # Leave any existing tailored_answer alone; the kill-switch
+            # is observed at fill-time via human_review_2.feedback / the
+            # auto_submit_feasible signal. No tailored_answers mutation.
+            continue
+        ans = fa.get("answer")
+        if ans is None or not isinstance(ans, str):
+            continue
+        question = ""
+        if 0 <= ffi < len(form_fields_state):
+            question = (form_fields_state[ffi].get("label") or "")
+        existing = answers_updated.get(key) or {}
+        answers_updated[key] = {
+            **existing,
+            "content": ans.strip(),
+            "question": existing.get("question") or question,
+            "form_field_index": ffi,
+            "llm_used": False,
+            "source": "user_override",
+        }
+
     return {
         **updates,
         "human_review_2": {
             "approved": approved,
             "attempt_auto_submit": attempt_auto_submit,
             "feedback": feedback,
+            "field_answers": field_answers,
         },
+        # Persist the override layer back to top-level state so
+        # downstream nodes + auto_apply_adapter.attempt_auto_fill see
+        # the user's final say, not the pre-edit value_planner output.
+        "tailored_answers": answers_updated,
     }

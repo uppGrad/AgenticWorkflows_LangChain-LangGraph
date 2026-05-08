@@ -129,6 +129,50 @@ def test_returns_empty_string_when_no_inputs_anywhere():
     assert out == ""
 
 
+def test_body_fallback_rejects_single_search_filter_input():
+    """Greenhouse redirects closed/removed postings to its careers-index
+    page, which has only a search/filter input (`id="keyword-filter"`).
+    Our previous body-fallback was returning that 1 input as a form,
+    causing the downstream LLM to "extract" a meaningless field. Real-world
+    cases from coverage_run 2026-05-03: SOFICO id=130136, Adyen id=128803.
+
+    We require ≥2 inputs in the body fallback because every real
+    application form has at minimum name + email."""
+    html = """
+    <html>
+      <head><title>Jobs at Sofico</title></head>
+      <body>
+        <header>
+          <input id="keyword-filter" class="input input__single-line"
+                 type="text" placeholder="Search" />
+        </header>
+        <main>
+          <h1>Current openings</h1>
+          <a href="/jobs/123">Junior Accountant</a>
+          <a href="/jobs/124">Office Manager</a>
+        </main>
+      </body>
+    </html>
+    """
+    assert extract_form_html(html) == ""
+
+
+def test_body_fallback_accepts_two_or_more_inputs():
+    """A minimal real form (name + email only) must still be picked up by
+    the body fallback. Two inputs is the threshold."""
+    html = """
+    <html><body>
+      <div class="form">
+        <input type="text" name="name" required />
+        <input type="email" name="email" required />
+      </div>
+    </body></html>
+    """
+    out = extract_form_html(html)
+    assert 'name="name"' in out
+    assert 'name="email"' in out
+
+
 def test_falls_back_to_body_when_no_form_tag_but_inputs_exist():
     """Modern React ATSes (Ashby, newer Workday) don't use native <form>
     elements — they use <div>s with click handlers and submit via fetch.

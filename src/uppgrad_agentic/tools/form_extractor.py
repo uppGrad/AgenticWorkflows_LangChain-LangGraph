@@ -89,8 +89,15 @@ def extract_form_html(html: str) -> str:
     # Strategy 2: no <form> tag (modern React-driven ATSes). Fall back to
     # the body with noise stripped. The body still contains the input/
     # select/textarea tags the LLM needs to identify the form.
+    #
+    # Require ≥2 inputs to avoid false positives on careers-index pages
+    # whose only input is a search/filter box (real example: Greenhouse
+    # redirects closed postings to `/jobs/<id>` showing the careers index
+    # with id="keyword-filter" — coverage_run_2026_05_03 SOFICO/Adyen).
+    # No real application form has fewer than 2 inputs (every form has at
+    # minimum name + email).
     body = soup.body
-    if body is None or _score(body) == 0:
+    if body is None or _score(body) < 2:
         return ""
     _strip_noise(body)
     return str(body)
