@@ -774,17 +774,83 @@ def _contains_pii_placeholder(after_text: str) -> bool:
     return bool(_PII_PLACEHOLDER.search(after_text))
 
 
+def _matches_full_paragraph(before_text: str, doc_sections: dict) -> bool:
+    """True iff normalized before_text exactly matches one paragraph in any
+    section (paragraphs split on blank line — same as analyzers)."""
+    if not before_text:
+        return False
+    norm_before = _normalize(before_text)
+    if not norm_before:
+        return False
+    for section_text in doc_sections.values():
+        if not section_text:
+            continue
+        for para in re.split(r"\n\s*\n+", section_text):
+            para_strip = para.strip()
+            if not para_strip:
+                continue
+            if _normalize(para_strip) == norm_before:
+                return True
+    return False
+
+
+def _expand_to_full_paragraph(before_text: str, doc_sections: dict) -> str:
+    """If before_text is a substring of exactly one paragraph, return that
+    paragraph verbatim. Otherwise return "" so the caller can drop the
+    proposal.
+
+    Used to recover delete proposals where the synth LLM emitted a
+    sentence-level `before_text` instead of the full paragraph (the LLM
+    sometimes ignores the "delete = full paragraph" rule and picks an
+    arbitrary sentence from inside the paragraph it wants to remove). The
+    user's intent is to delete the whole paragraph; expansion fixes the
+    proposal in place. Substring containment doesn't care WHERE in the
+    paragraph the sentence sits — first, middle, or last all work.
+
+    Returns "" when before_text spans no paragraph or spans multiple, so
+    we don't accidentally promote a cross-paragraph snippet into a single-
+    paragraph delete.
+    """
+    if not before_text:
+        return ""
+    norm_before = _normalize(before_text)
+    if len(norm_before) < 10:
+        return ""
+    matches: List[str] = []
+    for section_text in doc_sections.values():
+        if not section_text:
+            continue
+        for para in re.split(r"\n\s*\n+", section_text):
+            para_strip = para.strip()
+            if not para_strip:
+                continue
+            norm_para = _normalize(para_strip)
+            if norm_before == norm_para:
+                # Already a full match — caller would have caught it; surface
+                # the paragraph anyway.
+                return para_strip
+            if norm_before in norm_para:
+                matches.append(para_strip)
+    # Exactly one containing paragraph → safe to expand. Zero or two+ → drop.
+    if len(matches) == 1:
+        return matches[0]
+    return ""
+
+
 def _validate_proposals(
     proposals: List[dict],
     doc_sections: dict,
 ) -> List[dict]:
     """Filter out proposals with hallucinated before_text, meta-instruction
-    after_text, or PII placeholders ([Your Name]/[Date]) in after_text."""
+    after_text, PII placeholders in after_text, or partial-paragraph deletes
+    that can't be expanded to a full paragraph."""
     full_text = " ".join(doc_sections.values())
     validated = []
     dropped_ungrounded = 0
     dropped_meta = 0
     dropped_placeholder = 0
+    dropped_partial_delete = 0
+    expanded_partial_delete = 0
 
     for p in proposals:
         before = p.get("before_text", "")
@@ -827,15 +893,46 @@ def _validate_proposals(
             )
             continue
 
+        # Delete proposals MUST target a complete paragraph. Sentence-level
+        # deletes from the synth LLM (which ignores the "delete = full
+        # paragraph" prompt rule and picks an arbitrary sentence from the
+        # paragraph it wants to remove) read as if the system mistook a
+        # sentence for a paragraph. Try to recover the user's intent by
+        # expanding to the unique containing paragraph; drop if before_text
+        # spans no paragraph or spans multiple.
+        if action == "delete" and not _matches_full_paragraph(before, doc_sections):
+            expanded = _expand_to_full_paragraph(before, doc_sections)
+            if expanded:
+                p = {**p, "before_text": expanded}
+                before = expanded
+                expanded_partial_delete += 1
+                logger.info(
+                    "Expanded partial-paragraph delete to its containing "
+                    "paragraph: section=%s, before_text=%.80s…",
+                    p.get("section", "?"),
+                    expanded[:80],
+                )
+            else:
+                dropped_partial_delete += 1
+                logger.warning(
+                    "Dropped partial-paragraph delete proposal "
+                    "(no unique containing paragraph found): "
+                    "section=%s, before_text=%.120s…",
+                    p.get("section", "?"),
+                    before,
+                )
+                continue
+
         validated.append(p)
 
-    dropped = dropped_ungrounded + dropped_meta + dropped_placeholder
-    if dropped:
+    dropped = dropped_ungrounded + dropped_meta + dropped_placeholder + dropped_partial_delete
+    if dropped or expanded_partial_delete:
         logger.info(
             "Validation: kept %d / %d proposals "
-            "(%d ungrounded, %d meta-instruction, %d placeholder dropped)",
+            "(%d ungrounded, %d meta-instruction, %d placeholder, "
+            "%d partial-delete dropped; %d partial-delete expanded)",
             len(validated), len(proposals), dropped_ungrounded, dropped_meta,
-            dropped_placeholder,
+            dropped_placeholder, dropped_partial_delete, expanded_partial_delete,
         )
 
     return validated
