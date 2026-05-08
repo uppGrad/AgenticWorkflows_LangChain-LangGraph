@@ -549,6 +549,62 @@ async def _combobox_pick(page, locator, option_text: str) -> tuple[bool, str]:
     return (False, "no_option_matched")
 
 
+async def _enumerate_combobox_options(page, locator) -> list[str]:
+    """Open a combobox listbox, read every visible option's text,
+    close via Escape. Used by the post-verify option-aware override
+    to compare `observed` against the live option universe (catches
+    Anthropic-style display quirks where a Country combobox renders
+    just '+90' for an option whose actual text is '+90 Turkey'.)
+    """
+    try:
+        control = locator.locator(
+            'xpath=ancestor::div[contains(@class,"select__control")][1]'
+        )
+        if await control.count() > 0:
+            try:
+                await control.first.click(timeout=1500)
+            except Exception:
+                pass
+        else:
+            try:
+                await locator.click(timeout=1500)
+            except Exception:
+                return []
+    except Exception:
+        return []
+
+    listbox_selectors = (
+        '.select__option',
+        '[role="listbox"] [role="option"]',
+        '[role="option"]',
+        'li[role="option"]',
+    )
+    options: list[str] = []
+    seen: set = set()
+    for sel in listbox_selectors:
+        try:
+            await page.wait_for_selector(sel, timeout=1500, state="visible")
+            opts = page.locator(sel)
+            count = await opts.count()
+            for i in range(min(count, 100)):
+                try:
+                    txt = (await opts.nth(i).text_content(timeout=300) or "").strip()
+                except Exception:
+                    continue
+                if txt and txt not in seen:
+                    seen.add(txt)
+                    options.append(txt)
+            break
+        except Exception:
+            continue
+
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return options
+
+
 async def _locate(page, field) -> tuple[Any, str]:
     """Tier 1 + 2. Returns (locator, method) or (None, "none")."""
     name = (field.name or "").strip()
@@ -671,6 +727,17 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
         return ("select_error", f"combobox_pick_failed:{detail}")
 
     if field_type == "file":
+        # Stamp the filename onto `plan.observed_value` BEFORE we try
+        # the upload — the post-fill probe reads `el.files.length` which
+        # Greenhouse/Workable widgets reset to 0 after their async
+        # upload-to-CDN handshake. Without this stamp, the probe sees
+        # an empty file list and the verifier flags drift even though
+        # set_input_files reported success and the form has the file.
+        try:
+            from os.path import basename as _basename
+            plan.observed_value = _basename(str(value))
+        except Exception:
+            pass
         try:
             await locator.set_input_files(value, timeout=3000)
             return ("ok", "set_input_files")
@@ -691,6 +758,12 @@ async def _fill_deterministic(page, plan: FormFieldFillPlan) -> tuple[FillFieldO
                         return ("ok", "set_input_files:sibling_recovery")
                 except Exception:
                     pass
+            # Upload genuinely failed — clear the optimistic stamp so
+            # downstream sees the real empty state.
+            try:
+                plan.observed_value = ""
+            except Exception:
+                pass
             return ("file_error", err[:90])
 
     if field_type == "select":
@@ -1153,14 +1226,21 @@ _BATCH_VERIFY_SYSTEM = """You are verifying that an auto-filler set the right va
 
 For each row you receive, decide whether the `observed` value is a SENSIBLE answer to the question described by `label` (and the original `intended` value we tried to set).
 
+How `observed` is read by the probe:
+- For combobox/select fields, `observed` is read from the rendered picked-value element (`.select__single-value`, `<option selected>`, etc.) — it's the option the user effectively SELECTED, not raw input text. If the user typed something but didn't pick an option, observed is empty (the picked-value element isn't set).
+- For radio groups, observed is the selected member's value.
+- For checkboxes, "true"/"false".
+- For files, observed is the filename or "N_files" when the upload landed.
+- For text/textarea, observed is `el.value`.
+
 Rules:
-- If `validation_error` on a row is non-empty, the form has REJECTED the fill — that's drift regardless of value match. Use the error text to choose `suggested_value` (e.g. error "Phone must be 10 digits" + intended "+90 555 555 5555" → suggested "5555555555").
-- Treat semantic mismatch as drift. Example: label="Are you open to relocation for this role?", intended="Yes", observed="Ankara, Turkey" → drift, because a city name isn't a yes/no answer.
-- Treat autocomplete decoration as match. Example: label="Country", intended="United States", observed="United States — primary" → sane (autocomplete added a hint). Likewise "san fr" → "San Francisco, CA" is sane on a city autocomplete.
-- An empty `observed` while `intended` is non-empty → drift (the form rejected the value or the input was the wrong one).
-- A combobox where the user typed text but didn't select an option (observed equals intended exactly but the field needed a pick from a list) → drift. Hint: such fields will have field_type="select" or aria_autocomplete on the metadata.
-- File uploads: observed of "1_files" or "2_files" → sane. Empty → drift.
-- For yes/no labels, accept "Yes"/"No" or any synonym (e.g. "True"/"False", "Authorized"/"Not authorized") that matches intent.
+- If `validation_error` on a row is non-empty, the form has REJECTED the fill — drift regardless of value match. Use the error text to choose `suggested_value` (e.g. error "Phone must be 10 digits" + intended "+90 555 555 5555" → suggested "5555555555").
+- Combobox / select: when `observed` matches `intended` exactly (case-insensitive), the option pick SUCCEEDED — return sane. Do NOT flag this as "typed without picking"; the probe reads from the picked-value element, equality means selection landed.
+- Combobox / select display quirks: a Country combobox may render the option's phone code prefix (e.g. observed="+90" for option "+90 Turkey" when intended was "Turkey") — if observed could plausibly be a substring of a real option matching the user's intent, treat as sane. The fill chose an option; only the visible decoration differs.
+- Treat semantic mismatch as drift. Example: label="Are you open to relocation?", intended="Yes", observed="Ankara, Turkey" → drift, because a city name isn't a yes/no answer.
+- Treat autocomplete text-input decoration as match. Example: label="City", intended="san fr", observed="San Francisco, CA" → sane.
+- An empty `observed` while `intended` is non-empty → drift, EXCEPT for files: if the intended payload was a file path and the system fills via set_input_files, the upload may complete async and the probe can read empty even when the file landed. Treat empty observed for `field_type="file"` with a non-empty intended as SANE — the auto-filler reports file outcomes separately and a false drift here just creates wasted correction calls.
+- For yes/no labels, accept "Yes"/"No" or any synonym ("True"/"False", "Authorized"/"Not authorized") that matches intent.
 
 When drift is detected, suggest the value the form likely expects in `suggested_value` (when obvious from context). Otherwise leave it empty.
 
@@ -1232,20 +1312,15 @@ async def _llm_verify_batch(
             trivial_sane[i] = _FieldVerdict(idx=i, sane=True, reason="empty_intended")
             continue
 
-        # Deterministic drift trap for comboboxes: ARIA says combobox AND
-        # observed echoes intended (typed but not picked). This is the
-        # canonical combobox-typed-without-pick failure — cheap to flag,
-        # expensive to miss. Drift corrector then fires with the intended
-        # value; LLM picks the option from the rendered listbox.
-        if _is_autocomplete_field(p.field) and (
-            _normalise_for_compare(intended) == _normalise_for_compare(observed)
-        ):
-            trivial_drift[i] = _FieldVerdict(
-                idx=i, sane=False,
-                reason="combobox_typed_without_option_pick",
-                suggested_value=intended,
-            )
-            continue
+        # NOTE on combobox `intended == observed`: the post-fill probe
+        # reads from `.select__single-value` for combobox-shape fields,
+        # which is the rendered picked-value element. If observed
+        # matches intended exactly, the option pick succeeded — that's
+        # SUCCESS, not "typed without picking". (When the user types
+        # but doesn't pick, the probe returns "" because
+        # .select__single-value isn't set.) The previous deterministic
+        # trap that flagged equality-as-drift was stale post-probe-
+        # rewrite and false-flagged every successful Yes/No pick.
 
         # When intended doesn't match observed at all, send to LLM —
         # could be drift (combobox echo, wrong sibling) or could be
@@ -1480,7 +1555,13 @@ async def _correct_field_drift(
             except Exception:
                 await target.select_option(value=str(plan.value), timeout=2000)
         elif sp.action == "click_then_pick_option":
-            ok, detail = await _custom_select_pick(page, target, sp.option_text or str(plan.value))
+            # Use _combobox_pick (not _custom_select_pick) — the latter
+            # falls back to JS-style `locator.click()` which doesn't
+            # fire the mousedown event react-select listens for. The
+            # corrector hits this path on every drift correction
+            # attempt for Anthropic Greenhouse comboboxes; without the
+            # right click chain it always reports trigger_click_failed.
+            ok, detail = await _combobox_pick(page, target, sp.option_text or str(plan.value))
             if not ok:
                 return ("llm_exec_error", f"corrector_pick:{detail}")
         elif sp.action == "click_label_for_input":
@@ -1557,7 +1638,19 @@ async def fill_form_async(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
-            ctx = await browser.new_context(viewport={"width": 1280, "height": 1800})
+            # Headless: keep the tall viewport so off-screen form
+            # sections (Greenhouse lazy-mounts EEOC questions, etc.)
+            # are mounted by the time the walker hits them.
+            # Headed (demo): match a typical screen so the user can
+            # scroll the browser window normally — a 1800px viewport
+            # is taller than most screens, which clips the bottom of
+            # the form behind the OS taskbar and prevents scrolling.
+            viewport = (
+                {"width": 1280, "height": 900}
+                if not headless
+                else {"width": 1280, "height": 1800}
+            )
+            ctx = await browser.new_context(viewport=viewport)
             page = await ctx.new_page()
 
             try:
@@ -1580,6 +1673,12 @@ async def fill_form_async(
                 pending_reports: List[Optional[FormFieldFillReport]] = [None] * len(plan)
                 fill_sources: List[str] = ["none"] * len(plan)
                 outcomes: List[str] = ["pending"] * len(plan)
+                # Indices where _combobox_pick clicked a real listbox
+                # option (exact/substring/after_type/exact-after-type).
+                # The form HAS the value selected — verifier should NOT
+                # second-guess these. Pass-2.5 below short-circuits them
+                # to trivially sane regardless of value comparison.
+                combobox_picked: set = set()
 
                 for i, entry in enumerate(plan):
                     label = entry.field.label[:50]
@@ -1594,6 +1693,22 @@ async def fill_form_async(
 
                     outcome, detail = await _fill_deterministic(page, entry)
                     fill_source = "native"
+
+                    # Track confirmed combobox option clicks. `_combobox_pick`
+                    # encodes the click flavour in `detail`:
+                    #   exact_match / substring_match — Step 3, listbox open
+                    #   picked_after_type / picked_after_type_exact — Step 4
+                    # All four mean an actual `.select__option` click landed.
+                    # `enter_commit` (Step 5) is NOT tracked — it presses
+                    # Enter without confirming a click on a listbox row.
+                    if outcome == "ok" and isinstance(detail, str):
+                        if (
+                            detail.startswith("combobox_pick:exact_match:")
+                            or detail.startswith("combobox_pick:substring_match:")
+                            or detail.startswith("combobox_pick:picked_after_type:")
+                            or detail.startswith("combobox_pick:picked_after_type_exact:")
+                        ):
+                            combobox_picked.add(i)
 
                     if outcome != "ok":
                         if llm is not None and llm_calls < llm_picker_budget:
@@ -1619,13 +1734,23 @@ async def fill_form_async(
 
                     # Read post-fill state. The verdict comes later from
                     # the LLM batch verifier.
+                    # File fields stamped a filename onto observed_value
+                    # at fill time (Greenhouse-style async uploaders
+                    # reset el.files after POSTing to their CDN, so the
+                    # probe reads 0 files even on a successful upload).
+                    # Don't let the probe clobber the stamped filename
+                    # with an empty read.
                     locator, _method = await _locate(page, entry.field)
                     if locator is not None:
                         try:
                             await page.wait_for_timeout(300)
                         except Exception:
                             pass
-                        entry.observed_value = await _probe_field_state(page, entry, locator)
+                        probed = await _probe_field_state(page, entry, locator)
+                        if entry.field.field_type == "file" and not probed:
+                            pass  # keep the stamped filename
+                        else:
+                            entry.observed_value = probed
 
                     fill_sources[i] = fill_source
                     outcomes[i] = "filled_pending_verify"
@@ -1641,6 +1766,71 @@ async def fill_form_async(
                 # "Ankara, Turkey") + autocomplete-rewrite false positives
                 # (e.g. "san fr" → "San Francisco, CA") in the same call.
                 verdicts = await _llm_verify_batch(plan, llm)
+
+                # ─── Pass 2.4: deterministic short-circuit for confirmed
+                # combobox option clicks. `_combobox_pick` exact_match /
+                # substring_match / picked_after_type all clicked a
+                # real `.select__option` from the open listbox — the
+                # form HAS the picked value selected. Override any
+                # drift verdict to sane regardless of how the LLM
+                # interpreted observed (Anthropic Country renders just
+                # "+90" for "+90 Turkey", which the LLM can't
+                # disambiguate without seeing the listbox; this
+                # short-circuit handles it without an extra probe).
+                for i in combobox_picked:
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdicts[i] = _FieldVerdict(
+                        idx=i, sane=True,
+                        reason="combobox_pick_clicked_listbox_option",
+                    )
+
+                # ─── Pass 2.5: option-aware override for combobox display
+                # quirks. Anthropic's Country combobox renders just the
+                # picked option's phone code ('+90') while the actual
+                # option text is '+90 Turkey'. The verifier reasoning
+                # from observed='+90' alone concludes "phone code, not
+                # a country" — false drift. Cheap deterministic fix:
+                # for each drifted combobox-shape field, open the
+                # listbox, read live options, and if observed is a
+                # strict substring of any real option (observed != opt
+                # but observed is contained in opt's text), accept as
+                # sane. We DO NOT override when observed equals an
+                # option exactly — that's a successful pick whose
+                # semantic correctness (e.g. AI Policy: prose intent
+                # vs picked 'No') still needs the verifier.
+                for i, entry in enumerate(plan):
+                    if outcomes[i] != "filled_pending_verify":
+                        continue
+                    verdict = verdicts.get(i)
+                    if verdict is None or verdict.sane:
+                        continue
+                    if entry.field.field_type not in ("text", "select", "url", "email", "tel"):
+                        continue
+                    if not _is_autocomplete_field(entry.field):
+                        continue
+                    obs_norm = _normalise_for_compare(entry.observed_value)
+                    if not obs_norm or len(obs_norm) > 30:
+                        continue
+                    locator, _method = await _locate(page, entry.field)
+                    if locator is None:
+                        continue
+                    try:
+                        live_opts = await _enumerate_combobox_options(page, locator)
+                    except Exception:
+                        live_opts = []
+                    if not live_opts:
+                        continue
+                    for opt in live_opts:
+                        opt_norm = _normalise_for_compare(opt)
+                        if not opt_norm or opt_norm == obs_norm:
+                            continue
+                        if obs_norm in opt_norm and len(obs_norm) < len(opt_norm):
+                            verdicts[i] = _FieldVerdict(
+                                idx=i, sane=True,
+                                reason=f"observed_is_prefix_of_option:{opt[:60]}",
+                            )
+                            break
 
                 # ─── Pass 3: per-insane-field drift correction. Bounded.
                 for i, entry in enumerate(plan):
@@ -1742,8 +1932,39 @@ async def fill_form_async(
                     and not result.submit_clicked
                 )
             finally:
-                await ctx.close()
-                await browser.close()
+                # Demo / debug mode (headless=False): keep the browser
+                # open after auto-fill so the user can inspect the
+                # filled form, scroll, and verify visually before the
+                # session tears down. Default 5-minute window;
+                # overridable via UPPGRAD_AUTO_FILL_KEEP_OPEN_SECS.
+                # Headless: close immediately as before.
+                if not headless:
+                    try:
+                        keep_open = int(
+                            os.environ.get("UPPGRAD_AUTO_FILL_KEEP_OPEN_SECS", "300")
+                        )
+                    except (TypeError, ValueError):
+                        keep_open = 300
+                    keep_open = max(0, min(keep_open, 1800))  # clamp 0–30 min
+                    if keep_open > 0:
+                        logger.info(
+                            "fill_form_async: keeping browser open for %ds — "
+                            "close it manually or wait for the timeout.",
+                            keep_open,
+                        )
+                        try:
+                            await page.wait_for_timeout(keep_open * 1000)
+                        except Exception:
+                            # Browser closed manually by user — that's fine.
+                            pass
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
     except Exception as exc:
         logger.exception("fill_form_async: top-level error")
         result.error = f"{type(exc).__name__}: {str(exc)[:200]}"

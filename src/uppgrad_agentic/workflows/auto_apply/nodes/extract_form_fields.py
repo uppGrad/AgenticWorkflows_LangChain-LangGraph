@@ -12,6 +12,7 @@ Outputs:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -75,6 +76,71 @@ def extract_form_fields(state: AutoApplyState) -> dict:
     form_url = state.get("discovered_form_url")
     if not form_url:
         return {**updates, "form_fields": []}
+
+    # ─── Primary path: live-DOM Playwright walker ────────────────────
+    # The walker captures everything the downstream layers need
+    # (options for native selects, options for react-select comboboxes
+    # via listbox-open probe, ARIA shape, label resolution chain) in
+    # ONE Playwright session.
+    #
+    # When `UPPGRAD_FORM_DISCOVERY_VERIFY=1`, also captures a screenshot
+    # of the form area and runs a vision-LLM verifier on the walker's
+    # output. The verifier proposes label/type/options corrections,
+    # additions for missed fields, and removals for phantom entries
+    # (e.g. OpenAI Ashby radio groups the walker silently folds into a
+    # single "first option" entry). Bounded single LLM call;
+    # never blocks discovery if it fails.
+    discovered: list = []
+    verify_enabled = (
+        (os.environ.get("UPPGRAD_FORM_DISCOVERY_VERIFY") or "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if verify_enabled:
+        try:
+            import asyncio
+            from uppgrad_agentic.tools.form_discoverer import (
+                discover_form_fields_with_screenshot_async,
+            )
+            from uppgrad_agentic.tools.form_verifier import verify_fields_with_vision
+            walker_fields, screenshot = asyncio.run(
+                discover_form_fields_with_screenshot_async(form_url)
+            )
+            if walker_fields:
+                discovered = verify_fields_with_vision(walker_fields, screenshot)
+                logger.info(
+                    "extract_form_fields (verified): %d field(s) for %s "
+                    "(walker emitted %d before verifier corrections)",
+                    len(discovered), form_url, len(walker_fields),
+                )
+        except Exception as exc:
+            logger.warning(
+                "extract_form_fields: verifier path raised (%s) — falling "
+                "back to plain walker", exc,
+            )
+            discovered = []
+
+    if not discovered:
+        try:
+            from uppgrad_agentic.tools.form_discoverer import discover_form_fields
+            discovered = discover_form_fields(form_url)
+        except Exception as exc:
+            logger.warning("extract_form_fields: form_discoverer raised — %s", exc)
+            discovered = []
+    if discovered:
+        logger.info(
+            "extract_form_fields: discovered %d field(s) live for %s "
+            "(%d combobox-shape, %d with options)",
+            len(discovered), form_url,
+            sum(1 for f in discovered if (f.get("role") or "") == "combobox"
+                or (f.get("aria_autocomplete") or "") in ("list", "both", "inline")),
+            sum(1 for f in discovered if f.get("options")),
+        )
+        return {**updates, "form_fields": discovered}
+    logger.info(
+        "extract_form_fields: live walker returned 0 fields for %s — "
+        "falling back to LLM-on-static-HTML parser",
+        form_url,
+    )
 
     overview_url = state.get("discovered_apply_url") or ""
     # Read from the top-level state field directly — `scraped_requirements`
