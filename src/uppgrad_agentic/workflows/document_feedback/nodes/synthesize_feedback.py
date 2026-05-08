@@ -364,6 +364,39 @@ either delete the why-this-company paragraph or refocus it on a stated \
 responsibility from the opportunity (no anchor needed — engagement with \
 the role's stated work is itself enough).
 
+═══════════════════════ ANCHOR REUSE CAP (POST-PROJECTION, HARD RULE) ═══════════════════════
+
+Beyond the input-flagged `repeated_anchors`, the EVALUATOR also enforces \
+that every named anchor (project / employer / school) appears focally \
+in at most ONE paragraph of the PROJECTED document — i.e. the document \
+that results when all your proposals are applied. This is the failure \
+mode the user reported: the input mentioned a project once, but a new \
+hook + a rewritten why-this-company paragraph + a new closing all \
+injected the same project, and the rendered cover letter named it \
+four times.
+
+Plan against this BEFORE you finalise the proposal set:
+
+- The paragraph whose `differentiators` include an anchor OWNS that \
+  anchor in the projected document. The differentiator-preservation \
+  rule means the anchor will appear there verbatim. That is the one \
+  paragraph in which it may be focal.
+- Every OTHER rewrite (hook, why-this-company, closing) that you would \
+  otherwise anchor to that same project must instead either: \
+  (a) anchor to a DIFFERENT project / employer / school from the \
+  candidate's profile that is not already the focus of another \
+  paragraph, OR (b) engage with the role's stated responsibilities \
+  WITHOUT naming an anchor (the closing's Responsibility-first shape, \
+  for example).
+- "Focal" means the anchor appears in the first ~200 chars of the \
+  paragraph or appears 2+ times in it. A single passing reference \
+  later in the paragraph does not count and is allowed.
+- Before you submit a proposal, mentally render the post-application \
+  paragraphs and count: for every anchor in the candidate's profile, \
+  does it now appear focally in 2+ paragraphs? If yes, that proposal \
+  set will be rejected by the evaluator and the synthesis will retry. \
+  Pre-empt the retry by redirecting the second mention now.
+
 ═══════════════════════ DELETE / MERGE PROPOSAL FORMAT ═══════════════════════
 
 You can emit three kinds of proposals via the `action` field:
@@ -409,9 +442,17 @@ must be rewritten. The new closing MUST:
 
 - Name the target organisation by name (and the role/program when \
   natural).
-- Specify ONE concrete contribution the candidate would make — drawn \
-  from the hook anchor or the strongest evidence anchor in the document, \
-  not invented.
+- Specify ONE concrete contribution the candidate would make.
+- NOT name an anchor (project / employer / school) that another \
+  paragraph in the projected document already uses as its focus. The \
+  closing's contribution may engage with the role's stated \
+  responsibilities, the candidate's general engineering habit, or a \
+  non-overlapping anchor — but reusing the hook anchor (or any anchor \
+  that is already focal in another paragraph after your rewrites are \
+  applied) yields the failure mode this contract exists to prevent: \
+  the same project gets named in the hook, the why-this-company \
+  paragraph, AND the closing. The evaluator's anchor-reuse cap is \
+  blocking, so this is not optional.
 - Avoid all of: "thank you for your time / consideration", "I would be \
   happy for the opportunity", "continue developing myself", "I see this \
   opportunity as a chance to learn", "I believe my background... would \
@@ -421,27 +462,37 @@ must be rewritten. The new closing MUST:
   opener.
 
 The closing has no fixed template. Pick whichever shape fits the \
-candidate's voice and the paragraph immediately above. Below are FOUR \
+candidate's voice and the paragraph immediately above. Below are FIVE \
 structural shapes you may choose from. Treat them as structural \
 illustrations only — do NOT copy these phrasings; rewrite them in the \
 candidate's own register, and rotate which shape you use across \
-documents so closings do not all sound alike:
+documents so closings do not all sound alike. The first four name an \
+anchor; pick one of these only when an anchor is available that no \
+OTHER paragraph in the projected document is already focused on. The \
+fifth is anchor-less and is the right pick when every available anchor \
+is already the focus of another paragraph:
 
-  • Action-first   — "Joining [team] at [company], I would start on \
-    [contribution] by drawing on [anchor]."
-  • Anchor-first   — "[Anchor] is the kind of work I want to keep \
-    doing, and at [company] that would mean [contribution]."
-  • Trait-first    — "What I would bring to [team] at [company] is \
-    the habit that ran through [anchor]: [trait], applied to \
-    [contribution]."
-  • Direct         — "At [company], my first contribution would be \
-    [thing], building on [anchor]."
+  • Action-first        — "Joining [team] at [company], I would start \
+    on [contribution] by drawing on [unused anchor]."
+  • Anchor-first        — "[Unused anchor] is the kind of work I want \
+    to keep doing, and at [company] that would mean [contribution]."
+  • Trait-first         — "What I would bring to [team] at [company] \
+    is the habit that ran through [unused anchor]: [trait], applied \
+    to [contribution]."
+  • Direct              — "At [company], my first contribution would \
+    be [thing], building on [unused anchor]."
+  • Responsibility-first — "At [company], the work I would start with \
+    is [stated responsibility from the role], approached with the \
+    same [trait/habit] I bring to engineering generally." (No anchor \
+    named; engagement is with the role itself.)
 
 Whichever shape you pick, the closing MUST (a) name the target org, \
-(b) specify ONE concrete contribution drawn from a real anchor, and \
-(c) NOT begin with "If selected for..." or any of the avoid-list \
-phrases above. Do NOT use em-dashes in the closing (or anywhere else \
-in your after_text).
+(b) specify ONE concrete contribution, and (c) NOT begin with "If \
+selected for..." or any of the avoid-list phrases above. (d) An \
+anchor is OPTIONAL — name one only if it is not already the focus of \
+another paragraph in the projected document; otherwise pick the \
+Responsibility-first shape. Do NOT use em-dashes in the closing (or \
+anywhere else in your after_text).
 
 ═══════════════════════ DISTINCTIVENESS PRESERVATION ═══════════════════════
 

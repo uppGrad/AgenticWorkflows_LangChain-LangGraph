@@ -62,7 +62,16 @@ analysis outputs. Evaluate each proposal for:
    "directly shapes", "play a meaningful role", "tapestry", "delve", "delving",
    "stands out to me", "matters to me because", and the metaphorical
    "leverage" / "navigate". Flag any violation.
-9. **Distinctiveness** (SOP / COVER_LETTER ONLY): rewrites must preserve
+9. **Anchor reuse cap** (SOP / COVER_LETTER ONLY): in the projected
+   document (after applying all proposals), every named anchor (project
+   / employer / school) drawn from the rhetoric `differentiators` or
+   narrative `paragraph_roles[].anchor_examples` must be the focal
+   mention of AT MOST one paragraph. Flag any anchor that is focal in
+   2+ paragraphs of the projection — typical cause is the synth pulling
+   the same project anchor into the hook, the why-this-company
+   paragraph, AND the closing. The deterministic cross-check enforces
+   this; do not pass the proposal set if an anchor is reused.
+10. **Distinctiveness** (SOP / COVER_LETTER ONLY): rewrites must preserve
    the candidate's distinctive specifics, not smooth them into safer
    generic prose. Flag any of:
    - a `rewrite` proposal whose `after_text` strips a `differentiator`
@@ -685,6 +694,95 @@ def _check_distinctiveness(
     return issues
 
 
+_ANCHOR_MIN_LEN = 5
+_FOCAL_HEAD_CHARS = 200
+
+
+def _check_anchor_diversity_post_projection(
+    proposals: List[dict],
+    doc_type: str,
+    analysis_results: dict,
+    raw_text: str,
+) -> List[str]:
+    """Project the document and flag named anchors that end up focal in 2+ paragraphs.
+
+    `_check_narrative_compliance` rule 1 catches anchors the *input* already
+    repeated. This complementary check catches the case the user reported:
+    the input mentions an anchor in one paragraph, but a new hook + a new
+    why-this-company paragraph + a rewritten closing all inject the same
+    anchor, yielding a final document that mentions the same project four
+    times. Without projection, the existing rule only sees the input shape.
+
+    Anchor universe = union of `rhetoric.findings[*].differentiators` and
+    `narrative.paragraph_roles[*].anchor_examples` — both are verbatim
+    spans the analyzers identified as named anchors.
+
+    "Focal" proxy mirrors `_check_narrative_compliance` rule 1: the anchor
+    appears 2+ times in the paragraph OR in the first ~200 chars. A single
+    passing reference further down the paragraph does not count.
+    """
+    if doc_type not in ("SOP", "COVER_LETTER"):
+        return []
+
+    rhetoric = (analysis_results or {}).get("rhetoric") or {}
+    narrative = (analysis_results or {}).get("narrative") or {}
+    findings = rhetoric.get("paragraph_findings") or []
+    paragraph_roles = narrative.get("paragraph_roles") or []
+
+    anchors: set[str] = set()
+    for f in findings:
+        for d in (f.get("differentiators") or []):
+            if isinstance(d, str) and len(d.strip()) >= _ANCHOR_MIN_LEN:
+                anchors.add(d.strip())
+    for pr in paragraph_roles:
+        if not isinstance(pr, dict):
+            continue
+        for a in (pr.get("anchor_examples") or []):
+            if isinstance(a, str) and len(a.strip()) >= _ANCHOR_MIN_LEN:
+                anchors.add(a.strip())
+    if not anchors:
+        return []
+
+    try:
+        from uppgrad_agentic.workflows.document_feedback.nodes.finalize import (
+            _apply_proposals_to_text,
+        )
+        projected, _, _ = _apply_proposals_to_text(raw_text, proposals)
+    except Exception:
+        return []
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", projected) if p.strip()]
+    if len(paragraphs) < 2:
+        return []
+
+    issues: List[str] = []
+    for anchor in sorted(anchors, key=len, reverse=True):
+        norm_anchor = _normalize_for_match(anchor)
+        if not norm_anchor:
+            continue
+        focal_paragraph_count = 0
+        for para in paragraphs:
+            norm_para = _normalize_for_match(para)
+            if norm_anchor not in norm_para:
+                continue
+            occurrences = norm_para.count(norm_anchor)
+            head = norm_para[:_FOCAL_HEAD_CHARS]
+            if occurrences >= 2 or norm_anchor in head:
+                focal_paragraph_count += 1
+        if focal_paragraph_count >= 2:
+            issues.append(
+                f"Anchor reuse: '{anchor[:80]}{'...' if len(anchor) > 80 else ''}' "
+                f"is the focal mention of {focal_paragraph_count} paragraphs in the "
+                "projected document. Each named anchor (project / employer / school) "
+                "may serve as the focus of at most ONE paragraph; the others must "
+                "either redirect to a different anchor from the candidate's profile "
+                "or engage with the role's stated responsibilities without naming "
+                "an anchor at all."
+            )
+
+    return issues
+
+
 def _check_ai_tells(proposals: List[dict], doc_type: str) -> List[str]:
     """Em-dash + banned-phrase audit on after_text values.
 
@@ -782,6 +880,12 @@ def _heuristic_evaluate(
     )
     all_issues.extend(distinctiveness_issues)
 
+    # Post-projection anchor cap — SOP/COVER_LETTER only.
+    anchor_diversity_issues = _check_anchor_diversity_post_projection(
+        proposals, doc_type, analysis_results or {}, raw_text
+    )
+    all_issues.extend(anchor_diversity_issues)
+
     # Deduplicate
     seen: set[str] = set()
     unique_issues: List[str] = []
@@ -814,6 +918,7 @@ def _heuristic_evaluate(
         and len(narrative_issues) == 0
         and len(ai_tell_issues) == 0
         and len(distinctiveness_issues) == 0
+        and len(anchor_diversity_issues) == 0
     )
 
     return EvaluationResult(
@@ -903,8 +1008,17 @@ def evaluate_output(state: DocFeedbackState) -> dict:
         distinctiveness_issues = _check_distinctiveness(
             proposals, doc_type, analysis_results, raw_text
         )
+        anchor_diversity_issues = _check_anchor_diversity_post_projection(
+            proposals, doc_type, analysis_results, raw_text
+        )
         merged_issues = list(out.issues or [])
-        for iss in substance_issues + narrative_issues + ai_tell_issues + distinctiveness_issues:
+        for iss in (
+            substance_issues
+            + narrative_issues
+            + ai_tell_issues
+            + distinctiveness_issues
+            + anchor_diversity_issues
+        ):
             if iss not in merged_issues:
                 merged_issues.append(iss)
         passed = (
@@ -913,6 +1027,7 @@ def evaluate_output(state: DocFeedbackState) -> dict:
             and not narrative_issues
             and not ai_tell_issues
             and not distinctiveness_issues
+            and not anchor_diversity_issues
         )
         result = EvaluationResult(
             passed=passed,
